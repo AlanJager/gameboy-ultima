@@ -1,0 +1,114 @@
+[
+  {
+    "name": "ands，C 保留",
+    "word": "0x4008",
+    "text": "ands r0, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x200000F0",
+      "gpr": { "r0": "0xFF", "r1": "0x0F" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x200000F0",
+      "gpr": { "r0": "0x0F" }
+    }
+  },
+  {
+    "name": "eors",
+    "word": "0x4048",
+    "text": "eors r0, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0xFF", "r1": "0x0F" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0xF0" }
+    }
+  },
+  {
+    "name": "orrs",
+    "word": "0x4308",
+    "text": "orrs r0, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0xF0", "r1": "0x0F" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0xFF" }
+    }
+  },
+  {
+    "name": "bics",
+    "word": "0x4388",
+    "text": "bics r0, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0xFF", "r1": "0x0F" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0xF0" }
+    }
+  },
+  {
+    "name": "mvns",
+    "word": "0x43C8",
+    "text": "mvns r0, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r1": "0x0" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x800000F0",
+      "gpr": { "r0": "0xFFFFFFFF" }
+    }
+  },
+  {
+    "name": "adcs 带上原来的 C",
+    "word": "0x4148",
+    "text": "adcs r0, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x200000F0",
+      "gpr": { "r0": "0x1", "r1": "0x1" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0x3" }
+    }
+  },
+  {
+    "name": "sbcs 在 C 为 0 时多减 1",
+    "word": "0x4188",
+    "text": "sbcs r0, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0x1", "r1": "0x0" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x600000F0",
+      "gpr": { "r0": "0x0" }
+    }
+  }
+]

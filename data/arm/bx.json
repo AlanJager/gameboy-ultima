@@ -1,0 +1,36 @@
+[
+  {
+    "name": "bx 留在 ARM",
+    "word": "0xE12FFF11",
+    "text": "bx r1",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r1": "0x03000010"
+      }
+    },
+    "final": {
+      "pc": "0x03000010",
+      "cpsr": "0x000000D0"
+    }
+  },
+  {
+    "name": "bx 最低位是 1 时切到 Thumb",
+    "word": "0xE12FFF11",
+    "text": "bx r1",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r1": "0x03000013"
+      }
+    },
+    "final": {
+      "pc": "0x03000012",
+      "cpsr": "0x000000F0"
+    }
+  }
+]

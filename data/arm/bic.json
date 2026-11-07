@@ -1,0 +1,22 @@
+[
+  {
+    "name": "bics 清掉低 4 位",
+    "word": "0xE3D0000F",
+    "text": "bics r0, r0, #0xF",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r0": "0xFF"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r0": "0xF0"
+      }
+    }
+  }
+]

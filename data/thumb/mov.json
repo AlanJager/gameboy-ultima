@@ -1,0 +1,48 @@
+[
+  {
+    "name": "movs 立即数，C 保留",
+    "word": "0x2001",
+    "text": "movs r0, #1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x200000F0"
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x200000F0",
+      "gpr": { "r0": "0x1" }
+    }
+  },
+  {
+    "name": "movs 0 置 Z",
+    "word": "0x2000",
+    "text": "movs r0, #0",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x200000F0"
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x600000F0",
+      "gpr": { "r0": "0x0" }
+    }
+  },
+  {
+    "name": "mov 高寄存器不改标志",
+    "word": "0x4680",
+    "text": "mov r8, r0",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0xFFFFFFFF" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x000000F0",
+      "gpr": { "r8": "0xFFFFFFFF" }
+    }
+  }
+]

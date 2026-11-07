@@ -1,0 +1,19 @@
+[
+  {
+    "name": "mvns 按位取反",
+    "word": "0xE3F00000",
+    "text": "mvns r0, #0",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0"
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x800000D0",
+      "gpr": {
+        "r0": "0xFFFFFFFF"
+      }
+    }
+  }
+]

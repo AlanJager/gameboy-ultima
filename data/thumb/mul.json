@@ -1,0 +1,18 @@
+[
+  {
+    "name": "muls，C 按这个模型保留",
+    "word": "0x4348",
+    "text": "muls r0, r1",
+    "cycles": 2,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x200000F0",
+      "gpr": { "r0": "0xFFFFFFFF", "r1": "0x2" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0xA00000F0",
+      "gpr": { "r0": "0xFFFFFFFE" }
+    }
+  }
+]

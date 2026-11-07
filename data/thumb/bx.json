@@ -1,0 +1,47 @@
+[
+  {
+    "name": "bx 切回 ARM",
+    "word": "0x4708",
+    "text": "bx r1",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r1": "0x03000010" }
+    },
+    "final": {
+      "pc": "0x03000010",
+      "cpsr": "0x000000D0"
+    }
+  },
+  {
+    "name": "bx 最低位是 1 时留在 Thumb",
+    "word": "0x4708",
+    "text": "bx r1",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r1": "0x03000013" }
+    },
+    "final": {
+      "pc": "0x03000012",
+      "cpsr": "0x000000F0"
+    }
+  },
+  {
+    "name": "add 写进 pc 仍留在 Thumb",
+    "word": "0x4487",
+    "text": "add pc, r0",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0x03000021" }
+    },
+    "final": {
+      "pc": "0x06000024",
+      "cpsr": "0x000000F0"
+    }
+  }
+]

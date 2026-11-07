@@ -1,0 +1,77 @@
+[
+  {
+    "name": "cmp 立即数相等",
+    "word": "0x2801",
+    "text": "cmp r0, #1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0x1" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x600000F0"
+    }
+  },
+  {
+    "name": "cmp 低寄存器",
+    "word": "0x4288",
+    "text": "cmp r0, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0x2", "r1": "0x1" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x200000F0"
+    }
+  },
+  {
+    "name": "cmp 高寄存器",
+    "word": "0x4540",
+    "text": "cmp r0, r8",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0x1", "r8": "0x1" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x600000F0"
+    }
+  },
+  {
+    "name": "cmn",
+    "word": "0x42C8",
+    "text": "cmn r0, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0xFFFFFFFF", "r1": "0x1" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x600000F0"
+    }
+  },
+  {
+    "name": "tst，C 保留",
+    "word": "0x4208",
+    "text": "tst r0, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x200000F0",
+      "gpr": { "r0": "0xFF", "r1": "0x0" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x600000F0"
+    }
+  }
+]

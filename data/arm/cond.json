@@ -1,0 +1,70 @@
+[
+  {
+    "name": "moveq 条件不成立",
+    "word": "0x3A00002",
+    "text": "moveq r0, #2",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r0": "0x1"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r0": "0x1"
+      }
+    }
+  },
+  {
+    "name": "moveq 条件成立",
+    "word": "0x3A00002",
+    "text": "moveq r0, #2",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x400000D0",
+      "gpr": {
+        "r0": "0x1"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x400000D0",
+      "gpr": {
+        "r0": "0x2"
+      }
+    }
+  },
+  {
+    "name": "bne 跳到自己",
+    "word": "0x1AFFFFFE",
+    "text": "bne 0x03000000",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0"
+    },
+    "final": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0"
+    }
+  },
+  {
+    "name": "bne 因为 Z 不跳",
+    "word": "0x1AFFFFFE",
+    "text": "bne 0x03000000",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x400000D0"
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x400000D0"
+    }
+  }
+]

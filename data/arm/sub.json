@@ -1,0 +1,42 @@
+[
+  {
+    "name": "subs 0 减 1",
+    "word": "0xE2500001",
+    "text": "subs r0, r0, #1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r0": "0x0"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x800000D0",
+      "gpr": {
+        "r0": "0xFFFFFFFF"
+      }
+    }
+  },
+  {
+    "name": "subs 最小负数再减 1",
+    "word": "0xE2500001",
+    "text": "subs r0, r0, #1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r0": "0x80000000"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x300000D0",
+      "gpr": {
+        "r0": "0x7FFFFFFF"
+      }
+    }
+  }
+]

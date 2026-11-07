@@ -1,0 +1,19 @@
+[
+  {
+    "name": "cmn 加到 0",
+    "word": "0xE3700001",
+    "text": "cmn r0, #1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r0": "0xFFFFFFFF"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x600000D0"
+    }
+  }
+]

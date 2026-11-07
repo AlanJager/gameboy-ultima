@@ -1,0 +1,66 @@
+[
+  {
+    "name": "subs 三个低寄存器，没有借位",
+    "word": "0x1A88",
+    "text": "subs r0, r1, r2",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r1": "0x5", "r2": "0x3" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x200000F0",
+      "gpr": { "r0": "0x2" }
+    }
+  },
+  {
+    "name": "subs 从 0 减出借位",
+    "word": "0x1E48",
+    "text": "subs r0, r1, #1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r1": "0x0" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x800000F0",
+      "gpr": { "r0": "0xFFFFFFFF" }
+    }
+  },
+  {
+    "name": "subs 八位立即数减成 0",
+    "word": "0x3801",
+    "text": "subs r0, #1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r0": "0x1" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x600000F0",
+      "gpr": { "r0": "0x0" }
+    }
+  },
+  {
+    "name": "negs",
+    "word": "0x4248",
+    "text": "negs r0, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "r1": "0x1" }
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x800000F0",
+      "gpr": { "r0": "0xFFFFFFFF" }
+    }
+  }
+]

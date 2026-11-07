@@ -1,0 +1,83 @@
+[
+  {
+    "name": "msr 只改标志位",
+    "word": "0xE128F001",
+    "text": "msr cpsr_f, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r1": "0xF0000000"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0xF00000D0"
+    }
+  },
+  {
+    "name": "用户模式不改控制位",
+    "word": "0xE121F001",
+    "text": "msr cpsr_c, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r1": "0x0"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x000000D0"
+    }
+  },
+  {
+    "name": "msr 立即数",
+    "word": "0xE328F102",
+    "text": "msr cpsr_f, #0x80000000",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0"
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x800000D0"
+    }
+  },
+  {
+    "name": "用户模式写不了 SPSR",
+    "word": "0xE168F001",
+    "error": "SPSR",
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r1": "0xF0000000"
+      }
+    },
+    "final": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0"
+    }
+  },
+  {
+    "name": "管理模式可以改模式位",
+    "word": "0xE121F001",
+    "text": "msr cpsr_c, r1",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D3",
+      "gpr": {
+        "r1": "0x000000D0"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x000000D0"
+    }
+  }
+]

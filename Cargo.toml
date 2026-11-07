@@ -1,0 +1,30 @@
+[package]
+name = "gameboy-ultima"
+version = "0.1.0"
+edition = "2021"
+description = "Game Boy Advance emulator with a cycle-timed ARM7TDMI interpreter"
+default-run = "gameboy-ultima"
+autobins = false
+
+[dependencies]
+cpal = "0.15.3"
+gpui = { version = "=0.2.2", default-features = false, features = ["runtime_shaders", "font-kit"] }
+image = { version = "=0.25.1", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+metal = "0.29"
+objc = "0.2"
+raw-window-handle = "0.6"
+rfd = { version = "0.15", default-features = false }
+
+[[bin]]
+name = "gameboy-ultima"
+path = "src/main.rs"
+
+[[bin]]
+name = "gameboy-ultima-gpui"
+path = "src/bin/gpui.rs"

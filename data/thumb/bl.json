@@ -1,0 +1,48 @@
+[
+  {
+    "name": "blhi 把 pc 加 4 放进 lr",
+    "word": "0xF000",
+    "text": "blhi #0",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0"
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x000000F0",
+      "gpr": { "lr": "0x03000004" }
+    }
+  },
+  {
+    "name": "blhi 高位是负的",
+    "word": "0xF7FF",
+    "text": "blhi #-0x1000",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0"
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x000000F0",
+      "gpr": { "lr": "0x02FFF004" }
+    }
+  },
+  {
+    "name": "bllo 跳走并把返回地址的最低位置 1",
+    "word": "0xF800",
+    "text": "bllo #0",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0",
+      "gpr": { "lr": "0x03001000" }
+    },
+    "final": {
+      "pc": "0x03001000",
+      "cpsr": "0x000000F0",
+      "gpr": { "lr": "0x03000003" }
+    }
+  }
+]

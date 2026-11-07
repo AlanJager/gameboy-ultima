@@ -1,0 +1,44 @@
+[
+  {
+    "name": "beq 成立",
+    "word": "0xD000",
+    "text": "beq 0x03000004",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x400000F0"
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x400000F0"
+    }
+  },
+  {
+    "name": "beq 不成立只往前两个字节",
+    "word": "0xD000",
+    "text": "beq 0x03000004",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0"
+    },
+    "final": {
+      "pc": "0x03000002",
+      "cpsr": "0x000000F0"
+    }
+  },
+  {
+    "name": "b 跳回自己",
+    "word": "0xE7FE",
+    "text": "b 0x03000000",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0"
+    },
+    "final": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000F0"
+    }
+  }
+]

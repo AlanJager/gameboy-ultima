@@ -1,0 +1,156 @@
+[
+  {
+    "name": "mul",
+    "word": "0xE0010392",
+    "text": "mul r1, r2, r3",
+    "cycles": 2,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r2": "0x6",
+        "r3": "0x7"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r1": "0x2A"
+      }
+    }
+  },
+  {
+    "name": "muls 负数，C 按这个模型保留",
+    "word": "0xE0110392",
+    "text": "muls r1, r2, r3",
+    "cycles": 2,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r2": "0xFFFFFFFF",
+        "r3": "0x2"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x800000D0",
+      "gpr": {
+        "r1": "0xFFFFFFFE"
+      }
+    }
+  },
+  {
+    "name": "mla 加上 rn",
+    "word": "0xE0214392",
+    "text": "mla r1, r2, r3, r4",
+    "cycles": 2,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r2": "0x6",
+        "r3": "0x7",
+        "r4": "0x1"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r1": "0x2B"
+      }
+    }
+  },
+  {
+    "name": "umull 低半在前",
+    "word": "0xE0810392",
+    "text": "umull r0, r1, r2, r3",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r2": "0x10000",
+        "r3": "0x10000"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r0": "0x0",
+        "r1": "0x1"
+      }
+    }
+  },
+  {
+    "name": "smull 负数",
+    "word": "0xE0C10392",
+    "text": "smull r0, r1, r2, r3",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r2": "0xFFFFFFFF",
+        "r3": "0x2"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r0": "0xFFFFFFFE",
+        "r1": "0xFFFFFFFF"
+      }
+    }
+  },
+  {
+    "name": "umlal 加上原来的 64 位",
+    "word": "0xE0A10392",
+    "text": "umlal r0, r1, r2, r3",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r0": "0x1",
+        "r1": "0x0",
+        "r2": "0x10000",
+        "r3": "0x10000"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x000000D0",
+      "gpr": {
+        "r0": "0x1",
+        "r1": "0x1"
+      }
+    }
+  },
+  {
+    "name": "smlals 置 N，C 按这个模型保留",
+    "word": "0xE0F10392",
+    "text": "smlals r0, r1, r2, r3",
+    "cycles": 3,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x200000D0",
+      "gpr": {
+        "r2": "0xFFFFFFFF",
+        "r3": "0x2"
+      }
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0xA00000D0",
+      "gpr": {
+        "r0": "0xFFFFFFFE",
+        "r1": "0xFFFFFFFF"
+      }
+    }
+  }
+]

@@ -1,0 +1,49 @@
+[
+  {
+    "name": "mrs 读出 CPSR",
+    "word": "0xE10F2000",
+    "text": "mrs r2, cpsr",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0xA00000D0"
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0xA00000D0",
+      "gpr": {
+        "r2": "0xA00000D0"
+      }
+    }
+  },
+  {
+    "name": "用户模式读不到 SPSR",
+    "word": "0xE14F2000",
+    "error": "SPSR",
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0"
+    },
+    "final": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D0"
+    }
+  },
+  {
+    "name": "管理模式读出 SPSR",
+    "word": "0xE14F2000",
+    "text": "mrs r2, spsr",
+    "cycles": 1,
+    "initial": {
+      "pc": "0x03000000",
+      "cpsr": "0x000000D3"
+    },
+    "final": {
+      "pc": "0x03000004",
+      "cpsr": "0x000000D3",
+      "gpr": {
+        "r2": "0x0"
+      }
+    }
+  }
+]
