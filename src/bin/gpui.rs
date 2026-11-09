@@ -2396,7 +2396,9 @@ fn solar_meter(level: u8, cx: &mut Context<AppView>) -> impl IntoElement {
         .child(cells)
         .child(
             div()
-                .w(px(36.))
+                .w(px(56.))
+                .flex_shrink_0()
+                .whitespace_nowrap()
                 .text_sm()
                 .text_color(rgb(ACCENT))
                 .child(format!("{percent}%")),
