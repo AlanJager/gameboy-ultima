@@ -127,16 +127,24 @@ pub(crate) enum Hotkey {
     Rewind,
     GyroLeft,
     GyroRight,
+    TiltLeft,
+    TiltRight,
+    TiltUp,
+    TiltDown,
 }
 
 impl Hotkey {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::QuickSave,
         Self::QuickLoad,
         Self::FastForward,
         Self::Rewind,
         Self::GyroLeft,
         Self::GyroRight,
+        Self::TiltLeft,
+        Self::TiltRight,
+        Self::TiltUp,
+        Self::TiltDown,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -147,6 +155,10 @@ impl Hotkey {
             Self::Rewind => 3,
             Self::GyroLeft => 4,
             Self::GyroRight => 5,
+            Self::TiltLeft => 6,
+            Self::TiltRight => 7,
+            Self::TiltUp => 8,
+            Self::TiltDown => 9,
         }
     }
 
@@ -158,6 +170,10 @@ impl Hotkey {
             Self::Rewind => "按住回退",
             Self::GyroLeft => "陀螺仪向左",
             Self::GyroRight => "陀螺仪向右",
+            Self::TiltLeft => "倾斜向左",
+            Self::TiltRight => "倾斜向右",
+            Self::TiltUp => "倾斜向上",
+            Self::TiltDown => "倾斜向下",
         }
     }
 
@@ -169,6 +185,10 @@ impl Hotkey {
             Self::Rewind => "rewind",
             Self::GyroLeft => "gyro_left",
             Self::GyroRight => "gyro_right",
+            Self::TiltLeft => "tilt_left",
+            Self::TiltRight => "tilt_right",
+            Self::TiltUp => "tilt_up",
+            Self::TiltDown => "tilt_down",
         }
     }
 
@@ -180,6 +200,10 @@ impl Hotkey {
             Self::Rewind => "hotkey-rewind",
             Self::GyroLeft => "hotkey-gyro-left",
             Self::GyroRight => "hotkey-gyro-right",
+            Self::TiltLeft => "hotkey-tilt-left",
+            Self::TiltRight => "hotkey-tilt-right",
+            Self::TiltUp => "hotkey-tilt-up",
+            Self::TiltDown => "hotkey-tilt-down",
         }
     }
 }
@@ -209,7 +233,7 @@ impl BindingTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KeyMap {
     keys: [String; 11],
-    hotkeys: [String; 6],
+    hotkeys: [String; 10],
 }
 
 impl Default for KeyMap {
@@ -235,6 +259,10 @@ impl Default for KeyMap {
                 "f6".into(),
                 "[".into(),
                 "]".into(),
+                ",".into(),
+                ".".into(),
+                ";".into(),
+                "'".into(),
             ],
         }
     }
@@ -843,6 +871,10 @@ mod tests {
         assert_eq!(legacy.map.hotkey(Hotkey::Rewind), "f6");
         assert_eq!(legacy.map.hotkey(Hotkey::GyroLeft), "[");
         assert_eq!(legacy.map.hotkey(Hotkey::GyroRight), "]");
+        assert_eq!(legacy.map.hotkey(Hotkey::TiltLeft), ",");
+        assert_eq!(legacy.map.hotkey(Hotkey::TiltRight), ".");
+        assert_eq!(legacy.map.hotkey(Hotkey::TiltUp), ";");
+        assert_eq!(legacy.map.hotkey(Hotkey::TiltDown), "'");
         assert_eq!(key_label("left"), "←");
         assert_eq!(key_label("f5"), "F5");
         assert_eq!(key_label(""), "未设置");

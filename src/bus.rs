@@ -12,6 +12,7 @@ use crate::ppu::{
 };
 use crate::gyro::Gyro;
 use crate::rtc::Rtc;
+use crate::tilt::Tilt;
 use crate::sched::{EventKind, Scheduler};
 use crate::sound::{sample_hz, sample_period, Sampler};
 use crate::timer::Timers;
@@ -86,6 +87,9 @@ pub struct Bus {
     /// 瓦里奥制造 Twisted 的角速度。其它卡带 `present` 为假，GPIO 仍归时钟。
     #[serde(default)]
     gyro: Gyro,
+    /// 耀西万有引力的两轴加速度。其它卡带不拦截 SRAM 窗口。
+    #[serde(default)]
+    tilt: Tilt,
     /// 下一次定时器、消隐、采样。空档里只把拍数加上去。
     scheduler: Scheduler,
     /// 译过的指令。命中不再拆位域，执行还是解释。
@@ -134,6 +138,7 @@ impl Bus {
             backup: Backup::new(),
             rtc: Rtc::default(),
             gyro: Gyro::default(),
+            tilt: Tilt::default(),
             scheduler: Scheduler::new(),
             icache: ICache::new(),
             dirty: DirtyLines::new(),
@@ -1016,11 +1021,23 @@ impl Bus {
         self.rom = rom.to_vec();
         self.icache.clear();
         self.gyro.set_present(crate::gyro::gyro_cart(&self.rom));
+        self.tilt.set_present(crate::tilt::tilt_cart(&self.rom));
     }
 
     /// `-1`、`0`、`1`。只有陀螺仪卡带会在 GPIO 上送出。
     pub fn set_gyro_rate(&mut self, rate: i8) {
         self.gyro.set_rate(rate);
+    }
+
+    /// 两轴各自 `-1`、`0`、`1`。下一次 `0x55` / `0xAA` 才锁存。
+    pub fn set_tilt(&mut self, x: i8, y: i8) {
+        self.tilt.set_axes(x, y);
+    }
+
+    /// bit 0 左，bit 1 右，bit 2 上，bit 3 下。
+    pub fn set_tilt_bits(&mut self, bits: i8) {
+        let (x, y) = crate::tilt::tilt_axes(bits);
+        self.set_tilt(x, y);
     }
 
     fn cart_gpio_read(&self, addr: u32) -> Option<u8> {
@@ -1102,7 +1119,13 @@ impl Bus {
                         .unwrap_or(0)
                 }
             }
-            0x0E => self.backup.read(addr),
+            0x0E => {
+                if let Some(value) = self.tilt.read(addr) {
+                    value
+                } else {
+                    self.backup.read(addr)
+                }
+            }
             _ => 0,
         }
     }
@@ -1158,7 +1181,11 @@ impl Bus {
                 }
             }
             0x08..=0x0D => self.cart_gpio_write(addr, value),
-            0x0E => self.backup.write(addr, value),
+            0x0E => {
+                if !self.tilt.write(addr, value) {
+                    self.backup.write(addr, value);
+                }
+            }
             _ => {}
         }
     }

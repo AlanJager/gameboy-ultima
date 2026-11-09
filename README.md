@@ -15,6 +15,7 @@
 | SRAM、Flash（64 KiB / 128 KiB）和 EEPROM 存档 | |
 | 卡带 RTC | S-3511。写入日期后按真实时间走，记在卡带旁边的 `.rtc` |
 | 陀螺仪 | 瓦里奥制造 Twisted（`RZWJ`、`RZWE`、`RZWP`）。静止读数 `0x700`。按住 `[` 向左转，`]` 向右转，松开回到静止。不占用十字键 |
+| 倾斜 | 耀西万有引力（`KYGJ`、`KYGE`、`KYGP`）。挂在 `0x0E008000`，写 `0x55` 再写 `0xAA` 才锁存。静止 `0x3A0`。`,` `.` 左右，`;` `'` 上下，松开回到静止。不占用十字键 |
 
 ### 声音
 
@@ -98,7 +99,7 @@ macOS 可以打成独立应用，构建需要 Xcode Command Line Tools：
 
 产物是 `target/ULTIMA.app`。
 
-默认按键：方向键是十字键，X / Z 是 A / B，A / S 是 L / R，Enter 是 Start，Backspace 是 Select，R 复位，Space 暂停。F5 快速存档，F8 快速读档，Tab 按住加速，F6 按住回退，`[` / `]` 是陀螺仪。这些都可以在键位设置里改。
+默认按键：方向键是十字键，X / Z 是 A / B，A / S 是 L / R，Enter 是 Start，Backspace 是 Select，R 复位，Space 暂停。F5 快速存档，F8 快速读档，Tab 按住加速，F6 按住回退，`[` / `]` 是陀螺仪，`,` / `.` / `;` / `'` 是倾斜的左右上下。这些都可以在键位设置里改。
 
 ## 测试
 

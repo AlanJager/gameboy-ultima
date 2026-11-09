@@ -21,6 +21,7 @@ mod lesson;
 mod ppu;
 mod registers;
 mod rtc;
+mod tilt;
 mod ring;
 mod sched;
 mod serde_array;
