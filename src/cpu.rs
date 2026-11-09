@@ -29,13 +29,23 @@ pub fn step(regs: &mut Registers, bus: &mut Bus) -> Result<Stepped, String> {
 
 /// 和 `step` 做同一件事，但不把指令译成文本。窗口按帧跑时用这个。
 ///
+/// 直线上的 Thumb 运算，在 Apple Silicon 上可以先译成一段宿主代码，再按原来的拍数逐条入账。
 /// 下一件日程还远时，最多连跑 8 条再看一眼缓存的截止拍。
 /// 每条仍按自己的拍数 `advance`，所以不会跨过定时器或采样。
 pub fn step_quiet(regs: &mut Registers, bus: &mut Bus) -> Result<(), String> {
     const BATCH: u32 = 8;
-    for _ in 0..BATCH {
+    let mut left = BATCH;
+    while left > 0 {
         let pc = regs.pc();
+        if let Some(ran) = crate::dynarec::try_block(regs, bus, left) {
+            left -= ran;
+            if bus.cycles() >= bus.deadline() {
+                break;
+            }
+            continue;
+        }
         step_at(regs, bus, false)?;
+        left -= 1;
         if regs.pc() == pc || bus.cycles() >= bus.deadline() {
             break;
         }

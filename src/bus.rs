@@ -2,6 +2,7 @@
 use crate::apu::Apu;
 use crate::backup::Backup;
 use crate::dma::Dma;
+use crate::dynarec::Dynarec;
 use crate::gfxcache::{self, Gfx};
 use crate::icache::ICache;
 use crate::keypad::Keypad;
@@ -106,6 +107,9 @@ pub struct Bus {
     /// 译过的指令。命中不再拆位域，执行还是解释。
     #[serde(skip, default = "ICache::new")]
     icache: ICache,
+    /// Thumb 直线运算的宿主代码。回退不复制这段，读档也重新译。
+    #[serde(skip, default)]
+    pub(crate) dynarec: Dynarec,
     /// 哪些扫描线要重新合成。干净的行光束直接跳过。
     dirty: DirtyLines,
     /// 图块索引和精灵行表。只少做解码和 OAM 扫描。
@@ -155,6 +159,7 @@ impl Bus {
             cheat_rom: Vec::new(),
             scheduler: Scheduler::new(),
             icache: ICache::new(),
+            dynarec: Dynarec::default(),
             dirty: DirtyLines::new(),
             gfx: Gfx::new(),
             bios_hle: true,
@@ -172,6 +177,21 @@ impl Bus {
 
     pub fn set_bios_hle(&mut self, enabled: bool) {
         self.bios_hle = enabled;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_dynarec(&mut self, enabled: bool) {
+        self.dynarec.set_enabled(enabled);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dynarec_compiled(&self) -> u64 {
+        self.dynarec.compiled()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dynarec_ran(&self) -> u64 {
+        self.dynarec.ran()
     }
 
     pub fn same_rom(&self, other: &Self) -> bool {
@@ -779,6 +799,22 @@ impl Bus {
         ie & pending != 0
     }
 
+    /// 这一拍的 `advance` 会把按键中断置进 `IF`，而且 CPU 马上会进中断。
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub(crate) fn key_irq_would_fire(&self) -> bool {
+        let mask = self.keys.irq_mask();
+        if mask == 0 || self.io[IME] & 1 == 0 {
+            return false;
+        }
+        let ie = u16::from(self.io[IE]) | (u16::from(self.io[IE + 1]) << 8);
+        ie & mask != 0
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub(crate) fn dma_owing(&self) -> bool {
+        self.dma.owing() != 0
+    }
+
     fn catch_up_timers(&mut self) {
         let (mask, overflows) = self.timers.materialize(self.cycles);
         self.raise_if(mask);
@@ -1034,6 +1070,7 @@ impl Bus {
     pub fn load_rom(&mut self, rom: &[u8]) {
         self.rom = rom.to_vec();
         self.icache.clear();
+        self.dynarec.clear();
         let lab = sensor_lab(&self.rom);
         self.gyro.set_present(crate::gyro::gyro_cart(&self.rom) || lab);
         self.tilt.set_present(crate::tilt::tilt_cart(&self.rom) || lab);

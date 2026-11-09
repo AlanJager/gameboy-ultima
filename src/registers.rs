@@ -81,6 +81,17 @@ impl Registers {
         self.r[15] = value;
     }
 
+    /// `r0`–`r7` 的起点。这八个在任何模式都落在同一组里。
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub(crate) fn low_regs_ptr(&mut self) -> *mut u32 {
+        self.r.as_mut_ptr()
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub(crate) fn cpsr_ptr(&mut self) -> *mut u32 {
+        &mut self.cpsr
+    }
+
     /// 按当前的 T 位对齐。回到 Thumb 时保留 bit 1，ARM 时按字对齐。
     pub(crate) fn set_pc_aligned(&mut self, value: u32) {
         let aligned = if self.thumb() { value & !1 } else { value & !3 };

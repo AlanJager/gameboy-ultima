@@ -12,6 +12,7 @@ mod cpu;
 pub mod decode;
 mod disasm;
 mod dma;
+mod dynarec;
 mod gfxcache;
 mod gyro;
 mod icache;
