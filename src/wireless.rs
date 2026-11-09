@@ -1,7 +1,8 @@
 //! 插在联机口上的无线适配器。
 //!
-//! 游戏用 32 位普通模式登录，口令是 `NINTENDO`，之后用 `0x9966` 命令广播、连人和传数据。
+//! 游戏用 32 位普通模式登录。口令是 `NINTENDO` 再加 `0x8001`，对完才发 `0x9966` 命令。
 //! 真正的电波由联机房间转发。没进房间时适配器还在，只是搜不到别人。
+//! `0x11` 固定回 `0xFF`，一个房间最多 4 台。
 
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +48,20 @@ pub(crate) struct Adapter {
     si_invert: bool,
     holding: bool,
     connect_ok: bool,
+    /// 登录还没开始。第一拍回 0，让游戏自己对齐。
+    #[serde(skip)]
+    login_started: bool,
+    /// 适配器正在出示的那半字，`0..4` 对应 `NINTENDO` 和结束符。
+    #[serde(skip)]
+    login_index: u8,
+    #[serde(skip)]
+    login_prev_lo: u16,
+    #[serde(skip)]
+    login_done: bool,
 }
+
+/// `NINTENDO` 五个半字，最后是 `0x8001`。低字节在前。
+const LOGIN_KEY: [u16; 5] = [0x494E, 0x544E, 0x4E45, 0x4F44, 0x8001];
 
 impl Adapter {
     pub(crate) fn new() -> Self {
@@ -66,7 +80,19 @@ impl Adapter {
             si_invert: false,
             holding: false,
             connect_ok: false,
+            login_started: false,
+            login_index: 0,
+            login_prev_lo: 0,
+            login_done: false,
         }
+    }
+
+    /// `RCNT` 把适配器拉进复位时，登录从头再来。已经连上的房间不动。
+    pub(crate) fn restart_login(&mut self) {
+        self.login_started = false;
+        self.login_index = 0;
+        self.login_prev_lo = 0;
+        self.login_done = false;
     }
 
     pub(crate) fn id(&self) -> u32 {
@@ -169,9 +195,38 @@ impl Adapter {
         if let Some(reply) = self.pending_pop() {
             return reply;
         }
+        if !self.login_done {
+            return self.login_word(word);
+        }
         let low = word & 0xFFFF;
         let high = word >> 16;
         (low << 16) | high
+    }
+
+    /// 高半字是适配器自己的口令，低半字是上一拍游戏低半字的反码。
+    /// 游戏把这两半对上之后，口令往前走一格。收到 `0x8001` 才算登录完成。
+    fn login_word(&mut self, word: u32) -> u32 {
+        let lo = (word & 0xFFFF) as u16;
+        let hi = (word >> 16) as u16;
+        let reply = if !self.login_started {
+            0
+        } else {
+            let own = LOGIN_KEY[usize::from(self.login_index.min(4))];
+            (u32::from(own) << 16) | u32::from(!self.login_prev_lo)
+        };
+        if self.login_started {
+            let expect = LOGIN_KEY[usize::from(self.login_index.min(4))];
+            if lo == expect && hi == !expect && self.login_index < 4 {
+                self.login_index += 1;
+            } else if self.login_index == 4 && lo == LOGIN_KEY[4] {
+                self.login_done = true;
+            } else if lo == LOGIN_KEY[0] && self.login_index > 0 {
+                self.login_index = 0;
+            }
+        }
+        self.login_prev_lo = lo;
+        self.login_started = true;
+        reply
     }
 
     fn pending_pop(&mut self) -> Option<u32> {
@@ -306,10 +361,50 @@ mod tests {
     }
 
     #[test]
-    fn login_swaps_the_two_halfwords() {
+    fn login_walks_the_nintendo_key_and_then_takes_commands() {
         let mut adapter = Adapter::new();
-        assert_eq!(pull(&mut adapter, 0xFFFF_494E), 0x494E_FFFF);
+        let sent = [
+            0x7FFF_494E,
+            0xFFFF_494E,
+            0xB6B1_494E,
+            0xB6B1_544E,
+            0xABB1_544E,
+            0xABB1_4E45,
+            0xB1BA_4E45,
+            0xB1BA_4F44,
+            0xB0BB_4F44,
+            0xB0BB_8001,
+        ];
+        let got = [
+            0x0000_0000,
+            0x494E_B6B1,
+            0x494E_B6B1,
+            0x544E_B6B1,
+            0x544E_ABB1,
+            0x4E45_ABB1,
+            0x4E45_B1BA,
+            0x4F44_B1BA,
+            0x4F44_B0BB,
+            0x8001_B0BB,
+        ];
+        for (word, reply) in sent.into_iter().zip(got) {
+            assert_eq!(pull(&mut adapter, word), reply, "{word:08X}");
+        }
+        assert_eq!(pull(&mut adapter, 0x9966_0011), 0x8000_0000);
+        assert_eq!(pull(&mut adapter, 0x8000_0000), 0x9966_0191);
+        assert_eq!(pull(&mut adapter, 0x8000_0000), 0xFF);
+    }
+
+    #[test]
+    fn a_broken_login_starts_the_key_over() {
+        let mut adapter = Adapter::new();
+        pull(&mut adapter, 0xFFFF_494E);
+        pull(&mut adapter, 0xB6B1_494E);
+        pull(&mut adapter, 0xB6B1_544E);
+        assert_eq!(pull(&mut adapter, 0xFFFF_494E), 0x544E_ABB1);
         assert_eq!(pull(&mut adapter, 0xB6B1_494E), 0x494E_B6B1);
+        adapter.restart_login();
+        assert_eq!(pull(&mut adapter, 0xFFFF_494E), 0);
     }
 
     #[test]

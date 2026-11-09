@@ -173,7 +173,11 @@ impl Sio {
                 None
             }
             0x135 => {
+                let prev = self.rcnt;
                 self.rcnt = (self.rcnt & 0x00FF) | (u16::from(value) << 8);
+                if prev & RCNT_GPIO == 0 && self.rcnt & RCNT_GPIO != 0 {
+                    self.adapter.restart_login();
+                }
                 None
             }
             _ => None,
@@ -463,7 +467,7 @@ mod tests {
         bus.write_u32(0x0400_0120, 0xFFFF_494E);
         bus.write_u16(0x0400_0128, 0x5083);
         bus.advance(3_000);
-        assert_eq!(bus.read_u32(0x0400_0120), 0x494E_FFFF);
+        assert_eq!(bus.read_u32(0x0400_0120), 0);
         assert_eq!(bus.read_u16(0x0400_0128) & 0x80, 0);
     }
 }
