@@ -134,6 +134,14 @@ impl AudioLink {
         self.control.produced.load(Ordering::Relaxed)
     }
 
+    pub fn queued(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
     fn pending(&self) -> Vec<Sample> {
         self.data.pending()
     }
@@ -429,6 +437,10 @@ impl Sampler {
     pub(crate) fn overruns(&self) -> u64 {
         self.link.overruns()
     }
+
+    pub(crate) fn queue(&self) -> (usize, usize, u32) {
+        (self.link.queued(), self.link.capacity(), self.link.hz())
+    }
 }
 
 pub fn sample_period(bias: u16) -> u32 {
@@ -442,6 +454,20 @@ pub fn sample_period(bias: u16) -> u32 {
 
 pub fn sample_hz(bias: u16) -> u32 {
     16_777_216 / sample_period(bias)
+}
+
+/// 按还没播出去的样本，把一帧的等待拉长或缩短。
+///
+/// `1.0` 是积压刚好。播放跟不上、环里堆多了，就放慢模拟；快播空了，就稍快一点补上。
+/// 目标大约 50ms，并夹在环容量的八分之一到一半之间。偏离最多 8%。环真的满了仍会丢掉新样本。
+pub fn audio_pace(queued: usize, capacity: usize, hz: u32) -> f64 {
+    if hz == 0 || capacity < 8 {
+        return 1.0;
+    }
+    let window = (u64::from(hz) / 20) as usize;
+    let target = window.clamp(capacity / 8, capacity / 2).max(1);
+    let error = queued as f64 - target as f64;
+    (1.0 + error / target as f64 * 0.12).clamp(0.92, 1.08)
 }
 
 pub fn pwm(level: i16, bias: u16) -> i16 {
@@ -485,6 +511,23 @@ mod tests {
         bus.write_u16(SOUND + 0x84, 0x0080);
         bus.write_u16(SOUND + 0x80, (1 << 9) | 0x0077);
         bus.write_u16(SOUND + 0x82, 2);
+    }
+
+    #[test]
+    fn audio_pace_slows_when_playback_falls_behind_and_speeds_up_when_the_queue_is_low() {
+        let hz = 32_768;
+        let capacity = 8192;
+        let target = (hz / 20) as usize;
+        assert!((audio_pace(target, capacity, hz) - 1.0).abs() < 1e-9);
+        assert!(audio_pace(capacity, capacity, hz) > 1.0);
+        assert!(audio_pace(0, capacity, hz) < 1.0);
+        assert_eq!(audio_pace(capacity, capacity, hz), 1.08);
+        assert_eq!(audio_pace(0, capacity, hz), 0.92);
+        assert_eq!(audio_pace(10, capacity, 0), 1.0);
+        assert_eq!(audio_pace(10, 4, hz), 1.0);
+        let fast = 262_144;
+        let fast_target = (capacity / 2).min((fast / 20) as usize);
+        assert!((audio_pace(fast_target, capacity, fast) - 1.0).abs() < 1e-9);
     }
 
     #[test]
