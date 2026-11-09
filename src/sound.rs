@@ -430,6 +430,12 @@ impl Sampler {
         self.link.clone()
     }
 
+    /// 换回正在播放的那条环，并让播放端丢掉积压。回退不能另开一条路。
+    pub(crate) fn rebind(&mut self, link: AudioLink) {
+        self.link = link;
+        self.link.request_discard();
+    }
+
     pub(crate) fn hz(&self) -> u32 {
         self.link.hz()
     }

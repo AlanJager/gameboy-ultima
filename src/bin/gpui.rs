@@ -1,7 +1,7 @@
 // objc 0.2's `sel!` checks `cfg(feature = "cargo-clippy")` at this crate.
 #![allow(unexpected_cfgs)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -213,6 +213,7 @@ impl Hotkey {
             Self::QuickSave => Some(Command::QuickSaveState),
             Self::QuickLoad => Some(Command::QuickLoadState),
             Self::FastForward => None,
+            Self::Rewind => None,
         }
     }
 }
@@ -306,6 +307,7 @@ struct AppView {
     locked_speed: Arc<AtomicU8>,
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
+    rewind_held: Arc<AtomicBool>,
     focus_handle: FocusHandle,
     image_version: u64,
     picture: PictureMode,
@@ -339,6 +341,7 @@ impl AppView {
         locked_speed: Arc<AtomicU8>,
         turbo_ratio: Arc<AtomicU8>,
         turbo_held: Arc<AtomicBool>,
+        rewind_held: Arc<AtomicBool>,
         library_mode: Arc<AtomicBool>,
         controls: Arc<Mutex<ControlSettings>>,
         link_ui: Arc<Mutex<LinkUi>>,
@@ -366,6 +369,7 @@ impl AppView {
             locked_speed,
             turbo_ratio,
             turbo_held,
+            rewind_held,
             focus_handle,
             image_version: 0,
             picture,
@@ -405,6 +409,7 @@ impl AppView {
 
     fn release_turbo(&self) {
         self.turbo_held.store(false, Ordering::Relaxed);
+        self.rewind_held.store(false, Ordering::Relaxed);
     }
 
     fn begin_capture(&self, target: BindingTarget, cx: &mut Context<Self>) {
@@ -652,6 +657,10 @@ impl AppView {
                 self.turbo_held.store(true, Ordering::Relaxed);
                 return;
             }
+            if hotkey == Hotkey::Rewind {
+                self.rewind_held.store(true, Ordering::Relaxed);
+                return;
+            }
             if !event.is_held {
                 if let Some(command) = hotkey.command() {
                     let _ = self.commands.send(command);
@@ -667,8 +676,12 @@ impl AppView {
         let open = settings.open;
         let map = settings.map.clone();
         drop(settings);
-        if map.hotkey_for_key(&event.keystroke.key) == Some(Hotkey::FastForward) {
-            self.release_turbo();
+        let released = map.hotkey_for_key(&event.keystroke.key);
+        if released == Some(Hotkey::FastForward) {
+            self.turbo_held.store(false, Ordering::Relaxed);
+        }
+        if released == Some(Hotkey::Rewind) {
+            self.rewind_held.store(false, Ordering::Relaxed);
         }
         if open || self.link_open() {
             return;
@@ -1165,6 +1178,9 @@ impl Render for AppView {
                 .relative()
                 .child(letterboxed_screen(screen, screen_h))
                 .when(speed_now > 1, |game| game.child(speed_badge(speed_now)))
+                .when(self.rewind_held.load(Ordering::Relaxed), |game| {
+                    game.child(rewind_badge())
+                })
                 .when(link_in_room, |game| game.child(link_board(&link_seats)))
                 .when(!link_in_room && !link_line.is_empty(), |game| {
                     game.child(link_chip(&link_line))
@@ -1887,6 +1903,7 @@ fn function_bindings(
         .child(named_hotkey(cx, map, capturing, Hotkey::QuickSave))
         .child(named_hotkey(cx, map, capturing, Hotkey::QuickLoad))
         .child(named_hotkey(cx, map, capturing, Hotkey::FastForward))
+        .child(named_hotkey(cx, map, capturing, Hotkey::Rewind))
 }
 
 fn named_hotkey(
@@ -2313,6 +2330,20 @@ fn link_name_char(key: &str) -> Option<char> {
     }
 }
 
+fn rewind_badge() -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(12.))
+        .left(px(12.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(4.))
+        .bg(rgb(PANEL_HI))
+        .text_color(rgb(ACCENT))
+        .text_sm()
+        .child("回退")
+}
+
 fn speed_badge(speed: u8) -> impl IntoElement {
     div()
         .absolute()
@@ -2331,6 +2362,7 @@ fn start_emulator(
     locked_speed: Arc<AtomicU8>,
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
+    rewind_held: Arc<AtomicBool>,
 ) -> (
     Arc<Mutex<Snapshot>>,
     mpsc::Sender<Command>,
@@ -2364,6 +2396,7 @@ fn start_emulator(
     let worker_locked_speed = Arc::clone(&locked_speed);
     let worker_turbo_ratio = Arc::clone(&turbo_ratio);
     let worker_turbo_held = Arc::clone(&turbo_held);
+    let worker_rewind_held = Arc::clone(&rewind_held);
     let worker = thread::Builder::new()
         .name("ultima-emulator".into())
         .stack_size(8 * 1024 * 1024)
@@ -2377,6 +2410,7 @@ fn start_emulator(
                 worker_locked_speed,
                 worker_turbo_ratio,
                 worker_turbo_held,
+                worker_rewind_held,
             )
         })
         .expect("start emulator worker");
@@ -2469,6 +2503,84 @@ fn take_link_command(
     }
 }
 
+/// 大约十秒。每半秒一档，按住时每四帧退一档。
+const REWIND_EVERY: u32 = 30;
+const REWIND_SLOTS: usize = 20;
+const REWIND_HOLD: u32 = 3;
+
+struct RewindSlot {
+    regs: Registers,
+    bus: Bus,
+    frame_number: u64,
+}
+
+struct Rewind {
+    slots: VecDeque<RewindSlot>,
+    since: u32,
+    hold: u32,
+}
+
+impl Rewind {
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.since = 0;
+        self.hold = 0;
+    }
+
+    fn released(&mut self) {
+        self.hold = 0;
+    }
+
+    fn record(&mut self, regs: &Registers, bus: &mut Bus, frame_number: u64) {
+        self.since += 1;
+        if self.since < REWIND_EVERY {
+            return;
+        }
+        self.since = 0;
+        if self.slots.len() == REWIND_SLOTS {
+            self.slots.pop_front();
+        }
+        self.slots.push_back(RewindSlot {
+            regs: regs.clone(),
+            bus: bus.rewind_capture(),
+            frame_number,
+        });
+    }
+
+    fn retreat(&mut self) -> Option<RewindSlot> {
+        if self.hold > 0 {
+            self.hold -= 1;
+            return None;
+        }
+        let slot = self.slots.pop_back()?;
+        self.hold = REWIND_HOLD;
+        self.since = 0;
+        Some(slot)
+    }
+}
+
+impl Default for Rewind {
+    fn default() -> Self {
+        Self {
+            slots: VecDeque::new(),
+            since: 0,
+            hold: 0,
+        }
+    }
+}
+
+fn drops_rewind(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Load(_)
+            | Command::Reset
+            | Command::StartFresh
+            | Command::LoadStateSlot(_)
+            | Command::QuickLoadState
+            | Command::ResumeState
+    )
+}
+
 fn emulator_worker(
     receiver: mpsc::Receiver<Command>,
     snapshot: Arc<Mutex<Snapshot>>,
@@ -2478,6 +2590,7 @@ fn emulator_worker(
     locked_speed: Arc<AtomicU8>,
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
+    rewind_held: Arc<AtomicBool>,
 ) {
     let mut cart: Option<ActiveCart> = None;
     let mut audio: Option<AudioPlay> = None;
@@ -2490,6 +2603,7 @@ fn emulator_worker(
     let mut pads = open_gamepads();
     let mut link = LinkHub::new();
     let mut link_steps = 0u32;
+    let mut rewind = Rewind::default();
 
     'worker: loop {
         let pad = poll_gamepad(&mut pads);
@@ -2497,6 +2611,9 @@ fn emulator_worker(
             drive_link(&mut link, &mut cart, &snapshot);
             match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(command) => {
+                    if drops_rewind(&command) {
+                        rewind.clear();
+                    }
                     if let Some(command) =
                         take_link_command(command, &mut link, &mut cart, &snapshot)
                     {
@@ -2540,18 +2657,76 @@ fn emulator_worker(
             .bus
             .set_fast_forward(speed > 1);
 
-        let frame_end = cart
-            .as_ref()
-            .expect("running cart exists")
-            .bus
-            .cycles()
-            .saturating_add(CYCLES_PER_FRAME);
+        let rewinding = rewind_held.load(Ordering::Relaxed);
+        if rewinding {
+            match receiver.try_recv() {
+                Ok(command) => {
+                    if drops_rewind(&command) {
+                        rewind.clear();
+                    }
+                    if let Some(command) =
+                        take_link_command(command, &mut link, &mut cart, &snapshot)
+                    {
+                        match apply_command(
+                            command,
+                            &mut cart,
+                            &mut audio,
+                            &mut paused,
+                            &mut bios_hle,
+                            &mut frame_number,
+                            CommandContext {
+                                snapshot: &snapshot,
+                                library_path: library_path.as_deref(),
+                                audio_volume: &audio_volume,
+                                screenshot_frames_left: &mut screenshot_frames_left,
+                            },
+                        ) {
+                            CommandResult::Continue => {}
+                            CommandResult::RestartFrame => {
+                                next_frame_deadline = Instant::now();
+                                continue 'worker;
+                            }
+                            CommandResult::Shutdown => break 'worker,
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break 'worker,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if paused || cart.is_none() {
+                continue 'worker;
+            }
+            if let Some(slot) = rewind.retreat() {
+                let active = cart.as_mut().expect("running cart exists");
+                active.regs = slot.regs;
+                active.bus.rewind_restore(slot.bus);
+                frame_number = slot.frame_number;
+            }
+        } else {
+            rewind.released();
+        }
+
+        let frame_end = {
+            let cycles = cart
+                .as_ref()
+                .expect("running cart exists")
+                .bus
+                .cycles();
+            if rewinding {
+                cycles
+            } else {
+                cycles.saturating_add(CYCLES_PER_FRAME)
+            }
+        };
         while cart
             .as_ref()
             .is_some_and(|active| active.bus.cycles() < frame_end)
         {
             match receiver.try_recv() {
                 Ok(command) => {
+                    if drops_rewind(&command) {
+                        rewind.clear();
+                    }
                     let Some(command) =
                         take_link_command(command, &mut link, &mut cart, &snapshot)
                     else {
@@ -2612,7 +2787,12 @@ fn emulator_worker(
         if cart.is_none() {
             continue;
         }
-        frame_number += 1;
+        if !rewinding {
+            frame_number += 1;
+            if let Some(active) = cart.as_mut() {
+                rewind.record(&active.regs, &mut active.bus, frame_number);
+            }
+        }
         let rgba = frame_to_rgba(cart.as_ref().expect("running cart exists").bus.frame());
         if let Some(left) = screenshot_frames_left {
             let left = left.saturating_sub(1);
@@ -3690,6 +3870,7 @@ struct WindowLaunch {
     locked_speed: Arc<AtomicU8>,
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
+    rewind_held: Arc<AtomicBool>,
     library_mode: Arc<AtomicBool>,
     controls: Arc<Mutex<ControlSettings>>,
     link_ui: Arc<Mutex<LinkUi>>,
@@ -3963,6 +4144,7 @@ fn open_game_window(
                     Arc::clone(&launch.locked_speed),
                     Arc::clone(&launch.turbo_ratio),
                     Arc::clone(&launch.turbo_held),
+                    Arc::clone(&launch.rewind_held),
                     launch.library_mode,
                     launch.controls,
                     launch.link_ui,
@@ -4219,10 +4401,12 @@ fn main() {
     let locked_speed = Arc::new(AtomicU8::new(saved.speed));
     let turbo_ratio = Arc::new(AtomicU8::new(saved.turbo));
     let turbo_held = Arc::new(AtomicBool::new(false));
+    let rewind_held = Arc::new(AtomicBool::new(false));
     let (snapshot, commands, keys, audio_volume, worker) = start_emulator(
         Arc::clone(&locked_speed),
         Arc::clone(&turbo_ratio),
         Arc::clone(&turbo_held),
+        Arc::clone(&rewind_held),
     );
     let (launch_rom, compare_on_launch) = launch_arguments();
     if let Some(path) = &launch_rom {
@@ -4254,6 +4438,7 @@ fn main() {
         locked_speed,
         turbo_ratio,
         turbo_held: Arc::clone(&turbo_held),
+        rewind_held: Arc::clone(&rewind_held),
         library_mode: Arc::clone(&library_mode),
         controls: Arc::clone(&controls),
         link_ui: Arc::clone(&link_ui),
@@ -4480,6 +4665,52 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewind_keeps_half_second_slots_and_steps_back_slowly() {
+        let mut bus = Bus::new();
+        bus.load_rom(&[0x12, 0x34]);
+        let regs = Registers::arm_start(0x0800_0000);
+        let mut rewind = Rewind::default();
+        for frame in 1..REWIND_EVERY {
+            rewind.record(&regs, &mut bus, frame.into());
+        }
+        assert!(rewind.slots.is_empty());
+        rewind.record(&regs, &mut bus, u64::from(REWIND_EVERY));
+        assert_eq!(rewind.slots.len(), 1);
+        assert_eq!(rewind.slots[0].frame_number, u64::from(REWIND_EVERY));
+        assert_eq!(bus.read_u8(0x0800_0000), 0x12);
+
+        for slot in 1..REWIND_SLOTS + 2 {
+            let frame = REWIND_EVERY as u64 * (slot as u64 + 1);
+            for _ in 0..REWIND_EVERY {
+                rewind.record(&regs, &mut bus, frame);
+            }
+        }
+        assert_eq!(rewind.slots.len(), REWIND_SLOTS);
+        assert_eq!(rewind.slots.front().expect("oldest slot").frame_number, 90);
+        assert_eq!(
+            rewind.slots.back().expect("newest slot").frame_number,
+            u64::from(REWIND_EVERY) * (REWIND_SLOTS as u64 + 2)
+        );
+
+        let newest = rewind.retreat().expect("first hold steps back");
+        assert_eq!(
+            newest.frame_number,
+            u64::from(REWIND_EVERY) * (REWIND_SLOTS as u64 + 2)
+        );
+        assert!(rewind.retreat().is_none());
+        assert!(rewind.retreat().is_none());
+        assert!(rewind.retreat().is_none());
+        let older = rewind.retreat().expect("next slot after the hold");
+        assert_eq!(
+            older.frame_number,
+            u64::from(REWIND_EVERY) * (REWIND_SLOTS as u64 + 1)
+        );
+        rewind.released();
+        rewind.clear();
+        assert!(rewind.retreat().is_none());
+    }
 
     #[test]
     fn custom_boot_animation_progress_stops_after_its_intro() {

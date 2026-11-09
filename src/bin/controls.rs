@@ -124,16 +124,23 @@ pub(crate) enum Hotkey {
     QuickSave,
     QuickLoad,
     FastForward,
+    Rewind,
 }
 
 impl Hotkey {
-    pub(crate) const ALL: [Self; 3] = [Self::QuickSave, Self::QuickLoad, Self::FastForward];
+    pub(crate) const ALL: [Self; 4] = [
+        Self::QuickSave,
+        Self::QuickLoad,
+        Self::FastForward,
+        Self::Rewind,
+    ];
 
     pub(crate) fn index(self) -> usize {
         match self {
             Self::QuickSave => 0,
             Self::QuickLoad => 1,
             Self::FastForward => 2,
+            Self::Rewind => 3,
         }
     }
 
@@ -142,6 +149,7 @@ impl Hotkey {
             Self::QuickSave => "快速存档",
             Self::QuickLoad => "快速读档",
             Self::FastForward => "按住加速",
+            Self::Rewind => "按住回退",
         }
     }
 
@@ -150,6 +158,7 @@ impl Hotkey {
             Self::QuickSave => "quick_save",
             Self::QuickLoad => "quick_load",
             Self::FastForward => "fast_forward",
+            Self::Rewind => "rewind",
         }
     }
 
@@ -158,6 +167,7 @@ impl Hotkey {
             Self::QuickSave => "hotkey-quick-save",
             Self::QuickLoad => "hotkey-quick-load",
             Self::FastForward => "hotkey-fast-forward",
+            Self::Rewind => "hotkey-rewind",
         }
     }
 }
@@ -187,7 +197,7 @@ impl BindingTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KeyMap {
     keys: [String; 11],
-    hotkeys: [String; 3],
+    hotkeys: [String; 4],
 }
 
 impl Default for KeyMap {
@@ -206,7 +216,7 @@ impl Default for KeyMap {
                 "a".into(),
                 "r".into(),
             ],
-            hotkeys: ["f5".into(), "f8".into(), "tab".into()],
+            hotkeys: ["f5".into(), "f8".into(), "tab".into(), "f6".into()],
         }
     }
 }
@@ -796,6 +806,7 @@ mod tests {
         assert_eq!(loaded.map.hotkey(Hotkey::QuickSave), "f5");
         assert_eq!(loaded.map.hotkey(Hotkey::QuickLoad), "f8");
         assert_eq!(loaded.map.hotkey(Hotkey::FastForward), "tab");
+        assert_eq!(loaded.map.hotkey(Hotkey::Rewind), "f6");
         let legacy = dir.join("legacy.json");
         std::fs::write(&legacy, r#"{"version":1,"bindings":{"a":"k"}}"#).unwrap();
         let legacy = read_controls(&legacy).unwrap();
@@ -805,6 +816,7 @@ mod tests {
         assert_eq!(legacy.map.hotkey(Hotkey::QuickSave), "f5");
         assert_eq!(legacy.map.hotkey(Hotkey::QuickLoad), "f8");
         assert_eq!(legacy.map.hotkey(Hotkey::FastForward), "tab");
+        assert_eq!(legacy.map.hotkey(Hotkey::Rewind), "f6");
         assert_eq!(key_label("left"), "←");
         assert_eq!(key_label("f5"), "F5");
         assert_eq!(key_label(""), "未设置");

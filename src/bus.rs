@@ -1012,6 +1012,23 @@ impl Bus {
         self.icache.clear();
     }
 
+    /// 记下这一刻的机器。卡带字节不复制，快照里的 ROM 是空的。
+    pub fn rewind_capture(&mut self) -> Self {
+        let rom = std::mem::take(&mut self.rom);
+        let snap = self.clone();
+        self.rom = rom;
+        snap
+    }
+
+    /// 回到快照。留下当前卡带和播放线程那条环，积压的采样丢掉。
+    pub fn rewind_restore(&mut self, mut snap: Self) {
+        let rom = std::mem::take(&mut self.rom);
+        let link = self.sound.link();
+        snap.rom = rom;
+        *self = snap;
+        self.sound.rebind(link);
+    }
+
     pub(crate) fn decode_arm(&mut self, pc: u32, word: u32) -> Option<crate::disasm::Op> {
         self.icache.arm(pc, word)
     }
@@ -1667,5 +1684,23 @@ mod tests {
         bus.advance(1);
         assert_eq!(bus.read_u16(0x0400_0104), 0xFFFF);
         assert_eq!(bus.read_u16(0x0400_0202), 0x0010);
+    }
+
+    #[test]
+    fn rewind_restores_memory_without_a_second_copy_of_the_rom() {
+        let mut bus = Bus::new();
+        bus.load_rom(&[0xEA, 0x00, 0x00, 0x00]);
+        bus.write_u8(0x0200_0000, 0x11);
+        let snap = bus.rewind_capture();
+        assert!(snap.rom.is_empty());
+        assert_eq!(bus.rom, [0xEA, 0x00, 0x00, 0x00]);
+        bus.write_u8(0x0200_0000, 0x22);
+        bus.sound.latch((1000, -1000), 0);
+        bus.rewind_restore(snap);
+        assert_eq!(bus.read_u8(0x0200_0000), 0x11);
+        assert_eq!(bus.read_u8(0x0800_0000), 0xEA);
+        assert_eq!(bus.rom.len(), 4);
+        let (left, _) = bus.sound.samples();
+        assert!(!left.is_empty());
     }
 }
