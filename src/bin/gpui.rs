@@ -229,6 +229,8 @@ enum Command {
     StartFresh,
     Reset,
     HostLink,
+    ServeRelay,
+    HostRelay(String),
     JoinLink(String),
     StopLink,
     SetLinkName(String),
@@ -2644,6 +2646,7 @@ fn link_overlay(
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .gap(px(10.))
                         .child(
                             div()
@@ -2659,6 +2662,42 @@ fn link_overlay(
                                     cx.notify();
                                 }))
                                 .child("做主机"),
+                        )
+                        .child(
+                            div()
+                                .id("link-relay-host")
+                                .px(px(14.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(ACCENT))
+                                .text_color(rgb(BG))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let address = this
+                                        .link_ui
+                                        .lock()
+                                        .expect("link ui poisoned")
+                                        .address
+                                        .clone();
+                                    let _ = this.commands.send(Command::HostRelay(address));
+                                    cx.notify();
+                                }))
+                                .child("经中继开房"),
+                        )
+                        .child(
+                            div()
+                                .id("link-relay")
+                                .px(px(14.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(BG))
+                                .text_color(rgb(TEXT))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let _ = this.commands.send(Command::ServeRelay);
+                                    cx.notify();
+                                }))
+                                .child("本机中继"),
                         )
                         .child(
                             div()
@@ -2749,7 +2788,7 @@ fn link_overlay(
                         .text_xs()
                         .text_color(rgb(MUTED))
                         .child(format!(
-                            "本机 {lan_ip}:5576。点名字或地址再输入，Command-V 粘贴。同一张卡带，主机是 1 号机。Esc 只关闭面板。"
+                            "本机 {lan_ip}:5576，中继端口 5578。同一 Wi-Fi 可以点下面的主机。跨网时把状态栏里的地址#房间号填进手动加入。Command-V 粘贴。同一张卡带，主机是 1 号机。"
                         )),
                 ),
         )
@@ -2939,6 +2978,16 @@ fn write_link_view(state: &mut Snapshot, view: &gameboy_ultima::link::LinkView) 
     state.link_seats = view.seats.clone();
 }
 
+fn relay_target(address: &str) -> String {
+    let address = address.trim();
+    let address = address.split('#').next().unwrap_or(address).trim();
+    if address.is_empty() {
+        "127.0.0.1:5578".to_string()
+    } else {
+        address.to_string()
+    }
+}
+
 fn take_link_command(
     command: Command,
     link: &mut LinkHub,
@@ -2969,6 +3018,22 @@ fn take_link_command(
                     let _ = link.host(&rom_id);
                 }
                 None => link.note("先打开一张卡带，再做主机"),
+            }
+            publish_link(snapshot, link);
+            None
+        }
+        Command::ServeRelay => {
+            let _ = link.serve_relay();
+            publish_link(snapshot, link);
+            None
+        }
+        Command::HostRelay(address) => {
+            match cart.as_ref() {
+                Some(active) => {
+                    let rom_id = active.rom_id.clone();
+                    let _ = link.host_via(&relay_target(&address), &rom_id);
+                }
+                None => link.note("先打开一张卡带，再经中继开房"),
             }
             publish_link(snapshot, link);
             None
@@ -4152,7 +4217,12 @@ fn apply_command(
             set_error(snapshot, error);
             CommandResult::Continue
         }
-        Command::HostLink | Command::JoinLink(_) | Command::StopLink | Command::SetLinkName(_) => {
+        Command::HostLink
+        | Command::ServeRelay
+        | Command::HostRelay(_)
+        | Command::JoinLink(_)
+        | Command::StopLink
+        | Command::SetLinkName(_) => {
             CommandResult::Continue
         }
         Command::AddCheat { .. } | Command::ToggleCheat(_) | Command::RemoveCheat(_) => {

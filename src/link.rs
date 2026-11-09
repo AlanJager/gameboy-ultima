@@ -1,20 +1,33 @@
-//! 局域网上的联机房间，最多四台。
+//! 局域网上的联机房间，最多四台。不在同一网络时，经中继向外连接。
 //!
 //! 主机听 `0.0.0.0:5576`，并每半秒往局域网广播自己。客人搜到名字就能加入，也可以手填地址。
+//! 中继听 `5578`。主机和客人都主动连过去，房间号写成 `地址#房间`。中继只把两边的字节对上，
+//! 联机协议不变。局域网发现和手填地址照旧。
 //! 联机线一次交换四台的 16 位。同一条连接也转发无线适配器的广播和数据包。
 //! 卡带内容不一致就拒绝。
 
-use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::collections::{HashMap, VecDeque};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::sync::Mutex;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::bus::Bus;
 
 pub const LINK_PORT: u16 = 5576;
+pub const RELAY_PORT: u16 = 5578;
 const DISCOVERY_PORT: u16 = 5577;
+const RELAY_MAGIC: &[u8] = b"URELAY1";
+const RELAY_HOST: u8 = 1;
+const RELAY_GUEST: u8 = 2;
+const RELAY_ATTACH: u8 = 3;
+const RELAY_OK: u8 = 1;
+const RELAY_FULL: u8 = 2;
+const RELAY_UNKNOWN: u8 = 3;
+const RELAY_BAD: u8 = 4;
+const RELAY_TOKEN: u8 = 0xA1;
 const DISCOVERY_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 1);
 const MAGIC: &[u8] = b"ULTIMA1";
 const READY: u8 = 1;
@@ -112,6 +125,14 @@ enum WireFrame {
     Roster(u8),
 }
 
+struct RelaySession {
+    control: TcpStream,
+    address: SocketAddr,
+    room: [u8; 4],
+    inbox: Vec<u8>,
+    dead: bool,
+}
+
 pub struct LinkHub {
     role: Role,
     discovery: Option<UdpSocket>,
@@ -126,6 +147,8 @@ pub struct LinkHub {
     player: Option<u8>,
     peers: u8,
     remotes: Vec<(u32, [u32; 6])>,
+    relay: Option<RelaySession>,
+    relay_server: Option<RelayServer>,
 }
 
 impl LinkHub {
@@ -146,7 +169,79 @@ impl LinkHub {
             player: None,
             peers: 1,
             remotes: Vec::new(),
+            relay: None,
+            relay_server: None,
         }
+    }
+
+    pub fn serve_relay(&mut self) -> Result<u16, String> {
+        self.serve_relay_on(RELAY_PORT)
+    }
+
+    pub fn serve_relay_on(&mut self, port: u16) -> Result<u16, String> {
+        if let Some(server) = &self.relay_server {
+            return Ok(server.port);
+        }
+        let server = match RelayServer::start(port) {
+            Ok(server) => server,
+            Err(error) => return Err(self.fail(error)),
+        };
+        let port = server.port;
+        self.relay_server = Some(server);
+        self.error = None;
+        self.line = format!("本机中继已开 · {}:{port}", self.share_host());
+        Ok(port)
+    }
+
+    pub fn host_via(&mut self, relay: &str, rom_id: &str) -> Result<String, String> {
+        let addr = match parse_relay_address(relay) {
+            Ok(addr) => addr,
+            Err(error) => return Err(self.fail(error)),
+        };
+        self.stop();
+        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, LINK_PORT)).ok();
+        if let Some(listener) = listener.as_ref() {
+            if listener.set_nonblocking(true).is_err() {
+                self.stop();
+                return Err(self.fail("联机端口无法改成非阻塞".into()));
+            }
+        }
+        let port = listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|addr| addr.port())
+            .unwrap_or(0);
+        self.role = Role::Host(Peer::new(listener, port, rom_id));
+        let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.stop();
+                return Err(self.fail(format!("连接中继 {addr} 失败：{error}")));
+            }
+        };
+        let room = match relay_handshake(&mut stream, RELAY_HOST, [0; 4], [0; 4]) {
+            Ok(room) => room,
+            Err(error) => {
+                self.stop();
+                return Err(self.fail(error));
+            }
+        };
+        if prepare_stream(&stream).is_err() {
+            self.stop();
+            return Err(self.fail("中继套接字设置失败".into()));
+        }
+        self.relay = Some(RelaySession {
+            control: stream,
+            address: addr,
+            room,
+            inbox: Vec::new(),
+            dead: false,
+        });
+        self.player = None;
+        self.error = None;
+        self.line = format!("中继 {} · 等待加入 · 1/4 · {}", room_text(&room), self.relay_share());
+        self.beacon();
+        Ok(room_text(&room))
     }
 
     pub fn host(&mut self, rom_id: &str) -> Result<(), String> {
@@ -175,6 +270,9 @@ impl LinkHub {
     }
 
     pub fn join(&mut self, address: &str, rom_id: &str) -> Result<(), String> {
+        if let Some((relay, room)) = split_relay(address) {
+            return self.join_via(relay, room, rom_id);
+        }
         let addr = match parse_address(address) {
             Ok(addr) => addr,
             Err(error) => return Err(self.fail(error)),
@@ -198,14 +296,50 @@ impl LinkHub {
         Ok(())
     }
 
+    fn join_via(&mut self, relay: &str, room: &str, rom_id: &str) -> Result<(), String> {
+        let addr = match parse_relay_address(relay) {
+            Ok(addr) => addr,
+            Err(error) => return Err(self.fail(error)),
+        };
+        let room = match parse_room(room) {
+            Ok(room) => room,
+            Err(error) => return Err(self.fail(error)),
+        };
+        self.stop();
+        let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            Ok(stream) => stream,
+            Err(error) => return Err(self.fail(format!("连接中继 {addr} 失败：{error}"))),
+        };
+        if let Err(error) = relay_handshake(&mut stream, RELAY_GUEST, room, [0; 4]) {
+            return Err(self.fail(error));
+        }
+        if let Err(error) = prepare_stream(&stream) {
+            return Err(self.fail(error));
+        }
+        let mut peer = Peer::new(None, addr.port(), rom_id);
+        peer.attach(stream);
+        peer.send_hello();
+        peer.send_name(&self.name);
+        self.role = Role::Guest(peer);
+        self.player = None;
+        self.error = None;
+        self.line = format!("正在连接中继 {}", room_text(&room));
+        Ok(())
+    }
+
     pub fn stop(&mut self) {
         self.remove_announcement();
+        self.relay = None;
         self.role = Role::Idle;
         self.player = None;
         self.peers = 1;
         self.remotes.clear();
         self.line.clear();
         self.error = None;
+        if let Some(server) = &self.relay_server {
+            let port = server.port;
+            self.line = format!("本机中继已开 · {}:{port}", self.share_host());
+        }
     }
 
     pub fn set_name(&mut self, name: &str) {
@@ -362,6 +496,13 @@ impl LinkHub {
     }
 
     fn pump(&mut self) {
+        let arrivals = self.take_relay_arrivals();
+        if let Role::Host(peer) = &mut self.role {
+            for stream in arrivals {
+                peer.adopt_guest(stream);
+            }
+        }
+        let relay_share = self.relay_share();
         let guest_rejected = match &mut self.role {
             Role::Host(peer) => {
                 let port = peer.port;
@@ -381,12 +522,21 @@ impl LinkHub {
                     self.peers = (1 + welcomed).min(4);
                     peer.note_roster(self.peers);
                     if self.error.is_none() {
-                        self.line = format!("联机 · {}/4 · 1号机", self.peers);
+                        self.line = if relay_share.is_empty() {
+                            format!("联机 · {}/4 · 1号机", self.peers)
+                        } else {
+                            format!("联机 · {}/4 · 1号机 · {relay_share}", self.peers)
+                        };
                     }
                 } else if self.error.is_none() {
                     self.player = None;
                     self.peers = 1;
-                    self.line = format!("等待加入 · 1/4 · {}:{port}", self.lan_ip);
+                    self.line = if relay_share.is_empty() {
+                        format!("等待加入 · 1/4 · {}:{port}", self.lan_ip)
+                    } else {
+                        let code = relay_share.rsplit_once('#').map(|(_, code)| code).unwrap_or("");
+                        format!("中继 {code} · 等待加入 · 1/4 · {relay_share}")
+                    };
                 }
                 false
             }
@@ -544,10 +694,64 @@ impl LinkHub {
         }
     }
 
+    fn relay_share(&self) -> String {
+        let Some(relay) = &self.relay else {
+            return String::new();
+        };
+        format!("{}#{}", self.relay_host(relay.address), room_text(&relay.room))
+    }
+
+    fn relay_host(&self, address: SocketAddr) -> String {
+        let ip = if address.ip().is_loopback() {
+            self.share_host()
+        } else {
+            address.ip().to_string()
+        };
+        format!("{ip}:{}", address.port())
+    }
+
+    fn share_host(&self) -> String {
+        if self.lan_ip.parse::<Ipv4Addr>().is_ok() {
+            self.lan_ip.clone()
+        } else {
+            "127.0.0.1".into()
+        }
+    }
+
+    fn take_relay_arrivals(&mut self) -> Vec<TcpStream> {
+        let (tokens, dead, address, room) = {
+            let Some(relay) = self.relay.as_mut() else {
+                return Vec::new();
+            };
+            (
+                relay.poll_tokens(),
+                relay.dead,
+                relay.address,
+                relay.room,
+            )
+        };
+        if dead {
+            self.relay = None;
+            self.note("中继断开了");
+            return Vec::new();
+        }
+        let mut streams = Vec::new();
+        for token in tokens {
+            match dial_attach(address, room, token) {
+                Ok(stream) => streams.push(stream),
+                Err(error) => self.error = Some(error),
+            }
+        }
+        streams
+    }
+
     fn beacon(&mut self) {
         let Role::Host(peer) = &self.role else {
             return;
         };
+        if peer.listener.is_none() {
+            return;
+        }
         let due = self
             .last_beacon
             .is_none_or(|at| at.elapsed() >= Duration::from_millis(500));
@@ -811,6 +1015,13 @@ impl Peer {
         let Ok((stream, _)) = listener.accept() else {
             return;
         };
+        self.adopt_guest(stream);
+    }
+
+    fn adopt_guest(&mut self, stream: TcpStream) {
+        if self.seats.len() >= 3 {
+            return;
+        }
         if prepare_stream(&stream).is_err() {
             return;
         }
@@ -1323,6 +1534,442 @@ fn data_frame(from: u32, words: &[u32]) -> Vec<u8> {
     }
     frame
 }
+impl RelaySession {
+    fn poll_tokens(&mut self) -> Vec<[u8; 4]> {
+        let mut buf = [0u8; 64];
+        loop {
+            match self.control.read(&mut buf) {
+                Ok(0) => {
+                    self.dead = true;
+                    break;
+                }
+                Ok(size) => self.inbox.extend_from_slice(&buf[..size]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    self.dead = true;
+                    break;
+                }
+            }
+        }
+        let mut tokens = Vec::new();
+        while self.inbox.len() >= 5 {
+            let marker = self.inbox[0];
+            let mut token = [0u8; 4];
+            token.copy_from_slice(&self.inbox[1..5]);
+            self.inbox.drain(..5);
+            if marker == RELAY_TOKEN {
+                tokens.push(token);
+            }
+        }
+        tokens
+    }
+}
+
+struct RelayServer {
+    port: u16,
+    shutdown: std::sync::Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RelayServer {
+    fn start(port: u16) -> Result<Self, String> {
+        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
+            .map_err(|error| format!("打开中继端口 {port} 失败：{error}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("中继端口无法改成非阻塞：{error}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| format!("读取中继端口失败：{error}"))?
+            .port();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&shutdown);
+        let rooms = std::sync::Arc::new(Mutex::new(HashMap::<[u8; 4], RelayRoom>::new()));
+        let thread = std::thread::Builder::new()
+            .name("ultima-relay".into())
+            .spawn(move || relay_listen(listener, flag, rooms))
+            .map_err(|error| format!("中继线程没有起来：{error}"))?;
+        Ok(Self {
+            port,
+            shutdown,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for RelayServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct RelayRoom {
+    control: TcpStream,
+    guests: u8,
+    waiting: HashMap<[u8; 4], std::sync::mpsc::Sender<TcpStream>>,
+}
+
+fn relay_listen(
+    listener: TcpListener,
+    shutdown: std::sync::Arc<AtomicBool>,
+    rooms: std::sync::Arc<Mutex<HashMap<[u8; 4], RelayRoom>>>,
+) {
+    while !shutdown.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let rooms = std::sync::Arc::clone(&rooms);
+                std::thread::spawn(move || relay_client(stream, rooms));
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn relay_client(mut stream: TcpStream, rooms: std::sync::Arc<Mutex<HashMap<[u8; 4], RelayRoom>>>) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let request = match read_relay_request(&mut stream) {
+        Some(request) => request,
+        None => return,
+    };
+    match request.role {
+        RELAY_HOST => relay_host(stream, request, rooms),
+        RELAY_GUEST => relay_guest(stream, request, rooms),
+        RELAY_ATTACH => relay_attach(stream, request, rooms),
+        _ => {
+            let _ = write_relay_reply(&mut stream, RELAY_BAD, [0; 4]);
+        }
+    }
+}
+
+struct RelayRequest {
+    role: u8,
+    room: [u8; 4],
+    token: [u8; 4],
+}
+
+fn relay_host(
+    mut stream: TcpStream,
+    request: RelayRequest,
+    rooms: std::sync::Arc<Mutex<HashMap<[u8; 4], RelayRoom>>>,
+) {
+    let room = if request.room == [0; 4] {
+        fresh_room(&rooms)
+    } else {
+        request.room
+    };
+    {
+        let Ok(mut rooms) = rooms.lock() else {
+            return;
+        };
+        if rooms.contains_key(&room) {
+            let _ = write_relay_reply(&mut stream, RELAY_FULL, room);
+            return;
+        }
+        if write_relay_reply(&mut stream, RELAY_OK, room).is_err() {
+            return;
+        }
+        let _ = stream.set_read_timeout(None);
+        let _ = stream.set_nonblocking(false);
+        let Ok(control) = stream.try_clone() else {
+            return;
+        };
+        rooms.insert(
+            room,
+            RelayRoom {
+                control,
+                guests: 0,
+                waiting: HashMap::new(),
+            },
+        );
+    }
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    if let Ok(mut rooms) = rooms.lock() {
+        rooms.remove(&room);
+    }
+}
+
+fn relay_guest(
+    mut stream: TcpStream,
+    request: RelayRequest,
+    rooms: std::sync::Arc<Mutex<HashMap<[u8; 4], RelayRoom>>>,
+) {
+    let (token, incoming, mut control) = {
+        let Ok(mut rooms) = rooms.lock() else {
+            return;
+        };
+        let Some(room) = rooms.get_mut(&request.room) else {
+            let _ = write_relay_reply(&mut stream, RELAY_UNKNOWN, request.room);
+            return;
+        };
+        if room.guests >= 3 {
+            let _ = write_relay_reply(&mut stream, RELAY_FULL, request.room);
+            return;
+        }
+        let token = fresh_token(&room.waiting);
+        let (sender, incoming) = std::sync::mpsc::channel();
+        let Ok(control) = room.control.try_clone() else {
+            let _ = write_relay_reply(&mut stream, RELAY_BAD, request.room);
+            return;
+        };
+        room.guests += 1;
+        room.waiting.insert(token, sender);
+        (token, incoming, control)
+    };
+    let mut bytes = [0u8; 5];
+    bytes[0] = RELAY_TOKEN;
+    bytes[1..].copy_from_slice(&token);
+    if control.write_all(&bytes).is_err() {
+        if let Ok(mut rooms) = rooms.lock() {
+            if let Some(room) = rooms.get_mut(&request.room) {
+                room.waiting.remove(&token);
+                room.guests = room.guests.saturating_sub(1);
+            }
+        }
+        let _ = write_relay_reply(&mut stream, RELAY_BAD, request.room);
+        return;
+    }
+    let attach = incoming.recv_timeout(Duration::from_secs(5));
+    {
+        let Ok(mut rooms) = rooms.lock() else {
+            return;
+        };
+        if let Some(room) = rooms.get_mut(&request.room) {
+            room.waiting.remove(&token);
+        }
+    }
+    let Ok(attach) = attach else {
+        if let Ok(mut rooms) = rooms.lock() {
+            if let Some(room) = rooms.get_mut(&request.room) {
+                room.guests = room.guests.saturating_sub(1);
+            }
+        }
+        let _ = write_relay_reply(&mut stream, RELAY_BAD, request.room);
+        return;
+    };
+    if write_relay_reply(&mut stream, RELAY_OK, request.room).is_err() {
+        release_relay_guest(&rooms, request.room);
+        return;
+    }
+    splice(stream, attach);
+    release_relay_guest(&rooms, request.room);
+}
+
+fn release_relay_guest(rooms: &Mutex<HashMap<[u8; 4], RelayRoom>>, code: [u8; 4]) {
+    let Ok(mut rooms) = rooms.lock() else {
+        return;
+    };
+    if let Some(room) = rooms.get_mut(&code) {
+        room.guests = room.guests.saturating_sub(1);
+    }
+}
+
+fn relay_attach(
+    mut stream: TcpStream,
+    request: RelayRequest,
+    rooms: std::sync::Arc<Mutex<HashMap<[u8; 4], RelayRoom>>>,
+) {
+    let sender = {
+        let Ok(mut rooms) = rooms.lock() else {
+            return;
+        };
+        let Some(room) = rooms.get_mut(&request.room) else {
+            let _ = write_relay_reply(&mut stream, RELAY_UNKNOWN, request.room);
+            return;
+        };
+        match room.waiting.remove(&request.token) {
+            Some(sender) => sender,
+            None => {
+                let _ = write_relay_reply(&mut stream, RELAY_UNKNOWN, request.room);
+                return;
+            }
+        }
+    };
+    if write_relay_reply(&mut stream, RELAY_OK, request.room).is_err() {
+        return;
+    }
+    let _ = stream.set_read_timeout(None);
+    let _ = stream.set_write_timeout(None);
+    let _ = stream.set_nonblocking(false);
+    let _ = sender.send(stream);
+}
+
+fn splice(left: TcpStream, right: TcpStream) {
+    let _ = left.set_nonblocking(false);
+    let _ = right.set_nonblocking(false);
+    let _ = left.set_read_timeout(None);
+    let _ = right.set_read_timeout(None);
+    let _ = left.set_write_timeout(None);
+    let _ = right.set_write_timeout(None);
+    let Ok(mut left_out) = left.try_clone() else {
+        return;
+    };
+    let Ok(mut right_out) = right.try_clone() else {
+        return;
+    };
+    let mut left_in = left;
+    std::thread::spawn(move || {
+        let mut right_in = right;
+        let _ = std::io::copy(&mut right_in, &mut left_out);
+        let _ = left_out.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = std::io::copy(&mut left_in, &mut right_out);
+    let _ = right_out.shutdown(std::net::Shutdown::Write);
+}
+
+fn fresh_room(rooms: &Mutex<HashMap<[u8; 4], RelayRoom>>) -> [u8; 4] {
+    loop {
+        let room = room_code();
+        let Ok(rooms) = rooms.lock() else {
+            return room;
+        };
+        if !rooms.contains_key(&room) {
+            return room;
+        }
+    }
+}
+
+fn fresh_token(waiting: &HashMap<[u8; 4], std::sync::mpsc::Sender<TcpStream>>) -> [u8; 4] {
+    loop {
+        let token = room_code();
+        if !waiting.contains_key(&token) {
+            return token;
+        }
+    }
+}
+
+fn room_code() -> [u8; 4] {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut value = NEXT.fetch_add(1, Ordering::Relaxed) ^ std::process::id();
+    let mut code = [0u8; 4];
+    for slot in &mut code {
+        *slot = ALPHABET[(value as usize) % ALPHABET.len()];
+        value = value.rotate_left(5).wrapping_add(0x9E37);
+    }
+    code
+}
+
+fn room_text(room: &[u8; 4]) -> String {
+    String::from_utf8_lossy(room).into_owned()
+}
+
+fn parse_room(text: &str) -> Result<[u8; 4], String> {
+    let bytes = text.trim().as_bytes();
+    if bytes.len() != 4 || !bytes.iter().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err("房间号是 4 位".into());
+    }
+    let mut room = [0u8; 4];
+    room.copy_from_slice(bytes);
+    Ok(room)
+}
+
+fn split_relay(address: &str) -> Option<(&str, &str)> {
+    let (relay, room) = address.trim().rsplit_once('#')?;
+    let relay = relay.trim();
+    let room = room.trim();
+    if relay.is_empty() || parse_room(room).is_err() {
+        return None;
+    }
+    Some((relay, room))
+}
+
+fn parse_relay_address(address: &str) -> Result<SocketAddr, String> {
+    let address = address.trim();
+    if address.is_empty() {
+        return Err("先填写中继地址".into());
+    }
+    if let Ok(addr) = address.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let ip: Ipv4Addr = address
+        .parse()
+        .map_err(|_| format!("中继地址无效：{address}"))?;
+    Ok(SocketAddr::V4(SocketAddrV4::new(ip, RELAY_PORT)))
+}
+
+fn relay_handshake(
+    stream: &mut TcpStream,
+    role: u8,
+    room: [u8; 4],
+    token: [u8; 4],
+) -> Result<[u8; 4], String> {
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("中继套接字设置失败：{error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("中继套接字设置失败：{error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("中继套接字设置失败：{error}"))?;
+    let mut request = [0u8; 16];
+    request[..RELAY_MAGIC.len()].copy_from_slice(RELAY_MAGIC);
+    request[7] = role;
+    request[8..12].copy_from_slice(&room);
+    request[12..16].copy_from_slice(&token);
+    stream
+        .write_all(&request)
+        .map_err(|error| format!("向中继报名失败：{error}"))?;
+    let mut reply = [0u8; 8];
+    stream
+        .read_exact(&mut reply)
+        .map_err(|error| format!("中继没有回应：{error}"))?;
+    let mut assigned = [0u8; 4];
+    assigned.copy_from_slice(&reply[1..5]);
+    match reply[0] {
+        RELAY_OK => Ok(assigned),
+        RELAY_FULL => Err("这间中继房间已经满了".into()),
+        RELAY_UNKNOWN => Err("没有这间中继房间".into()),
+        _ => Err("中继拒绝了这次连接".into()),
+    }
+}
+
+fn read_relay_request(stream: &mut TcpStream) -> Option<RelayRequest> {
+    let mut request = [0u8; 16];
+    stream.read_exact(&mut request).ok()?;
+    if &request[..RELAY_MAGIC.len()] != RELAY_MAGIC {
+        return None;
+    }
+    let mut room = [0u8; 4];
+    let mut token = [0u8; 4];
+    room.copy_from_slice(&request[8..12]);
+    token.copy_from_slice(&request[12..16]);
+    Some(RelayRequest {
+        role: request[7],
+        room,
+        token,
+    })
+}
+
+fn write_relay_reply(stream: &mut TcpStream, status: u8, room: [u8; 4]) -> std::io::Result<()> {
+    let mut reply = [0u8; 8];
+    reply[0] = status;
+    reply[1..5].copy_from_slice(&room);
+    stream.write_all(&reply)
+}
+
+fn dial_attach(address: SocketAddr, room: [u8; 4], token: [u8; 4]) -> Result<TcpStream, String> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
+        .map_err(|error| format!("连接中继席位失败：{error}"))?;
+    relay_handshake(&mut stream, RELAY_ATTACH, room, token)?;
+    prepare_stream(&stream)?;
+    Ok(stream)
+}
+
 fn prepare_stream(stream: &TcpStream) -> Result<(), String> {
     stream
         .set_nodelay(true)
@@ -1615,6 +2262,75 @@ mod tests {
         assert_eq!(bus.read_u16(0x0400_0120), 0x1111);
         assert_eq!(bus.read_u16(0x0400_0122), 0x2222);
         assert_eq!(guest.join().expect("guest thread"), 0x2222);
+    }
+
+    #[test]
+    fn a_relay_carries_one_multiplayer_word_off_the_lan_port() {
+        let mut host = LinkHub::new();
+        let port = host.serve_relay_on(0).expect("relay");
+        let code = host
+            .host_via(&format!("127.0.0.1:{port}"), "same-rom")
+            .expect("host via relay");
+        assert_eq!(code.len(), 4);
+        let address = format!("127.0.0.1:{port}#{code}");
+        let guest = std::thread::spawn(move || {
+            let mut guest = LinkHub::new();
+            guest.join(&address, "same-rom").expect("join via relay");
+            let mut bus = Bus::new();
+            for _ in 0..50 {
+                guest.service(&mut bus);
+                if guest.connected() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(guest.connected(), "guest did not finish hello");
+            bus.write_u16(0x0400_012A, 0x2222);
+            bus.write_u16(0x0400_0128, (1 << 13) | (1 << 14) | 3);
+            for _ in 0..80 {
+                guest.service(&mut bus);
+                bus.advance(1_000);
+                if bus.read_u16(0x0400_0120) == 0x1111 && bus.read_u16(0x0400_0128) & 0x80 == 0 {
+                    return bus.read_u16(0x0400_0122);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("guest never saw the transfer");
+        });
+        let mut bus = Bus::new();
+        for _ in 0..50 {
+            host.service(&mut bus);
+            if host.connected() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(host.connected(), "host did not see the relay guest: {}", host.view().line);
+        bus.write_u16(0x0400_012A, 0x1111);
+        bus.write_u16(0x0400_0128, (1 << 13) | (1 << 14) | 3 | (1 << 7));
+        for _ in 0..80 {
+            bus.advance(1_000);
+            host.service(&mut bus);
+            if bus.read_u16(0x0400_0128) & 0x80 == 0 && bus.read_u16(0x0400_0122) == 0x2222 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(bus.read_u16(0x0400_0120), 0x1111);
+        assert_eq!(bus.read_u16(0x0400_0122), 0x2222);
+        assert!(host.view().line.contains(&code), "{}", host.view().line);
+        assert_eq!(guest.join().expect("guest thread"), 0x2222);
+    }
+
+    #[test]
+    fn an_unknown_relay_room_is_refused() {
+        let mut relay = LinkHub::new();
+        let port = relay.serve_relay_on(0).expect("relay");
+        let mut guest = LinkHub::new();
+        let error = guest
+            .join(&format!("127.0.0.1:{port}#ZZZZ"), "same-rom")
+            .expect_err("unknown room");
+        assert!(error.contains("没有这间"), "{error}");
     }
 
     #[test]
