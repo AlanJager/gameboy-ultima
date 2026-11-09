@@ -1,8 +1,7 @@
 //! ARM7TDMI 的寄存器。
 //!
-//! 现在放五份。`r0`–`r15` 是用户和系统看到的那一份。
-//! 管理模式、中断模式、未定义模式各有 SP、LR 和 SPSR。快速中断另有 `r8`–`r14` 和 SPSR。
-//! 中止仍先共用用户这份，也没有 SPSR。
+//! 现在放六份。`r0`–`r15` 是用户和系统看到的那一份。
+//! 管理模式、中断模式、中止模式、未定义模式各有 SP、LR 和 SPSR。快速中断另有 `r8`–`r14` 和 SPSR。
 //!
 //! 当前模式是 CPSR 的低 5 位。`get` / `set` 看这一位决定读写哪一份，
 //! 换模式时旧的值留在原地。
@@ -19,6 +18,7 @@ pub(crate) const MODE_USER: u8 = 0x10;
 pub(crate) const MODE_FIQ: u8 = 0x11;
 pub(crate) const MODE_IRQ: u8 = 0x12;
 pub(crate) const MODE_SVC: u8 = 0x13;
+pub(crate) const MODE_ABT: u8 = 0x17;
 pub(crate) const MODE_UND: u8 = 0x1B;
 const MODE_SYSTEM: u8 = 0x1F;
 
@@ -41,6 +41,8 @@ pub struct Registers {
     fiq: Bank,
     irq: Bank,
     svc: Bank,
+    #[serde(default)]
+    abt: Bank,
     und: Bank,
     cpsr: u32,
 }
@@ -54,6 +56,7 @@ impl Registers {
             fiq: Bank::default(),
             irq: Bank::default(),
             svc: Bank::default(),
+            abt: Bank::default(),
             und: Bank::default(),
             cpsr: 0x0000_00D0,
         };
@@ -101,6 +104,7 @@ impl Registers {
             8..=12 if mode == MODE_FIQ => self.fiq_high[index as usize - 8],
             13 | 14 if mode == MODE_SVC => self.svc.sp_lr(index),
             13 | 14 if mode == MODE_IRQ => self.irq.sp_lr(index),
+            13 | 14 if mode == MODE_ABT => self.abt.sp_lr(index),
             13 | 14 if mode == MODE_UND => self.und.sp_lr(index),
             13 | 14 if mode == MODE_FIQ => self.fiq.sp_lr(index),
             _ => self.r[index as usize],
@@ -114,6 +118,8 @@ impl Registers {
             self.svc.set_sp_lr(index, value);
         } else if matches!(index, 13 | 14) && mode == MODE_IRQ {
             self.irq.set_sp_lr(index, value);
+        } else if matches!(index, 13 | 14) && mode == MODE_ABT {
+            self.abt.set_sp_lr(index, value);
         } else if matches!(index, 13 | 14) && mode == MODE_UND {
             self.und.set_sp_lr(index, value);
         } else if matches!(index, 13 | 14) && mode == MODE_FIQ {
@@ -132,11 +138,12 @@ impl Registers {
         self.cpsr = value;
     }
 
-    /// 当前模式的 SPSR。管理、中断、未定义和快速中断各有一份。
+    /// 当前模式的 SPSR。管理、中断、中止、未定义和快速中断各有一份。
     pub(crate) fn spsr(&self) -> Option<u32> {
         match self.mode() {
             MODE_SVC => Some(self.svc.spsr),
             MODE_IRQ => Some(self.irq.spsr),
+            MODE_ABT => Some(self.abt.spsr),
             MODE_UND => Some(self.und.spsr),
             MODE_FIQ => Some(self.fiq.spsr),
             _ => None,
@@ -147,6 +154,7 @@ impl Registers {
         match self.mode() {
             MODE_SVC => self.svc.spsr = value,
             MODE_IRQ => self.irq.spsr = value,
+            MODE_ABT => self.abt.spsr = value,
             MODE_UND => self.und.spsr = value,
             MODE_FIQ => self.fiq.spsr = value,
             _ => return false,
@@ -209,7 +217,8 @@ impl Registers {
         self.svc.spsr = 0;
         self.irq.lr = 0;
         self.irq.spsr = 0;
-        // 未定义组没有开机栈，复位时整份清掉。
+        // 中止和未定义没有开机栈，复位时整份清掉。
+        self.abt = Bank::default();
         self.und = Bank::default();
         self.set_in(13, 0x0300_7F00, MODE_USER);
         self.set_in(13, 0x0300_7FA0, MODE_IRQ);
@@ -446,6 +455,34 @@ mod tests {
         regs.set_cpsr(0x0000_00DB);
         assert_eq!(regs.get(13), 0x3333);
         assert_eq!(regs.spsr(), Some(0xA000_00F0));
+    }
+
+    #[test]
+    fn abort_keeps_its_own_stack_and_spsr() {
+        let mut regs = Registers::arm_start(0x0800_0000);
+        regs.set(8, 0x8888);
+        regs.set(13, 0x1111);
+        regs.set(14, 0x2222);
+        regs.set_cpsr(0x0000_00D7);
+        assert_eq!(regs.mode(), MODE_ABT);
+        assert_eq!(regs.get(8), 0x8888);
+        assert_eq!(regs.get(13), 0);
+        assert_eq!(regs.get(14), 0);
+        assert_eq!(regs.spsr(), Some(0));
+        regs.set(13, 0x3333);
+        regs.set(14, 0x4444);
+        regs.write_status(true, 0xF, 0xA000_00F0).unwrap();
+        regs.set_cpsr(0x0000_00D0);
+        assert_eq!(regs.get(13), 0x1111);
+        assert_eq!(regs.get(14), 0x2222);
+        assert!(regs.spsr().is_none());
+        regs.set_cpsr(0x0000_00D7);
+        assert_eq!(regs.get(13), 0x3333);
+        assert_eq!(regs.get(14), 0x4444);
+        assert_eq!(regs.spsr(), Some(0xA000_00F0));
+        regs.prepare_reset(0x0800_0000);
+        assert_eq!(regs.get_in(13, MODE_ABT), 0);
+        assert_eq!(regs.get_in(14, MODE_ABT), 0);
     }
 }
 use serde::{Deserialize, Serialize};
