@@ -8,6 +8,7 @@ autobins = false
 
 [dependencies]
 cpal = "0.15.3"
+gilrs = "0.11.2"
 gpui = { version = "=0.2.2", default-features = false, features = ["runtime_shaders", "font-kit"] }
 image = { version = "=0.25.1", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1", features = ["derive"] }

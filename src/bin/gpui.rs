@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 use gameboy_ultima::{
     rgb555_to_888, step_quiet, AudioPlay, Bus, Registers, CYCLES_PER_FRAME, HEIGHT, WIDTH,
 };
+#[path = "controls.rs"]
+mod controls;
+use controls::*;
 #[cfg(target_os = "macos")]
 #[path = "metal_screen.rs"]
 mod metal_screen;
@@ -189,154 +192,7 @@ enum Command {
     Shutdown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PadButton {
-    A,
-    B,
-    Select,
-    Start,
-    Right,
-    Left,
-    Up,
-    Down,
-    R,
-    L,
-    Reset,
-}
-
-impl PadButton {
-    const ALL: [Self; 11] = [
-        Self::A,
-        Self::B,
-        Self::Select,
-        Self::Start,
-        Self::Right,
-        Self::Left,
-        Self::Up,
-        Self::Down,
-        Self::R,
-        Self::L,
-        Self::Reset,
-    ];
-
-    fn index(self) -> usize {
-        match self {
-            Self::A => 0,
-            Self::B => 1,
-            Self::Select => 2,
-            Self::Start => 3,
-            Self::Right => 4,
-            Self::Left => 5,
-            Self::Up => 6,
-            Self::Down => 7,
-            Self::R => 8,
-            Self::L => 9,
-            Self::Reset => 10,
-        }
-    }
-
-    fn bit(self) -> Option<u16> {
-        match self {
-            Self::A => Some(1 << 0),
-            Self::B => Some(1 << 1),
-            Self::Select => Some(1 << 2),
-            Self::Start => Some(1 << 3),
-            Self::Right => Some(1 << 4),
-            Self::Left => Some(1 << 5),
-            Self::Up => Some(1 << 6),
-            Self::Down => Some(1 << 7),
-            Self::R => Some(1 << 8),
-            Self::L => Some(1 << 9),
-            Self::Reset => None,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::A => "A",
-            Self::B => "B",
-            Self::Select => "SELECT",
-            Self::Start => "START",
-            Self::Right => "右",
-            Self::Left => "左",
-            Self::Up => "上",
-            Self::Down => "下",
-            Self::R => "R",
-            Self::L => "L",
-            Self::Reset => "复位",
-        }
-    }
-
-    fn id(self) -> &'static str {
-        match self {
-            Self::A => "a",
-            Self::B => "b",
-            Self::Select => "select",
-            Self::Start => "start",
-            Self::Right => "right",
-            Self::Left => "left",
-            Self::Up => "up",
-            Self::Down => "down",
-            Self::R => "r",
-            Self::L => "l",
-            Self::Reset => "reset",
-        }
-    }
-
-    fn element_id(self) -> &'static str {
-        match self {
-            Self::A => "pad-a",
-            Self::B => "pad-b",
-            Self::Select => "pad-select",
-            Self::Start => "pad-start",
-            Self::Right => "pad-right",
-            Self::Left => "pad-left",
-            Self::Up => "pad-up",
-            Self::Down => "pad-down",
-            Self::R => "pad-r",
-            Self::L => "pad-l",
-            Self::Reset => "pad-reset",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Hotkey {
-    QuickSave,
-    QuickLoad,
-}
-
 impl Hotkey {
-    const ALL: [Self; 2] = [Self::QuickSave, Self::QuickLoad];
-
-    fn index(self) -> usize {
-        match self {
-            Self::QuickSave => 0,
-            Self::QuickLoad => 1,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::QuickSave => "快速存档",
-            Self::QuickLoad => "快速读档",
-        }
-    }
-
-    fn id(self) -> &'static str {
-        match self {
-            Self::QuickSave => "quick_save",
-            Self::QuickLoad => "quick_load",
-        }
-    }
-
-    fn element_id(self) -> &'static str {
-        match self {
-            Self::QuickSave => "hotkey-quick-save",
-            Self::QuickLoad => "hotkey-quick-load",
-        }
-    }
-
     fn command(self) -> Command {
         match self {
             Self::QuickSave => Command::QuickSaveState,
@@ -345,116 +201,10 @@ impl Hotkey {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BindingTarget {
-    Pad(PadButton),
-    Hotkey(Hotkey),
-}
-
-impl BindingTarget {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Pad(button) => button.name(),
-            Self::Hotkey(hotkey) => hotkey.name(),
-        }
-    }
-
-    fn element_id(self) -> &'static str {
-        match self {
-            Self::Pad(button) => button.element_id(),
-            Self::Hotkey(hotkey) => hotkey.element_id(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct KeyMap {
-    keys: [String; 11],
-    hotkeys: [String; 2],
-}
-
-impl Default for KeyMap {
-    fn default() -> Self {
-        Self {
-            keys: [
-                "x".into(),
-                "z".into(),
-                "backspace".into(),
-                "enter".into(),
-                "right".into(),
-                "left".into(),
-                "up".into(),
-                "down".into(),
-                "s".into(),
-                "a".into(),
-                "r".into(),
-            ],
-            hotkeys: ["f5".into(), "f8".into()],
-        }
-    }
-}
-
-impl KeyMap {
-    fn key(&self, button: PadButton) -> &str {
-        &self.keys[button.index()]
-    }
-
-    fn hotkey(&self, hotkey: Hotkey) -> &str {
-        &self.hotkeys[hotkey.index()]
-    }
-
-    fn button_for_key(&self, key: &str) -> Option<PadButton> {
-        let key = normalize_key(key);
-        if key.is_empty() {
-            return None;
-        }
-        PadButton::ALL
-            .into_iter()
-            .find(|button| self.key(*button) == key)
-    }
-
-    fn hotkey_for_key(&self, key: &str) -> Option<Hotkey> {
-        let key = normalize_key(key);
-        if key.is_empty() {
-            return None;
-        }
-        Hotkey::ALL
-            .into_iter()
-            .find(|hotkey| self.hotkey(*hotkey) == key)
-    }
-
-    fn bind_target(&mut self, target: BindingTarget, key: &str) {
-        let key = normalize_key(key);
-        if !bindable_key(&key) {
-            return;
-        }
-        for button in PadButton::ALL {
-            if BindingTarget::Pad(button) != target && self.key(button) == key {
-                self.keys[button.index()].clear();
-            }
-        }
-        for hotkey in Hotkey::ALL {
-            if BindingTarget::Hotkey(hotkey) != target && self.hotkey(hotkey) == key {
-                self.hotkeys[hotkey.index()].clear();
-            }
-        }
-        match target {
-            BindingTarget::Pad(button) => self.keys[button.index()] = key,
-            BindingTarget::Hotkey(hotkey) => self.hotkeys[hotkey.index()] = key,
-        }
-    }
-}
-
 struct ControlSettings {
     open: bool,
     capturing: Option<BindingTarget>,
     map: KeyMap,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ControlsFile {
-    version: u8,
-    bindings: HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -687,14 +437,14 @@ impl AppView {
     }
 
     fn set_key_bit(&self, key: &str, map: &KeyMap, pressed: bool) {
-        let Some(mask) = game_key_mask(key, map) else {
+        if game_key_mask(key, map).is_none() {
             return;
-        };
-        if pressed {
-            self.keys.fetch_or(mask, Ordering::Relaxed);
-        } else {
-            self.keys.fetch_and(!mask, Ordering::Relaxed);
         }
+        let _ = self
+            .keys
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(keyboard_bits(held, key, map, pressed))
+            });
     }
 
     fn render_library(
@@ -1541,70 +1291,8 @@ fn rgba_buffer_to_bgra(
     image
 }
 
-fn normalize_key(key: &str) -> String {
-    match key.to_ascii_lowercase().as_str() {
-        "arrowright" => "right".into(),
-        "arrowleft" => "left".into(),
-        "arrowup" => "up".into(),
-        "arrowdown" => "down".into(),
-        other => other.to_string(),
-    }
-}
-
 fn shortcut_chord(modifiers: &gpui::Modifiers) -> bool {
     modifiers.platform || modifiers.control || modifiers.alt
-}
-
-fn bindable_key(key: &str) -> bool {
-    !matches!(
-        key,
-        "" | "escape"
-            | "space"
-            | "shift"
-            | "control"
-            | "alt"
-            | "cmd"
-            | "command"
-            | "fn"
-            | "function"
-            | "super"
-            | "win"
-            | "meta"
-    )
-}
-
-fn game_key_mask(key: &str, map: &KeyMap) -> Option<u16> {
-    map.button_for_key(key).and_then(PadButton::bit)
-}
-
-fn is_reset_key(key: &str, map: &KeyMap) -> bool {
-    map.button_for_key(key) == Some(PadButton::Reset)
-}
-
-fn is_function_key(key: &str) -> bool {
-    let Some(number) = key.strip_prefix('f') else {
-        return false;
-    };
-    !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())
-}
-
-fn key_label(key: &str) -> String {
-    if key.is_empty() {
-        return "未设置".into();
-    }
-    match key {
-        "left" => "←".into(),
-        "right" => "→".into(),
-        "up" => "↑".into(),
-        "down" => "↓".into(),
-        "enter" => "Enter".into(),
-        "backspace" => "Bksp".into(),
-        "delete" => "Del".into(),
-        "tab" => "Tab".into(),
-        other if is_function_key(other) => format!("F{}", &other[1..]),
-        other if other.chars().count() == 1 => other.to_ascii_uppercase(),
-        other => other.to_string(),
-    }
 }
 
 fn controls_file_path() -> Result<PathBuf, String> {
@@ -1619,81 +1307,6 @@ fn load_saved_controls() -> KeyMap {
             KeyMap::default()
         }
     }
-}
-
-fn read_controls(path: &Path) -> Result<KeyMap, String> {
-    if !path.exists() {
-        return Ok(KeyMap::default());
-    }
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("读取键位 {} 失败：{error}", path.display()))?;
-    let file: ControlsFile = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("解析键位 {} 失败：{error}", path.display()))?;
-    if file.version != 1 {
-        return Err(format!("不支持的键位版本：{}", file.version));
-    }
-    let mut map = KeyMap::default();
-    for button in PadButton::ALL {
-        let Some(key) = file.bindings.get(button.id()) else {
-            continue;
-        };
-        apply_saved_key(&mut map.keys[button.index()], key);
-    }
-    for hotkey in Hotkey::ALL {
-        let Some(key) = file.bindings.get(hotkey.id()) else {
-            continue;
-        };
-        apply_saved_key(&mut map.hotkeys[hotkey.index()], key);
-    }
-    let mut seen = Vec::new();
-    for button in PadButton::ALL {
-        claim_saved_key(&mut map.keys[button.index()], &mut seen);
-    }
-    for hotkey in Hotkey::ALL {
-        claim_saved_key(&mut map.hotkeys[hotkey.index()], &mut seen);
-    }
-    Ok(map)
-}
-
-fn apply_saved_key(slot: &mut String, key: &str) {
-    let key = normalize_key(key);
-    if key.is_empty() {
-        slot.clear();
-    } else if bindable_key(&key) {
-        *slot = key;
-    }
-}
-
-fn claim_saved_key(slot: &mut String, seen: &mut Vec<String>) {
-    if slot.is_empty() {
-        return;
-    }
-    if seen.iter().any(|used| used == slot) {
-        slot.clear();
-    } else {
-        seen.push(slot.clone());
-    }
-}
-
-fn write_controls(path: &Path, map: &KeyMap) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("创建键位目录 {} 失败：{error}", parent.display()))?;
-    }
-    let mut bindings: HashMap<String, String> = PadButton::ALL
-        .into_iter()
-        .map(|button| (button.id().to_string(), map.key(button).to_string()))
-        .collect();
-    for hotkey in Hotkey::ALL {
-        bindings.insert(hotkey.id().to_string(), map.hotkey(hotkey).to_string());
-    }
-    let bytes = serde_json::to_vec_pretty(&ControlsFile {
-        version: 1,
-        bindings,
-    })
-    .map_err(|error| format!("写入键位失败：{error}"))?;
-    std::fs::write(path, bytes)
-        .map_err(|error| format!("写入键位 {} 失败：{error}", path.display()))
 }
 
 const KEYMAP_WIDTH: f32 = 560.;
@@ -1729,7 +1342,7 @@ fn controls_overlay(
 ) -> impl IntoElement {
     let hint = match capturing {
         Some(target) => format!("按下要绑定到 {} 的键", target.name()),
-        None => "点输入框，再按键盘。Esc 关闭。".into(),
+        None => "点输入框，再按键盘。Esc 关闭。手柄走默认键位，和键盘同时有效。".into(),
     };
     div()
         .absolute()
@@ -2067,8 +1680,10 @@ fn emulator_worker(
     let mut screenshot_frames_left: Option<u32> = None;
     let frame_interval = Duration::from_secs_f64(CYCLES_PER_FRAME as f64 / 16_777_216.0);
     let mut next_frame_deadline = Instant::now();
+    let mut pads = open_gamepads();
 
     'worker: loop {
+        let pad = poll_gamepad(&mut pads);
         if cart.is_none() || paused {
             match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(command) => match apply_command(
@@ -2138,7 +1753,7 @@ fn emulator_worker(
                 continue 'worker;
             }
             let active = cart.as_mut().expect("running cart exists");
-            active.bus.set_keys(keys.load(Ordering::Relaxed));
+            active.bus.set_keys(held_keys(keys.load(Ordering::Relaxed), pad));
             if let Err(error) = step_quiet(&mut active.regs, &mut active.bus) {
                 paused = true;
                 let mut state = snapshot.lock().expect("emulator snapshot poisoned");
@@ -3977,64 +3592,6 @@ mod tests {
         assert_eq!(mix_color(0x000000, 0xFFFFFF, 0.0), 0x000000);
         assert_eq!(mix_color(0x000000, 0xFFFFFF, 0.5), 0x808080);
         assert_eq!(mix_color(0x000000, 0xFFFFFF, 1.0), 0xFFFFFF);
-    }
-
-    #[test]
-    fn maps_gba_controls_to_the_existing_key_bits() {
-        let map = KeyMap::default();
-        assert_eq!(game_key_mask("x", &map), Some(1 << 0));
-        assert_eq!(game_key_mask("z", &map), Some(1 << 1));
-        assert_eq!(game_key_mask("backspace", &map), Some(1 << 2));
-        assert_eq!(game_key_mask("enter", &map), Some(1 << 3));
-        assert_eq!(game_key_mask("right", &map), Some(1 << 4));
-        assert_eq!(game_key_mask("arrowright", &map), Some(1 << 4));
-        assert_eq!(game_key_mask("a", &map), Some(1 << 9));
-        assert_eq!(game_key_mask("unknown", &map), None);
-        assert!(is_reset_key("r", &map));
-        assert_eq!(game_key_mask("r", &map), None);
-    }
-
-    #[test]
-    fn rebinding_a_key_moves_it_and_roundtrips() {
-        let mut map = KeyMap::default();
-        map.bind_target(BindingTarget::Pad(PadButton::A), "k");
-        assert_eq!(game_key_mask("k", &map), Some(1 << 0));
-        assert_eq!(game_key_mask("x", &map), None);
-        map.bind_target(BindingTarget::Pad(PadButton::B), "K");
-        assert_eq!(game_key_mask("k", &map), Some(1 << 1));
-        assert_eq!(map.key(PadButton::A), "");
-        map.bind_target(BindingTarget::Pad(PadButton::Reset), "escape");
-        assert!(is_reset_key("r", &map));
-        let dir = std::env::temp_dir().join(format!("ultima-keys-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("controls.json");
-        write_controls(&path, &map).unwrap();
-        let loaded = read_controls(&path).unwrap();
-        assert_eq!(loaded.key(PadButton::B), "k");
-        assert_eq!(loaded.key(PadButton::A), "");
-        assert_eq!(loaded.key(PadButton::Reset), "r");
-        assert_eq!(loaded.hotkey(Hotkey::QuickSave), "f5");
-        assert_eq!(loaded.hotkey(Hotkey::QuickLoad), "f8");
-        let legacy = dir.join("legacy.json");
-        std::fs::write(&legacy, r#"{"version":1,"bindings":{"a":"k"}}"#).unwrap();
-        let legacy = read_controls(&legacy).unwrap();
-        assert_eq!(legacy.key(PadButton::A), "k");
-        assert_eq!(legacy.hotkey(Hotkey::QuickSave), "f5");
-        assert_eq!(legacy.hotkey(Hotkey::QuickLoad), "f8");
-        assert_eq!(key_label("left"), "←");
-        assert_eq!(key_label("f5"), "F5");
-        assert_eq!(key_label(""), "未设置");
-        assert_eq!(map.hotkey(Hotkey::QuickSave), "f5");
-        assert_eq!(map.hotkey(Hotkey::QuickLoad), "f8");
-        map.bind_target(BindingTarget::Hotkey(Hotkey::QuickSave), "k");
-        assert_eq!(map.hotkey(Hotkey::QuickSave), "k");
-        assert_eq!(map.key(PadButton::B), "");
-        assert_eq!(map.hotkey_for_key("k"), Some(Hotkey::QuickSave));
-        assert_eq!(game_key_mask("k", &map), None);
-        map.bind_target(BindingTarget::Pad(PadButton::Reset), "f8");
-        assert_eq!(map.hotkey(Hotkey::QuickLoad), "");
-        assert!(is_reset_key("f8", &map));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
