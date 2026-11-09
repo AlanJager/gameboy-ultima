@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use gameboy_ultima::link::{normalize_link_name, LinkHub, LinkSeat};
 use gameboy_ultima::{
-    audio_pace, rgb555_to_888, step_quiet, AudioPlay, Bus, Registers, CYCLES_PER_FRAME, HEIGHT,
-    WIDTH,
+    audio_pace, parse_cheat, rgb555_to_888, step_quiet, AudioPlay, Bus, CheatFamily, CheatProgram,
+    Registers, CYCLES_PER_FRAME, HEIGHT, WIDTH,
 };
 #[path = "controls.rs"]
 mod controls;
@@ -72,6 +72,7 @@ actions!(
         ResetConsole,
         ShowControls,
         ShowLink,
+        ShowCheats,
         ToggleMetalScreen,
         ToggleSharpenScreen,
         ToggleCpuScreen,
@@ -203,6 +204,13 @@ enum Command {
     JoinLink(String),
     StopLink,
     SetLinkName(String),
+    AddCheat {
+        name: String,
+        gameshark: bool,
+        code: String,
+    },
+    ToggleCheat(usize),
+    RemoveCheat(usize),
     Error(String),
     Shutdown,
 }
@@ -261,6 +269,8 @@ struct Snapshot {
     link_name: String,
     link_in_room: bool,
     link_seats: Vec<LinkSeat>,
+    cheats: Vec<CheatView>,
+    cheat_error: Option<String>,
 }
 
 enum LinkField {
@@ -274,6 +284,35 @@ struct LinkUi {
     name: String,
     name_touched: bool,
     field: LinkField,
+}
+
+enum CheatField {
+    Name,
+    Code,
+}
+
+struct CheatUi {
+    open: bool,
+    name: String,
+    code: String,
+    gameshark: bool,
+    field: CheatField,
+}
+
+#[derive(Clone)]
+struct CheatView {
+    name: String,
+    enabled: bool,
+    gameshark: bool,
+    code: String,
+}
+
+struct LiveCheat {
+    name: String,
+    enabled: bool,
+    gameshark: bool,
+    code: String,
+    program: Option<CheatProgram>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -329,6 +368,7 @@ struct AppView {
     library_mode: Arc<AtomicBool>,
     controls: Arc<Mutex<ControlSettings>>,
     link_ui: Arc<Mutex<LinkUi>>,
+    cheat_ui: Arc<Mutex<CheatUi>>,
 }
 
 impl AppView {
@@ -345,6 +385,7 @@ impl AppView {
         library_mode: Arc<AtomicBool>,
         controls: Arc<Mutex<ControlSettings>>,
         link_ui: Arc<Mutex<LinkUi>>,
+        cheat_ui: Arc<Mutex<CheatUi>>,
         windows_alive: Arc<AtomicUsize>,
         picture_windows: Arc<Mutex<PictureWindows>>,
         chrome_dirty: Arc<AtomicBool>,
@@ -391,6 +432,7 @@ impl AppView {
             library_mode,
             controls,
             link_ui,
+            cheat_ui,
         }
     }
 
@@ -467,6 +509,111 @@ impl AppView {
         self.keys.store(0, Ordering::Relaxed);
         self.release_turbo();
         cx.notify();
+    }
+
+    fn cheat_open(&self) -> bool {
+        self.cheat_ui.lock().expect("cheat ui poisoned").open
+    }
+
+    fn close_cheats(&self, cx: &mut Context<Self>) {
+        self.cheat_ui.lock().expect("cheat ui poisoned").open = false;
+        self.keys.store(0, Ordering::Relaxed);
+        self.release_turbo();
+        cx.notify();
+    }
+
+    fn edit_cheat_field(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = normalize_key(&event.keystroke.key);
+        if key == "escape" {
+            self.close_cheats(cx);
+            return;
+        }
+        if key == "v" && event.keystroke.modifiers.platform && !event.is_held {
+            if let Some(text) = clipboard_text() {
+                self.push_cheat_text(&text);
+                cx.notify();
+            }
+            return;
+        }
+        if event.is_held && key != "backspace" {
+            return;
+        }
+        if key == "enter" {
+            self.submit_cheat();
+            cx.notify();
+            return;
+        }
+        if key == "backspace" {
+            let mut cheat = self.cheat_ui.lock().expect("cheat ui poisoned");
+            match cheat.field {
+                CheatField::Name => {
+                    cheat.name.pop();
+                }
+                CheatField::Code => {
+                    cheat.code.pop();
+                }
+            }
+            cx.notify();
+            return;
+        }
+        let Some(ch) = cheat_key_char(&key) else {
+            return;
+        };
+        let mut cheat = self.cheat_ui.lock().expect("cheat ui poisoned");
+        match cheat.field {
+            CheatField::Name => {
+                if cheat.name.chars().count() < 32 {
+                    cheat.name.push(ch);
+                }
+            }
+            CheatField::Code => {
+                if cheat.code.len() < 400 && (ch.is_ascii_hexdigit() || ch == ' ') {
+                    cheat.code.push(ch);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn push_cheat_text(&self, text: &str) {
+        let mut cheat = self.cheat_ui.lock().expect("cheat ui poisoned");
+        match cheat.field {
+            CheatField::Name => {
+                cheat.name = text.chars().filter(|ch| !ch.is_control()).take(32).collect();
+            }
+            CheatField::Code => {
+                let mut next = String::new();
+                for ch in text.chars() {
+                    if ch.is_ascii_hexdigit() {
+                        next.push(ch.to_ascii_uppercase());
+                    } else if ch.is_whitespace() || ch == ';' || ch == ',' {
+                        if !next.ends_with(' ') && !next.is_empty() {
+                            next.push(' ');
+                        }
+                    }
+                    if next.len() >= 400 {
+                        break;
+                    }
+                }
+                cheat.code = next.trim().to_string();
+            }
+        }
+    }
+
+    fn submit_cheat(&self) {
+        let cheat = self.cheat_ui.lock().expect("cheat ui poisoned");
+        let name = cheat.name.clone();
+        let code = cheat.code.clone();
+        let gameshark = cheat.gameshark;
+        drop(cheat);
+        if code.is_empty() {
+            return;
+        }
+        let _ = self.commands.send(Command::AddCheat {
+            name,
+            gameshark,
+            code,
+        });
     }
 
     fn edit_link_field(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -608,6 +755,10 @@ impl AppView {
     }
 
     fn handle_key_down(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.cheat_open() {
+            self.edit_cheat_field(event, cx);
+            return;
+        }
         if self.link_open() {
             self.edit_link_field(event, cx);
             return;
@@ -683,7 +834,7 @@ impl AppView {
         if released == Some(Hotkey::Rewind) {
             self.rewind_held.store(false, Ordering::Relaxed);
         }
-        if open || self.link_open() {
+        if open || self.link_open() || self.cheat_open() {
             return;
         }
         self.set_key_bit(&event.keystroke.key, &map, false);
@@ -1058,6 +1209,8 @@ impl Render for AppView {
             link_name,
             link_in_room,
             link_seats,
+            cheats,
+            cheat_error,
         ) = {
             let snapshot = self.snapshot.lock().expect("emulator snapshot poisoned");
             (
@@ -1076,6 +1229,8 @@ impl Render for AppView {
                 snapshot.link_name.clone(),
                 snapshot.link_in_room,
                 snapshot.link_seats.clone(),
+                snapshot.cheats.clone(),
+                snapshot.cheat_error.clone(),
             )
         };
         let (link_open, link_address, link_draft, link_touched, link_field) = {
@@ -1307,6 +1462,18 @@ impl Render for AppView {
             .child(content)
             .when(!self.compare && controls_open, |app| {
                 app.child(controls_overlay(cx, &controls_map, controls_capturing))
+            })
+            .when(!self.compare && !controls_open && !link_open && self.cheat_open(), |app| {
+                let draft = self.cheat_ui.lock().expect("cheat ui poisoned");
+                app.child(cheat_overlay(
+                    cx,
+                    &draft.name,
+                    &draft.code,
+                    draft.gameshark,
+                    matches!(draft.field, CheatField::Name),
+                    &cheats,
+                    cheat_error.as_deref(),
+                ))
             })
             .when(!self.compare && !controls_open && link_open, |app| {
                 app.child(link_overlay(
@@ -1975,6 +2142,197 @@ fn link_chip(line: &str) -> impl IntoElement {
         .child(line.to_string())
 }
 
+fn cheat_key_char(key: &str) -> Option<char> {
+    if key == "space" {
+        return Some(' ');
+    }
+    let mut chars = key.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || ch.is_control() {
+        return None;
+    }
+    Some(ch)
+}
+
+fn cheat_overlay(
+    cx: &mut Context<AppView>,
+    name: &str,
+    code: &str,
+    gameshark: bool,
+    editing_name: bool,
+    cheats: &[CheatView],
+    error: Option<&str>,
+) -> impl IntoElement {
+    let name_text = if name.is_empty() {
+        "未命名".to_string()
+    } else {
+        name.to_string()
+    };
+    let code_text = if code.is_empty() {
+        "点这里，输入或粘贴。例如 82000000 03E7".to_string()
+    } else {
+        code.to_string()
+    };
+    let family = if gameshark { "GameShark v1" } else { "CodeBreaker" };
+    div()
+        .absolute()
+        .top(px(0.))
+        .right(px(0.))
+        .bottom(px(0.))
+        .left(px(0.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(0x050809))
+        .child(
+            div()
+                .id("cheat-panel")
+                .w(px(460.))
+                .max_h(px(640.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .p(px(18.))
+                .rounded(px(16.))
+                .bg(rgb(PANEL_HI))
+                .border_1()
+                .border_color(rgb(0x314044))
+                .child(div().text_lg().text_color(rgb(TEXT)).child("金手指"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child("按这张卡带记住。开着的码每帧写一次。Esc 关闭。"),
+                )
+                .children(error.map(|message| {
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xE08B76))
+                        .child(message.to_string())
+                }))
+                .child(div().text_sm().text_color(rgb(TEXT)).child("名字"))
+                .child(
+                    div()
+                        .id("cheat-name")
+                        .w_full()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(px(6.))
+                        .bg(rgb(BG))
+                        .border_1()
+                        .border_color(rgb(if editing_name { ACCENT } else { 0x314044 }))
+                        .text_color(rgb(if name.is_empty() { MUTED } else { TEXT }))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cheat_ui.lock().expect("cheat ui poisoned").field = CheatField::Name;
+                            cx.notify();
+                        }))
+                        .child(name_text),
+                )
+                .child(div().text_sm().text_color(rgb(TEXT)).child("码"))
+                .child(
+                    div()
+                        .id("cheat-code")
+                        .w_full()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(px(6.))
+                        .bg(rgb(BG))
+                        .border_1()
+                        .border_color(rgb(if editing_name { 0x314044 } else { ACCENT }))
+                        .text_color(rgb(if code.is_empty() { MUTED } else { TEXT }))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cheat_ui.lock().expect("cheat ui poisoned").field = CheatField::Code;
+                            cx.notify();
+                        }))
+                        .child(code_text),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .id("cheat-family")
+                                .px(px(14.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(BG))
+                                .text_color(rgb(TEXT))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let mut cheat = this.cheat_ui.lock().expect("cheat ui poisoned");
+                                    cheat.gameshark = !cheat.gameshark;
+                                    cx.notify();
+                                }))
+                                .child(family),
+                        )
+                        .child(
+                            div()
+                                .id("cheat-add")
+                                .px(px(14.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(ACCENT))
+                                .text_color(rgb(BG))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.submit_cheat();
+                                    cx.notify();
+                                }))
+                                .child("加上"),
+                        ),
+                )
+                .children(cheats.iter().enumerate().map(|(index, cheat)| {
+                    let label = format!(
+                        "{}  {}  {}  {}",
+                        if cheat.enabled { "开" } else { "关" },
+                        if cheat.gameshark { "GS" } else { "CB" },
+                        if cheat.name.is_empty() { "未命名" } else { &cheat.name },
+                        cheat.code
+                    );
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .id(("cheat-toggle", index))
+                                .flex_grow()
+                                .px(px(12.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(BG))
+                                .text_color(rgb(if cheat.enabled { ACCENT } else { TEXT }))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let _ = this.commands.send(Command::ToggleCheat(index));
+                                    cx.notify();
+                                }))
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .id(("cheat-remove", index))
+                                .px(px(10.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(BG))
+                                .text_color(rgb(MUTED))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let _ = this.commands.send(Command::RemoveCheat(index));
+                                    cx.notify();
+                                }))
+                                .child("删除"),
+                        )
+                })),
+        )
+}
+
 fn link_board(seats: &[LinkSeat]) -> impl IntoElement {
     let online = seats.iter().filter(|seat| !seat.name.is_empty()).count();
     div()
@@ -2447,6 +2805,7 @@ fn take_link_command(
     link: &mut LinkHub,
     cart: &mut Option<ActiveCart>,
     snapshot: &Mutex<Snapshot>,
+    cheats: &mut Vec<LiveCheat>,
 ) -> Option<Command> {
     let replaces_cart = matches!(
         command,
@@ -2499,7 +2858,180 @@ fn take_link_command(
             publish_link(snapshot, link);
             None
         }
+        Command::AddCheat {
+            name,
+            gameshark,
+            code,
+        } => {
+            let Some(active) = cart.as_ref() else {
+                publish_cheats(snapshot, cheats, Some("先打开一张卡带，再加金手指".into()));
+                return None;
+            };
+            let rom_id = active.rom_id.clone();
+            let family = if gameshark {
+                CheatFamily::GameShark
+            } else {
+                CheatFamily::CodeBreaker
+            };
+            let program = match parse_cheat(family, &code) {
+                Ok(program) => program,
+                Err(error) => {
+                    publish_cheats(snapshot, cheats, Some(error));
+                    return None;
+                }
+            };
+            cheats.push(LiveCheat {
+                name,
+                enabled: true,
+                gameshark,
+                code,
+                program: Some(program),
+            });
+            let error = save_cheats(&rom_id, cheats).err();
+            publish_cheats(snapshot, cheats, error);
+            None
+        }
+        Command::ToggleCheat(index) => {
+            let Some(active) = cart.as_ref() else {
+                return None;
+            };
+            let rom_id = active.rom_id.clone();
+            if let Some(cheat) = cheats.get_mut(index) {
+                if cheat.program.is_none() {
+                    let family = if cheat.gameshark {
+                        CheatFamily::GameShark
+                    } else {
+                        CheatFamily::CodeBreaker
+                    };
+                    match parse_cheat(family, &cheat.code) {
+                        Ok(program) => cheat.program = Some(program),
+                        Err(error) => {
+                            publish_cheats(snapshot, cheats, Some(error));
+                            return None;
+                        }
+                    }
+                }
+                cheat.enabled = !cheat.enabled;
+            }
+            let error = save_cheats(&rom_id, cheats).err();
+            publish_cheats(snapshot, cheats, error);
+            None
+        }
+        Command::RemoveCheat(index) => {
+            let Some(active) = cart.as_ref() else {
+                return None;
+            };
+            let rom_id = active.rom_id.clone();
+            if index < cheats.len() {
+                cheats.remove(index);
+            }
+            let error = save_cheats(&rom_id, cheats).err();
+            publish_cheats(snapshot, cheats, error);
+            None
+        }
         other => Some(other),
+    }
+}
+
+fn cheat_file(rom_id: &str) -> Result<PathBuf, String> {
+    Ok(application_data_dir()?.join("cheats").join(format!("{rom_id}.json")))
+}
+
+#[derive(Serialize, Deserialize)]
+struct CheatFile {
+    version: u8,
+    entries: Vec<CheatRecord>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CheatRecord {
+    name: String,
+    enabled: bool,
+    #[serde(default)]
+    gameshark: bool,
+    code: String,
+}
+
+fn live_cheat(record: CheatRecord) -> LiveCheat {
+    let family = if record.gameshark {
+        CheatFamily::GameShark
+    } else {
+        CheatFamily::CodeBreaker
+    };
+    let program = parse_cheat(family, &record.code).ok();
+    LiveCheat {
+        enabled: record.enabled && program.is_some(),
+        program,
+        name: record.name,
+        gameshark: record.gameshark,
+        code: record.code,
+    }
+}
+
+fn load_cheats(rom_id: &str) -> Vec<LiveCheat> {
+    if rom_id.is_empty() {
+        return Vec::new();
+    }
+    let Ok(path) = cheat_file(rom_id) else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    let Ok(file) = serde_json::from_slice::<CheatFile>(&bytes) else {
+        return Vec::new();
+    };
+    if file.version != 1 {
+        return Vec::new();
+    }
+    file.entries.into_iter().map(live_cheat).collect()
+}
+
+fn save_cheats(rom_id: &str, cheats: &[LiveCheat]) -> Result<(), String> {
+    let path = cheat_file(rom_id)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("创建金手指目录 {} 失败：{error}", parent.display()))?;
+    }
+    let file = CheatFile {
+        version: 1,
+        entries: cheats
+            .iter()
+            .map(|cheat| CheatRecord {
+                name: cheat.name.clone(),
+                enabled: cheat.enabled,
+                gameshark: cheat.gameshark,
+                code: cheat.code.clone(),
+            })
+            .collect(),
+    };
+    let bytes = serde_json::to_vec_pretty(&file)
+        .map_err(|error| format!("整理金手指失败：{error}"))?;
+    std::fs::write(&path, bytes)
+        .map_err(|error| format!("保存金手指 {} 失败：{error}", path.display()))
+}
+
+fn publish_cheats(snapshot: &Mutex<Snapshot>, cheats: &[LiveCheat], error: Option<String>) {
+    let mut state = snapshot.lock().expect("emulator snapshot poisoned");
+    state.cheats = cheats
+        .iter()
+        .map(|cheat| CheatView {
+            name: cheat.name.clone(),
+            enabled: cheat.enabled,
+            gameshark: cheat.gameshark,
+            code: cheat.code.clone(),
+        })
+        .collect();
+    state.cheat_error = error;
+}
+
+fn apply_cheats(bus: &mut Bus, cheats: &[LiveCheat]) {
+    for cheat in cheats {
+        if cheat.enabled {
+            if let Some(program) = &cheat.program {
+                program.apply(bus);
+            }
+        }
     }
 }
 
@@ -2604,9 +3136,20 @@ fn emulator_worker(
     let mut link = LinkHub::new();
     let mut link_steps = 0u32;
     let mut rewind = Rewind::default();
+    let mut cheats: Vec<LiveCheat> = Vec::new();
+    let mut cheat_rom = String::new();
 
     'worker: loop {
         let pad = poll_gamepad(&mut pads);
+        let rom_id = cart
+            .as_ref()
+            .map(|active| active.rom_id.clone())
+            .unwrap_or_default();
+        if rom_id != cheat_rom {
+            cheat_rom = rom_id;
+            cheats = load_cheats(&cheat_rom);
+            publish_cheats(&snapshot, &cheats, None);
+        }
         if cart.is_none() || paused {
             drive_link(&mut link, &mut cart, &snapshot);
             match receiver.recv_timeout(Duration::from_millis(100)) {
@@ -2615,7 +3158,7 @@ fn emulator_worker(
                         rewind.clear();
                     }
                     if let Some(command) =
-                        take_link_command(command, &mut link, &mut cart, &snapshot)
+                        take_link_command(command, &mut link, &mut cart, &snapshot, &mut cheats)
                     {
                         match apply_command(
                             command,
@@ -2665,7 +3208,7 @@ fn emulator_worker(
                         rewind.clear();
                     }
                     if let Some(command) =
-                        take_link_command(command, &mut link, &mut cart, &snapshot)
+                        take_link_command(command, &mut link, &mut cart, &snapshot, &mut cheats)
                     {
                         match apply_command(
                             command,
@@ -2728,7 +3271,7 @@ fn emulator_worker(
                         rewind.clear();
                     }
                     let Some(command) =
-                        take_link_command(command, &mut link, &mut cart, &snapshot)
+                        take_link_command(command, &mut link, &mut cart, &snapshot, &mut cheats)
                     else {
                         continue;
                     };
@@ -2790,6 +3333,7 @@ fn emulator_worker(
         if !rewinding {
             frame_number += 1;
             if let Some(active) = cart.as_mut() {
+                apply_cheats(&mut active.bus, &cheats);
                 rewind.record(&active.regs, &mut active.bus, frame_number);
             }
         }
@@ -3190,6 +3734,9 @@ fn apply_command(
             CommandResult::Continue
         }
         Command::HostLink | Command::JoinLink(_) | Command::StopLink | Command::SetLinkName(_) => {
+            CommandResult::Continue
+        }
+        Command::AddCheat { .. } | Command::ToggleCheat(_) | Command::RemoveCheat(_) => {
             CommandResult::Continue
         }
         Command::Shutdown => CommandResult::Shutdown,
@@ -3690,6 +4237,7 @@ fn app_menus(open: &[PictureMode], speed: u8, turbo: u8) -> Vec<Menu> {
                 speed_choice_menu("速度", speed, true),
                 speed_choice_menu("按住加速", turbo, false),
                 MenuItem::action("键位设置…", ShowControls),
+                MenuItem::action("金手指…", ShowCheats),
                 MenuItem::action("联机…", ShowLink),
                 MenuItem::action("切换 BIOS HLE", ToggleBiosHle),
                 MenuItem::separator(),
@@ -3874,6 +4422,7 @@ struct WindowLaunch {
     library_mode: Arc<AtomicBool>,
     controls: Arc<Mutex<ControlSettings>>,
     link_ui: Arc<Mutex<LinkUi>>,
+    cheat_ui: Arc<Mutex<CheatUi>>,
     windows_alive: Arc<AtomicUsize>,
     picture_windows: Arc<Mutex<PictureWindows>>,
     chrome_dirty: Arc<AtomicBool>,
@@ -4148,6 +4697,7 @@ fn open_game_window(
                     launch.library_mode,
                     launch.controls,
                     launch.link_ui,
+                    launch.cheat_ui,
                     launch.windows_alive,
                     launch.picture_windows,
                     launch.chrome_dirty,
@@ -4431,6 +4981,13 @@ fn main() {
         name_touched: !saved_link_name.is_empty(),
         field: LinkField::Address,
     }));
+    let cheat_ui = Arc::new(Mutex::new(CheatUi {
+        open: false,
+        name: String::new(),
+        code: String::new(),
+        gameshark: false,
+        field: CheatField::Code,
+    }));
     let launch = WindowLaunch {
         snapshot: Arc::clone(&snapshot),
         commands: commands.clone(),
@@ -4442,6 +4999,7 @@ fn main() {
         library_mode: Arc::clone(&library_mode),
         controls: Arc::clone(&controls),
         link_ui: Arc::clone(&link_ui),
+        cheat_ui: Arc::clone(&cheat_ui),
         windows_alive: Arc::new(AtomicUsize::new(0)),
         picture_windows: Arc::new(Mutex::new(PictureWindows {
             next_token: 0,
@@ -4569,28 +5127,54 @@ fn main() {
         let show_keys = Arc::clone(&keys);
         let show_turbo = Arc::clone(&turbo_held);
         let show_link = Arc::clone(&link_ui);
+        let show_cheats = Arc::clone(&cheat_ui);
+        let show_rewind = Arc::clone(&rewind_held);
         cx.on_action(move |_: &ShowControls, cx| {
             let mut settings = show_controls.lock().expect("control settings poisoned");
             settings.open = true;
             settings.capturing = None;
             drop(settings);
             show_link.lock().expect("link ui poisoned").open = false;
+            show_cheats.lock().expect("cheat ui poisoned").open = false;
             show_keys.store(0, Ordering::Relaxed);
             show_turbo.store(false, Ordering::Relaxed);
+            show_rewind.store(false, Ordering::Relaxed);
             cx.refresh_windows();
         });
         let open_link = Arc::clone(&link_ui);
+        let open_cheats = Arc::clone(&cheat_ui);
         let open_controls = Arc::clone(&controls);
         let open_keys = Arc::clone(&keys);
         let open_turbo = Arc::clone(&turbo_held);
+        let open_rewind = Arc::clone(&rewind_held);
         cx.on_action(move |_: &ShowLink, cx| {
             let mut settings = open_controls.lock().expect("control settings poisoned");
             settings.open = false;
             settings.capturing = None;
             drop(settings);
+            open_cheats.lock().expect("cheat ui poisoned").open = false;
             open_link.lock().expect("link ui poisoned").open = true;
             open_keys.store(0, Ordering::Relaxed);
             open_turbo.store(false, Ordering::Relaxed);
+            open_rewind.store(false, Ordering::Relaxed);
+            cx.refresh_windows();
+        });
+        let cheat_link = Arc::clone(&link_ui);
+        let cheat_panel = Arc::clone(&cheat_ui);
+        let cheat_controls = Arc::clone(&controls);
+        let cheat_keys = Arc::clone(&keys);
+        let cheat_turbo = Arc::clone(&turbo_held);
+        let cheat_rewind = Arc::clone(&rewind_held);
+        cx.on_action(move |_: &ShowCheats, cx| {
+            let mut settings = cheat_controls.lock().expect("control settings poisoned");
+            settings.open = false;
+            settings.capturing = None;
+            drop(settings);
+            cheat_link.lock().expect("link ui poisoned").open = false;
+            cheat_panel.lock().expect("cheat ui poisoned").open = true;
+            cheat_keys.store(0, Ordering::Relaxed);
+            cheat_turbo.store(false, Ordering::Relaxed);
+            cheat_rewind.store(false, Ordering::Relaxed);
             cx.refresh_windows();
         });
         let bios_commands = menu_commands.clone();

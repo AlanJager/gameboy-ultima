@@ -6,6 +6,7 @@ pub mod asm;
 mod backup;
 mod bios;
 mod bus;
+mod cheats;
 pub mod condition;
 mod cpu;
 pub mod decode;
@@ -33,6 +34,7 @@ mod timer;
 mod wait;
 
 pub use bus::Bus;
+pub use cheats::{parse_cheat, CheatFamily, CheatProgram};
 pub use cpu::{run_until_self_branch, step, step_quiet, Stepped};
 pub use disasm::{disassemble, Disassembly};
 pub use lesson::{
