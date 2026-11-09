@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use gameboy_ultima::link::{normalize_link_name, LinkHub, LinkSeat};
 use gameboy_ultima::{
-    rgb555_to_888, step_quiet, AudioPlay, Bus, Registers, CYCLES_PER_FRAME, HEIGHT, WIDTH,
+    audio_pace, rgb555_to_888, step_quiet, AudioPlay, Bus, Registers, CYCLES_PER_FRAME, HEIGHT,
+    WIDTH,
 };
 #[path = "controls.rs"]
 mod controls;
@@ -2646,7 +2647,13 @@ fn emulator_worker(
         write_link_view(&mut state, &link_view);
         drop(state);
 
-        let pace = frame_pace(frame_interval, speed);
+        let mut pace = frame_pace(frame_interval, speed);
+        if speed == 1 && audio.is_some() {
+            if let Some(active) = cart.as_ref() {
+                let (queued, capacity, hz) = active.bus.audio_queue();
+                pace = pace.mul_f64(audio_pace(queued, capacity, hz));
+            }
+        }
         next_frame_deadline += pace;
         let now = Instant::now();
         if next_frame_deadline > now {

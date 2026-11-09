@@ -14,6 +14,7 @@ mod dma;
 mod gfxcache;
 mod icache;
 mod keypad;
+mod music;
 mod lesson;
 mod ppu;
 mod registers;
@@ -41,5 +42,5 @@ pub use ppu::{
     Ppu, ScanPos, CYCLES_PER_FRAME, CYCLES_PER_LINE, HEIGHT, WIDTH,
 };
 pub use registers::Registers;
-pub use sound::{sample_hz, wav_bytes, AudioPlay, Sample};
+pub use sound::{audio_pace, sample_hz, wav_bytes, AudioPlay, Sample};
 pub use thumb::disassemble_thumb;

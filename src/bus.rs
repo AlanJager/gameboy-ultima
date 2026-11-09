@@ -197,6 +197,11 @@ impl Bus {
         self.sound.link().produced()
     }
 
+    /// 还在环里的样本数、环的容量、当前采样率。用来把模拟速度轻轻对齐播放。
+    pub fn audio_queue(&self) -> (usize, usize, u32) {
+        self.sound.queue()
+    }
+
     #[cfg(test)]
     pub(crate) fn collect_audio(&self) -> crate::sound::AudioPlay {
         crate::sound::AudioPlay::collect(self.sound.link())
