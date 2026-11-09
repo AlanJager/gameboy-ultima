@@ -17,6 +17,7 @@
 | 陀螺仪 | 瓦里奥制造 Twisted（`RZWJ`、`RZWE`、`RZWP`）。静止读数 `0x700`。按住 `[` 向左转，`]` 向右转，松开回到静止。不占用十字键 |
 | 倾斜 | 耀西万有引力（`KYGJ`、`KYGE`、`KYGP`）。挂在 `0x0E008000`，写 `0x55` 再写 `0xAA` 才锁存。静止 `0x3A0`。`,` `.` 左右，`;` `'` 上下，松开回到静止。不占用十字键 |
 | 太阳能 | 我们的太阳 1、2 和逆袭的萨巴塔（`U3IJ`、`U3IE`、`U3IP`、`U32J`、`U32E`、`U32P`、`U33J`）。和时钟共用 GPIO。0 是全黑，255 是最亮，默认 128。画面右下角点选强度，按卡带记住 |
+| 震动 | 瓦里奥制造 Twisted（`RZWJ`、`RZWE`、`RZWP`）和钻头娃娃（`V49J`、`V49E`、`V49P`）。GPIO bit 3 作为输出拉高时马达转。视图里的「画面震动」开着就把这一帧挪开几个像素，默认开，按卡带记住 |
 
 ### 声音
 
@@ -76,7 +77,6 @@
 | --- | --- |
 | 联合房间 | 登录能走完，`0x11` 仍是 `0xFF`，房间仍是 4 台 |
 | GameShark / Action Replay v3 | 未做。v1 的写入已经能用 |
-| 震动 | 未做 |
 | 动态重编译 | 未做 |
 | e-Reader | 未做 |
 | GameCube 联机 | 未做 |
@@ -108,7 +108,7 @@ macOS 可以打成独立应用，构建需要 Xcode Command Line Tools：
 cargo test
 ```
 
-`data/arm` 和 `data/thumb` 是单条指令的初态和终态。`roms/` 里的 `arm.gba`、`thumb.gba`、`memory.gba` 来自 [jsmolka/gba-tests](https://github.com/jsmolka/gba-tests)，许可证是 MIT，用来检查 CPU 和内存。`roms/sensors.gba` 是传感器实验卡，游戏代码 `ULTS`。左边的陀螺仪跟着 `[` `]` 往两侧倒，中间的小球跟着 `,` `.` `;` `'` 在槽里滚，右边的太阳跟着右下角的日光变大。
+`data/arm` 和 `data/thumb` 是单条指令的初态和终态。`roms/` 里的 `arm.gba`、`thumb.gba`、`memory.gba` 来自 [jsmolka/gba-tests](https://github.com/jsmolka/gba-tests)，许可证是 MIT，用来检查 CPU 和内存。`roms/sensors.gba` 是传感器实验卡，游戏代码 `ULTS`。左边的陀螺仪跟着 `[` `]` 往两侧倒，中间的小球跟着 `,` `.` `;` `'` 在槽里滚，右边的太阳跟着右下角的日光变大。`roms/rumble.gba` 是震动实验卡，游戏代码 `V49J`。靶心画死在画面上，马达每隔大约四分之一秒转一下；视图里的「画面震动」开着时整幅画面跟着晃，左上角的灯同时变亮。
 
 ## 许可
 

@@ -12,6 +12,7 @@ use crate::ppu::{
 };
 use crate::gyro::Gyro;
 use crate::rtc::Rtc;
+use crate::rumble::Rumble;
 use crate::solar::Solar;
 use crate::tilt::Tilt;
 use crate::sched::{EventKind, Scheduler};
@@ -94,6 +95,9 @@ pub struct Bus {
     /// 我们的太阳的感光。其它卡带不改 GPIO 的 bit 3。
     #[serde(default)]
     solar: Solar,
+    /// 震动马达。只有 Twisted 和钻头娃娃会拉高 bit 3。
+    #[serde(default)]
+    rumble: Rumble,
     /// 下一次定时器、消隐、采样。空档里只把拍数加上去。
     scheduler: Scheduler,
     /// 译过的指令。命中不再拆位域，执行还是解释。
@@ -144,6 +148,7 @@ impl Bus {
             gyro: Gyro::default(),
             tilt: Tilt::default(),
             solar: Solar::default(),
+            rumble: Rumble::default(),
             scheduler: Scheduler::new(),
             icache: ICache::new(),
             dirty: DirtyLines::new(),
@@ -1029,6 +1034,16 @@ impl Bus {
         self.gyro.set_present(crate::gyro::gyro_cart(&self.rom) || lab);
         self.tilt.set_present(crate::tilt::tilt_cart(&self.rom) || lab);
         self.solar.set_present(crate::solar::solar_cart(&self.rom) || lab);
+        self.rumble.set_present(crate::rumble::rumble_cart(&self.rom));
+    }
+
+    pub fn rumble_present(&self) -> bool {
+        self.rumble.present()
+    }
+
+    /// 这一帧马达转过，或现在还转着。调用之后短脉冲被收掉。
+    pub fn take_rumble(&mut self) -> bool {
+        self.rumble.take()
     }
 
     /// 0 全黑，255 最亮。下一次复位才锁存。
@@ -1066,6 +1081,9 @@ impl Bus {
             }
             return Some(value);
         }
+        if self.rumble.present() {
+            return self.rumble.read(addr);
+        }
         let mut value = self.rtc.read(addr)?;
         if (addr & 0x01FF_FFFF) == 0xC4 {
             if let Some(flag) = self.solar.driven_flag() {
@@ -1078,9 +1096,10 @@ impl Bus {
     fn cart_gpio_write(&mut self, addr: u32, value: u8) {
         if self.gyro.present() {
             self.gyro.write(addr, value);
-        } else {
+        } else if !self.rumble.present() {
             self.rtc.write(addr, value);
         }
+        self.rumble.write(addr, value);
         self.solar.write(addr, value);
     }
 

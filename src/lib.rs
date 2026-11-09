@@ -21,6 +21,7 @@ mod lesson;
 mod ppu;
 mod registers;
 mod rtc;
+mod rumble;
 mod tilt;
 mod ring;
 mod sched;
@@ -28,6 +29,8 @@ mod serde_array;
 pub mod link;
 #[cfg(test)]
 mod link_rom;
+#[cfg(test)]
+mod rumble_rom;
 #[cfg(test)]
 mod sensor_rom;
 mod sio;

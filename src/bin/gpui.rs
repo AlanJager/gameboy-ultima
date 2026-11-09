@@ -79,6 +79,7 @@ actions!(
         ToggleLinearScreen,
         ToggleLcdGhost,
         ToggleColorCorrect,
+        ToggleRumbleShake,
         CompareScreens,
         Quit
     ]
@@ -292,6 +293,7 @@ struct ControlSettings {
     turbo: u8,
     lcd_ghost: bool,
     color_correct: bool,
+    rumble_shake: bool,
 }
 
 impl ControlSettings {
@@ -321,6 +323,7 @@ struct Snapshot {
     picture_id: String,
     lcd_ghost: bool,
     color_correct: bool,
+    rumble_shake: bool,
     notice: String,
     frame_number: u64,
     image_version: u64,
@@ -419,6 +422,7 @@ struct AppView {
     solar: Arc<AtomicU8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
+    rumble_shake: Arc<AtomicBool>,
     focus_handle: FocusHandle,
     image_version: u64,
     applied_prefs: u64,
@@ -460,6 +464,7 @@ impl AppView {
         solar: Arc<AtomicU8>,
         lcd_ghost: Arc<AtomicBool>,
         color_correct: Arc<AtomicBool>,
+        rumble_shake: Arc<AtomicBool>,
         library_mode: Arc<AtomicBool>,
         controls: Arc<Mutex<ControlSettings>>,
         link_ui: Arc<Mutex<LinkUi>>,
@@ -494,6 +499,7 @@ impl AppView {
             solar,
             lcd_ghost,
             color_correct,
+            rumble_shake,
             focus_handle,
             image_version: 0,
             applied_prefs: 0,
@@ -618,6 +624,7 @@ impl AppView {
                 &shell.picture,
                 shell.lcd_ghost,
                 shell.color_correct,
+                shell.rumble_shake,
                 window,
                 cx,
             );
@@ -634,6 +641,7 @@ impl AppView {
             &prefs.picture,
             prefs.lcd_ghost,
             prefs.color_correct,
+            prefs.rumble_shake,
             window,
             cx,
         );
@@ -646,6 +654,7 @@ impl AppView {
         picture: &str,
         lcd_ghost: bool,
         color_correct: bool,
+        rumble_shake: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -656,15 +665,18 @@ impl AppView {
             settings.turbo = saved.turbo;
             settings.lcd_ghost = lcd_ghost;
             settings.color_correct = color_correct;
+            settings.rumble_shake = rumble_shake;
         }
         self.locked_speed.store(saved.speed, Ordering::Relaxed);
         self.turbo_ratio.store(saved.turbo, Ordering::Relaxed);
         self.lcd_ghost.store(lcd_ghost, Ordering::Relaxed);
         self.color_correct.store(color_correct, Ordering::Relaxed);
+        self.rumble_shake.store(rumble_shake, Ordering::Relaxed);
         {
             let mut state = self.snapshot.lock().expect("emulator snapshot poisoned");
             state.lcd_ghost = lcd_ghost;
             state.color_correct = color_correct;
+            state.rumble_shake = rumble_shake;
         }
         if !self.compare {
             if let Some(mode) = picture_from_id(picture) {
@@ -3040,6 +3052,7 @@ fn start_emulator(
     solar: Arc<AtomicU8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
+    rumble_shake: Arc<AtomicBool>,
 ) -> (
     Arc<Mutex<Snapshot>>,
     mpsc::Sender<Command>,
@@ -3061,6 +3074,7 @@ fn start_emulator(
         bios_hle: shell.bios_hle,
         lcd_ghost: shell.lcd_ghost,
         color_correct: shell.color_correct,
+        rumble_shake: shell.rumble_shake,
         error: library_error.clone(),
         library_error,
         library,
@@ -3082,6 +3096,7 @@ fn start_emulator(
     let worker_solar = Arc::clone(&solar);
     let worker_lcd_ghost = Arc::clone(&lcd_ghost);
     let worker_color_correct = Arc::clone(&color_correct);
+    let worker_rumble_shake = Arc::clone(&rumble_shake);
     let worker = thread::Builder::new()
         .name("ultima-emulator".into())
         .stack_size(8 * 1024 * 1024)
@@ -3101,6 +3116,7 @@ fn start_emulator(
                 worker_solar,
                 worker_lcd_ghost,
                 worker_color_correct,
+                worker_rumble_shake,
             )
         })
         .expect("start emulator worker");
@@ -3400,6 +3416,7 @@ struct CartPrefs {
     picture: String,
     lcd_ghost: bool,
     color_correct: bool,
+    rumble_shake: bool,
     solar: u8,
     map: KeyMap,
 }
@@ -3409,6 +3426,7 @@ struct ShellPrefs {
     picture: String,
     lcd_ghost: bool,
     color_correct: bool,
+    rumble_shake: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -3423,6 +3441,8 @@ struct CartPrefsFile {
     lcd_ghost: bool,
     #[serde(default)]
     color_correct: bool,
+    #[serde(default = "default_rumble_shake")]
+    rumble_shake: bool,
     #[serde(default = "default_solar_level")]
     solar: u8,
     bindings: HashMap<String, String>,
@@ -3430,6 +3450,10 @@ struct CartPrefsFile {
 
 fn default_solar_level() -> u8 {
     DEFAULT_SOLAR
+}
+
+fn default_rumble_shake() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize)]
@@ -3443,6 +3467,8 @@ struct ShellFile {
     lcd_ghost: bool,
     #[serde(default)]
     color_correct: bool,
+    #[serde(default = "default_rumble_shake")]
+    rumble_shake: bool,
 }
 
 fn shell_bios_default() -> bool {
@@ -3475,6 +3501,7 @@ fn read_cart_prefs_file(path: &Path) -> Option<CartPrefs> {
         picture: file.picture,
         lcd_ghost: file.lcd_ghost,
         color_correct: file.color_correct,
+        rumble_shake: file.rumble_shake,
         solar: file.solar,
         map: map_from_bindings(&file.bindings),
     })
@@ -3493,6 +3520,7 @@ fn write_cart_prefs_file(path: &Path, prefs: &CartPrefs) -> Result<(), String> {
         picture: prefs.picture.clone(),
         lcd_ghost: prefs.lcd_ghost,
         color_correct: prefs.color_correct,
+        rumble_shake: prefs.rumble_shake,
         solar: prefs.solar,
         bindings: bindings_from_map(&prefs.map),
     };
@@ -3512,6 +3540,7 @@ fn shell_defaults() -> ShellPrefs {
         picture: String::new(),
         lcd_ghost: false,
         color_correct: false,
+        rumble_shake: true,
     }
 }
 
@@ -3533,6 +3562,7 @@ fn read_shell_prefs() -> ShellPrefs {
         picture: file.picture,
         lcd_ghost: file.lcd_ghost,
         color_correct: file.color_correct,
+        rumble_shake: file.rumble_shake,
     }
 }
 
@@ -3548,6 +3578,7 @@ fn write_shell_prefs(prefs: &ShellPrefs) -> Result<(), String> {
         picture: prefs.picture.clone(),
         lcd_ghost: prefs.lcd_ghost,
         color_correct: prefs.color_correct,
+        rumble_shake: prefs.rumble_shake,
     };
     let bytes = serde_json::to_vec_pretty(&file)
         .map_err(|error| format!("整理界面设置失败：{error}"))?;
@@ -3556,7 +3587,7 @@ fn write_shell_prefs(prefs: &ShellPrefs) -> Result<(), String> {
 }
 
 fn persist_open_cart(snapshot: &Mutex<Snapshot>, saved: &SavedControls) -> Result<(), String> {
-    let (rom_id, bios, picture, lcd_ghost, color_correct, solar) = {
+    let (rom_id, bios, picture, lcd_ghost, color_correct, rumble_shake, solar) = {
         let state = snapshot.lock().expect("emulator snapshot poisoned");
         (
             state.rom_id.clone(),
@@ -3564,6 +3595,7 @@ fn persist_open_cart(snapshot: &Mutex<Snapshot>, saved: &SavedControls) -> Resul
             state.picture_id.clone(),
             state.lcd_ghost,
             state.color_correct,
+            state.rumble_shake,
             state.solar,
         )
     };
@@ -3574,6 +3606,7 @@ fn persist_open_cart(snapshot: &Mutex<Snapshot>, saved: &SavedControls) -> Resul
         &picture,
         lcd_ghost,
         color_correct,
+        rumble_shake,
         solar,
     )
 }
@@ -3585,6 +3618,7 @@ fn persist_runtime(
     picture: &str,
     lcd_ghost: bool,
     color_correct: bool,
+    rumble_shake: bool,
     solar: u8,
 ) -> Result<(), String> {
     if rom_id.is_empty() {
@@ -3594,6 +3628,7 @@ fn persist_runtime(
             picture: picture.to_string(),
             lcd_ghost,
             color_correct,
+            rumble_shake,
         })?;
         return Ok(());
     }
@@ -3606,6 +3641,7 @@ fn persist_runtime(
             picture: picture.to_string(),
             lcd_ghost,
             color_correct,
+            rumble_shake,
             solar,
             map: saved.map.clone(),
         },
@@ -3620,6 +3656,7 @@ fn adopt_cart_runtime(
     turbo_ratio: &AtomicU8,
     lcd_ghost: &AtomicBool,
     color_correct: &AtomicBool,
+    rumble_shake: &AtomicBool,
     solar_level: &AtomicU8,
     snapshot: &Mutex<Snapshot>,
 ) {
@@ -3634,6 +3671,10 @@ fn adopt_cart_runtime(
         .as_ref()
         .map(|item| item.color_correct)
         .unwrap_or(shell.color_correct);
+    let shake = prefs
+        .as_ref()
+        .map(|item| item.rumble_shake)
+        .unwrap_or(shell.rumble_shake);
     *bios_hle = bios;
     cart.bus.set_bios_hle(bios);
     locked_speed.store(speed, Ordering::Relaxed);
@@ -3641,12 +3682,14 @@ fn adopt_cart_runtime(
     let sun = prefs.as_ref().map(|item| item.solar).unwrap_or(DEFAULT_SOLAR);
     lcd_ghost.store(ghost, Ordering::Relaxed);
     color_correct.store(color, Ordering::Relaxed);
+    rumble_shake.store(shake, Ordering::Relaxed);
     solar_level.store(sun, Ordering::Relaxed);
     let mut state = snapshot.lock().expect("emulator snapshot poisoned");
     state.rom_id = rom_id.to_string();
     state.bios_hle = bios;
     state.lcd_ghost = ghost;
     state.color_correct = color;
+    state.rumble_shake = shake;
     state.solar_cart = cart.bus.solar_present();
     state.solar = sun;
     state.prefs_token = state.prefs_token.wrapping_add(1);
@@ -3745,6 +3788,7 @@ fn emulator_worker(
     solar: Arc<AtomicU8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
+    rumble_shake: Arc<AtomicBool>,
 ) {
     let mut cart: Option<ActiveCart> = None;
     let mut audio: Option<AudioPlay> = None;
@@ -3761,6 +3805,7 @@ fn emulator_worker(
     let mut cheats: Vec<LiveCheat> = Vec::new();
     let mut cheat_rom = String::new();
     let mut lcd_held: Option<Vec<u8>> = None;
+    let mut shake_phase = 0u32;
 
     'worker: loop {
         let pad = poll_gamepad(&mut pads);
@@ -3779,6 +3824,7 @@ fn emulator_worker(
                         &turbo_ratio,
                         &lcd_ghost,
                         &color_correct,
+                        &rumble_shake,
                         &solar,
                         &snapshot,
                     );
@@ -4012,12 +4058,18 @@ fn emulator_worker(
                 screenshot_frames_left = Some(left);
             }
         }
-        let shown = display_frame(
+        let mut shown = display_frame(
             rgba,
             color_correct.load(Ordering::Relaxed),
             !rewinding && lcd_ghost.load(Ordering::Relaxed),
             &mut lcd_held,
         );
+        if let Some(active) = cart.as_mut() {
+            if active.bus.take_rumble() && rumble_shake.load(Ordering::Relaxed) {
+                shake_phase = shake_phase.wrapping_add(1);
+                shown = shake_frame(&shown, shake_phase);
+            }
+        }
         if let Some(active) = cart.as_mut() {
             link.service(&mut active.bus);
         }
@@ -4875,6 +4927,42 @@ fn mix_half(current: &[u8], previous: &[u8]) -> Vec<u8> {
     out
 }
 
+fn shake_offset(phase: u32) -> (i32, i32) {
+    match phase % 4 {
+        0 => (3, 0),
+        1 => (-3, 1),
+        2 => (3, -1),
+        _ => (-3, 0),
+    }
+}
+
+fn shake_frame(src: &[u8], phase: u32) -> Vec<u8> {
+    let (dx, dy) = shake_offset(phase);
+    let mut out = vec![0u8; src.len()];
+    for pixel in out.chunks_exact_mut(4) {
+        pixel[3] = 0xFF;
+    }
+    if src.len() != WIDTH * HEIGHT * 4 {
+        return out;
+    }
+    for y in 0..HEIGHT {
+        let sy = y as i32 - dy;
+        if sy < 0 || sy >= HEIGHT as i32 {
+            continue;
+        }
+        for x in 0..WIDTH {
+            let sx = x as i32 - dx;
+            if sx < 0 || sx >= WIDTH as i32 {
+                continue;
+            }
+            let from = (sy as usize * WIDTH + sx as usize) * 4;
+            let to = (y * WIDTH + x) * 4;
+            out[to..to + 4].copy_from_slice(&src[from..from + 4]);
+        }
+    }
+    out
+}
+
 fn display_frame(
     raw: Vec<u8>,
     color: bool,
@@ -4929,6 +5017,7 @@ fn app_menus(
     turbo: u8,
     lcd_ghost: bool,
     color_correct: bool,
+    rumble_shake: bool,
 ) -> Vec<Menu> {
     let mut compare_items: Vec<MenuItem> = picture_modes()
         .into_iter()
@@ -5000,6 +5089,10 @@ fn app_menus(
                 MenuItem::action(
                     picture_option_label("色彩校正", color_correct),
                     ToggleColorCorrect,
+                ),
+                MenuItem::action(
+                    picture_option_label("画面震动", rumble_shake),
+                    ToggleRumbleShake,
                 ),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu {
@@ -5174,6 +5267,7 @@ struct WindowLaunch {
     solar: Arc<AtomicU8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
+    rumble_shake: Arc<AtomicBool>,
     library_mode: Arc<AtomicBool>,
     controls: Arc<Mutex<ControlSettings>>,
     link_ui: Arc<Mutex<LinkUi>>,
@@ -5454,6 +5548,7 @@ fn open_game_window(
                     Arc::clone(&launch.solar),
                     Arc::clone(&launch.lcd_ghost),
                     Arc::clone(&launch.color_correct),
+                    Arc::clone(&launch.rumble_shake),
                     launch.library_mode,
                     launch.controls,
                     launch.link_ui,
@@ -5597,20 +5692,34 @@ fn refresh_picture_chrome(
         });
     }
     let open = live.iter().map(|(mode, _)| *mode).collect::<Vec<_>>();
-    let (speed, turbo, lcd_ghost, color_correct) = {
+    let (speed, turbo, lcd_ghost, color_correct, rumble_shake) = {
         let settings = controls.lock().expect("control settings poisoned");
         (
             settings.speed,
             settings.turbo,
             settings.lcd_ghost,
             settings.color_correct,
+            settings.rumble_shake,
         )
     };
-    cx.set_menus(app_menus(&open, speed, turbo, lcd_ghost, color_correct));
+    cx.set_menus(app_menus(
+        &open,
+        speed,
+        turbo,
+        lcd_ghost,
+        color_correct,
+        rumble_shake,
+    ));
 }
 
-fn toggle_screen_option(cx: &mut App, launch: &WindowLaunch, ghost: bool) {
-    let (rom_id, bios, picture, mut lcd_ghost, mut color_correct, solar) = {
+enum ScreenToggle {
+    Ghost,
+    Color,
+    Rumble,
+}
+
+fn toggle_screen_option(cx: &mut App, launch: &WindowLaunch, option: ScreenToggle) {
+    let (rom_id, bios, picture, mut lcd_ghost, mut color_correct, mut rumble_shake, solar) = {
         let state = launch.snapshot.lock().expect("emulator snapshot poisoned");
         (
             state.rom_id.clone(),
@@ -5618,30 +5727,41 @@ fn toggle_screen_option(cx: &mut App, launch: &WindowLaunch, ghost: bool) {
             state.picture_id.clone(),
             state.lcd_ghost,
             state.color_correct,
+            state.rumble_shake,
             state.solar,
         )
     };
-    if ghost {
-        lcd_ghost = !lcd_ghost;
-    } else {
-        color_correct = !color_correct;
+    match option {
+        ScreenToggle::Ghost => lcd_ghost = !lcd_ghost,
+        ScreenToggle::Color => color_correct = !color_correct,
+        ScreenToggle::Rumble => rumble_shake = !rumble_shake,
     }
     {
         let mut state = launch.snapshot.lock().expect("emulator snapshot poisoned");
         state.lcd_ghost = lcd_ghost;
         state.color_correct = color_correct;
+        state.rumble_shake = rumble_shake;
     }
     {
         let mut settings = launch.controls.lock().expect("control settings poisoned");
         settings.lcd_ghost = lcd_ghost;
         settings.color_correct = color_correct;
+        settings.rumble_shake = rumble_shake;
     }
     launch.lcd_ghost.store(lcd_ghost, Ordering::Relaxed);
     launch.color_correct.store(color_correct, Ordering::Relaxed);
+    launch.rumble_shake.store(rumble_shake, Ordering::Relaxed);
     let saved = launch.controls.lock().expect("control settings poisoned").saved();
-    if let Err(error) =
-        persist_runtime(&rom_id, &saved, bios, &picture, lcd_ghost, color_correct, solar)
-    {
+    if let Err(error) = persist_runtime(
+        &rom_id,
+        &saved,
+        bios,
+        &picture,
+        lcd_ghost,
+        color_correct,
+        rumble_shake,
+        solar,
+    ) {
         let _ = launch.commands.send(Command::Error(error));
     }
     refresh_picture_chrome(cx, &launch.picture_windows, &launch.controls);
@@ -5762,6 +5882,7 @@ fn main() {
     let solar = Arc::new(AtomicU8::new(DEFAULT_SOLAR));
     let lcd_ghost = Arc::new(AtomicBool::new(shell.lcd_ghost));
     let color_correct = Arc::new(AtomicBool::new(shell.color_correct));
+    let rumble_shake = Arc::new(AtomicBool::new(shell.rumble_shake));
     let (snapshot, commands, keys, audio_volume, worker) = start_emulator(
         Arc::clone(&locked_speed),
         Arc::clone(&turbo_ratio),
@@ -5772,6 +5893,7 @@ fn main() {
         Arc::clone(&solar),
         Arc::clone(&lcd_ghost),
         Arc::clone(&color_correct),
+        Arc::clone(&rumble_shake),
     );
     let (launch_rom, compare_on_launch) = launch_arguments();
     if let Some(path) = &launch_rom {
@@ -5786,6 +5908,7 @@ fn main() {
         turbo: saved.turbo,
         lcd_ghost: shell.lcd_ghost,
         color_correct: shell.color_correct,
+        rumble_shake: shell.rumble_shake,
     }));
     let saved_link_name = load_link_name();
     if !saved_link_name.is_empty() {
@@ -5818,6 +5941,7 @@ fn main() {
         solar: Arc::clone(&solar),
         lcd_ghost: Arc::clone(&lcd_ghost),
         color_correct: Arc::clone(&color_correct),
+        rumble_shake: Arc::clone(&rumble_shake),
         library_mode: Arc::clone(&library_mode),
         controls: Arc::clone(&controls),
         link_ui: Arc::clone(&link_ui),
@@ -5899,24 +6023,29 @@ fn main() {
         });
         let launch_ghost = launch.clone();
         cx.on_action(move |_: &ToggleLcdGhost, cx| {
-            toggle_screen_option(cx, &launch_ghost, true);
+            toggle_screen_option(cx, &launch_ghost, ScreenToggle::Ghost);
         });
         let launch_color = launch.clone();
         cx.on_action(move |_: &ToggleColorCorrect, cx| {
-            toggle_screen_option(cx, &launch_color, false);
+            toggle_screen_option(cx, &launch_color, ScreenToggle::Color);
+        });
+        let launch_rumble = launch.clone();
+        cx.on_action(move |_: &ToggleRumbleShake, cx| {
+            toggle_screen_option(cx, &launch_rumble, ScreenToggle::Rumble);
         });
         let launch_all = launch.clone();
         cx.on_action(move |_: &CompareScreens, cx| {
             open_screen_comparison(cx, &launch_all);
         });
         if !compare_on_launch {
-            let (speed, turbo, lcd_ghost, color_correct) = {
+            let (speed, turbo, lcd_ghost, color_correct, rumble_shake) = {
                 let settings = launch.controls.lock().expect("control settings poisoned");
                 (
                     settings.speed,
                     settings.turbo,
                     settings.lcd_ghost,
                     settings.color_correct,
+                    settings.rumble_shake,
                 )
             };
             cx.set_menus(app_menus(
@@ -5925,6 +6054,7 @@ fn main() {
                 turbo,
                 lcd_ghost,
                 color_correct,
+                rumble_shake,
             ));
         }
         let speed_launch = launch.clone();
@@ -6027,7 +6157,7 @@ fn main() {
         let bios_snapshot = Arc::clone(&snapshot);
         let bios_controls = Arc::clone(&controls);
         cx.on_action(move |_: &ToggleBiosHle, cx| {
-            let (rom_id, bios, picture, lcd_ghost, color_correct, solar) = {
+            let (rom_id, bios, picture, lcd_ghost, color_correct, rumble_shake, solar) = {
                 let state = bios_snapshot.lock().expect("emulator snapshot poisoned");
                 (
                     state.rom_id.clone(),
@@ -6035,6 +6165,7 @@ fn main() {
                     state.picture_id.clone(),
                     state.lcd_ghost,
                     state.color_correct,
+                    state.rumble_shake,
                     state.solar,
                 )
             };
@@ -6047,6 +6178,7 @@ fn main() {
                 &picture,
                 lcd_ghost,
                 color_correct,
+                rumble_shake,
                 solar,
             )
             {
@@ -6147,6 +6279,7 @@ mod tests {
                 picture: "not-a-filter".into(),
                 lcd_ghost: false,
                 color_correct: false,
+                rumble_shake: false,
                 solar: 40,
                 map: map.clone(),
             },
@@ -6183,6 +6316,7 @@ mod tests {
         let bare = read_cart_prefs_file(&dir.join("bare.json")).expect("old prefs");
         assert!(!bare.lcd_ghost);
         assert!(!bare.color_correct);
+        assert!(bare.rumble_shake);
         assert_eq!(bare.solar, DEFAULT_SOLAR);
         assert_eq!(solar_step(0), 0);
         assert_eq!(solar_step(DEFAULT_SOLAR), 8);
@@ -6204,6 +6338,25 @@ mod tests {
         assert!(held.is_none());
         let again = display_frame(raw, false, false, &mut held);
         assert_eq!(again, vec![255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_rumble_frame_shifts_a_pixel_and_the_next_phase_shifts_it_back() {
+        let mut frame = vec![0u8; WIDTH * HEIGHT * 4];
+        for pixel in frame.chunks_exact_mut(4) {
+            pixel[3] = 0xFF;
+        }
+        let origin = (10 * WIDTH + 10) * 4;
+        frame[origin..origin + 4].copy_from_slice(&[255, 255, 255, 255]);
+        let right = shake_frame(&frame, 0);
+        let (dx, _) = shake_offset(0);
+        let moved = (10 * WIDTH + (10 + dx as usize)) * 4;
+        assert_eq!(&right[moved..moved + 4], &[255, 255, 255, 255]);
+        assert_eq!(&right[origin..origin + 4], &[0, 0, 0, 255]);
+        let left = shake_frame(&frame, 1);
+        let (dx, dy) = shake_offset(1);
+        let moved = ((10 + dy) as usize * WIDTH + (10 + dx) as usize) * 4;
+        assert_eq!(&left[moved..moved + 4], &[255, 255, 255, 255]);
     }
 
     #[test]
