@@ -239,6 +239,7 @@ enum Command {
     AddCheat {
         name: String,
         gameshark: bool,
+        action_replay: bool,
         code: String,
     },
     ToggleCheat(usize),
@@ -366,6 +367,7 @@ struct CheatUi {
     name: String,
     code: String,
     gameshark: bool,
+    action_replay: bool,
     field: CheatField,
 }
 
@@ -374,6 +376,7 @@ struct CheatView {
     name: String,
     enabled: bool,
     gameshark: bool,
+    action_replay: bool,
     code: String,
 }
 
@@ -381,6 +384,7 @@ struct LiveCheat {
     name: String,
     enabled: bool,
     gameshark: bool,
+    action_replay: bool,
     code: String,
     program: Option<CheatProgram>,
 }
@@ -800,6 +804,7 @@ impl AppView {
         let name = cheat.name.clone();
         let code = cheat.code.clone();
         let gameshark = cheat.gameshark;
+        let action_replay = cheat.action_replay;
         drop(cheat);
         if code.is_empty() {
             return;
@@ -807,6 +812,7 @@ impl AppView {
         let _ = self.commands.send(Command::AddCheat {
             name,
             gameshark,
+            action_replay,
             code,
         });
     }
@@ -1693,6 +1699,7 @@ impl Render for AppView {
                     &draft.name,
                     &draft.code,
                     draft.gameshark,
+                    draft.action_replay,
                     matches!(draft.field, CheatField::Name),
                     &cheats,
                     cheat_error.as_deref(),
@@ -2443,11 +2450,42 @@ fn cheat_key_char(key: &str) -> Option<char> {
     Some(ch)
 }
 
+fn cheat_kind_label(gameshark: bool, action_replay: bool) -> &'static str {
+    if action_replay {
+        "Action Replay v3"
+    } else if gameshark {
+        "GameShark v1"
+    } else {
+        "CodeBreaker"
+    }
+}
+
+fn cheat_kind_tag(gameshark: bool, action_replay: bool) -> &'static str {
+    if action_replay {
+        "AR"
+    } else if gameshark {
+        "GS"
+    } else {
+        "CB"
+    }
+}
+
+fn cheat_family(gameshark: bool, action_replay: bool) -> CheatFamily {
+    if action_replay {
+        CheatFamily::ActionReplay
+    } else if gameshark {
+        CheatFamily::GameShark
+    } else {
+        CheatFamily::CodeBreaker
+    }
+}
+
 fn cheat_overlay(
     cx: &mut Context<AppView>,
     name: &str,
     code: &str,
     gameshark: bool,
+    action_replay: bool,
     editing_name: bool,
     cheats: &[CheatView],
     error: Option<&str>,
@@ -2462,7 +2500,7 @@ fn cheat_overlay(
     } else {
         code.to_string()
     };
-    let family = if gameshark { "GameShark v1" } else { "CodeBreaker" };
+    let family = cheat_kind_label(gameshark, action_replay);
     div()
         .absolute()
         .top(px(0.))
@@ -2553,7 +2591,14 @@ fn cheat_overlay(
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     let mut cheat = this.cheat_ui.lock().expect("cheat ui poisoned");
-                                    cheat.gameshark = !cheat.gameshark;
+                                    if !cheat.gameshark && !cheat.action_replay {
+                                        cheat.gameshark = true;
+                                    } else if cheat.gameshark && !cheat.action_replay {
+                                        cheat.action_replay = true;
+                                    } else {
+                                        cheat.gameshark = false;
+                                        cheat.action_replay = false;
+                                    }
                                     cx.notify();
                                 }))
                                 .child(family),
@@ -2578,7 +2623,7 @@ fn cheat_overlay(
                     let label = format!(
                         "{}  {}  {}  {}",
                         if cheat.enabled { "开" } else { "关" },
-                        if cheat.gameshark { "GS" } else { "CB" },
+                        cheat_kind_tag(cheat.gameshark, cheat.action_replay),
                         if cheat.name.is_empty() { "未命名" } else { &cheat.name },
                         cheat.code
                     );
@@ -3241,6 +3286,7 @@ fn take_link_command(
         Command::AddCheat {
             name,
             gameshark,
+            action_replay,
             code,
         } => {
             let Some(active) = cart.as_ref() else {
@@ -3248,11 +3294,7 @@ fn take_link_command(
                 return None;
             };
             let rom_id = active.rom_id.clone();
-            let family = if gameshark {
-                CheatFamily::GameShark
-            } else {
-                CheatFamily::CodeBreaker
-            };
+            let family = cheat_family(gameshark, action_replay);
             let program = match parse_cheat(family, &code) {
                 Ok(program) => program,
                 Err(error) => {
@@ -3264,6 +3306,7 @@ fn take_link_command(
                 name,
                 enabled: true,
                 gameshark,
+                action_replay,
                 code,
                 program: Some(program),
             });
@@ -3278,11 +3321,7 @@ fn take_link_command(
             let rom_id = active.rom_id.clone();
             if let Some(cheat) = cheats.get_mut(index) {
                 if cheat.program.is_none() {
-                    let family = if cheat.gameshark {
-                        CheatFamily::GameShark
-                    } else {
-                        CheatFamily::CodeBreaker
-                    };
+                    let family = cheat_family(cheat.gameshark, cheat.action_replay);
                     match parse_cheat(family, &cheat.code) {
                         Ok(program) => cheat.program = Some(program),
                         Err(error) => {
@@ -3329,21 +3368,20 @@ struct CheatRecord {
     enabled: bool,
     #[serde(default)]
     gameshark: bool,
+    #[serde(default)]
+    action_replay: bool,
     code: String,
 }
 
 fn live_cheat(record: CheatRecord) -> LiveCheat {
-    let family = if record.gameshark {
-        CheatFamily::GameShark
-    } else {
-        CheatFamily::CodeBreaker
-    };
+    let family = cheat_family(record.gameshark, record.action_replay);
     let program = parse_cheat(family, &record.code).ok();
     LiveCheat {
         enabled: record.enabled && program.is_some(),
         program,
         name: record.name,
         gameshark: record.gameshark,
+        action_replay: record.action_replay,
         code: record.code,
     }
 }
@@ -3381,6 +3419,7 @@ fn save_cheats(rom_id: &str, cheats: &[LiveCheat]) -> Result<(), String> {
                 name: cheat.name.clone(),
                 enabled: cheat.enabled,
                 gameshark: cheat.gameshark,
+                action_replay: cheat.action_replay,
                 code: cheat.code.clone(),
             })
             .collect(),
@@ -3399,6 +3438,7 @@ fn publish_cheats(snapshot: &Mutex<Snapshot>, cheats: &[LiveCheat], error: Optio
             name: cheat.name.clone(),
             enabled: cheat.enabled,
             gameshark: cheat.gameshark,
+            action_replay: cheat.action_replay,
             code: cheat.code.clone(),
         })
         .collect();
@@ -3406,6 +3446,7 @@ fn publish_cheats(snapshot: &Mutex<Snapshot>, cheats: &[LiveCheat], error: Optio
 }
 
 fn apply_cheats(bus: &mut Bus, cheats: &[LiveCheat]) {
+    bus.clear_cheat_rom();
     for cheat in cheats {
         if cheat.enabled {
             if let Some(program) = &cheat.program {
@@ -5932,6 +5973,7 @@ fn main() {
         name: String::new(),
         code: String::new(),
         gameshark: false,
+        action_replay: false,
         field: CheatField::Code,
     }));
     let launch = WindowLaunch {

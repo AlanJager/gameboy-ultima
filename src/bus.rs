@@ -98,6 +98,9 @@ pub struct Bus {
     /// 震动马达。只有 Twisted 和钻头娃娃会拉高 bit 3。
     #[serde(default)]
     rumble: Rumble,
+    /// 金手指盖住的卡带半字。空着就读原来的 ROM，关掉这条码再清掉。
+    #[serde(default)]
+    cheat_rom: Vec<(usize, u16)>,
     /// 下一次定时器、消隐、采样。空档里只把拍数加上去。
     scheduler: Scheduler,
     /// 译过的指令。命中不再拆位域，执行还是解释。
@@ -149,6 +152,7 @@ impl Bus {
             tilt: Tilt::default(),
             solar: Solar::default(),
             rumble: Rumble::default(),
+            cheat_rom: Vec::new(),
             scheduler: Scheduler::new(),
             icache: ICache::new(),
             dirty: DirtyLines::new(),
@@ -1147,6 +1151,36 @@ impl Bus {
         self.icache.invalidate(addr, 4);
     }
 
+    pub fn clear_cheat_rom(&mut self) {
+        self.cheat_rom.clear();
+    }
+
+    pub fn patch_cheat_rom(&mut self, addr: u32, value: u16) {
+        let off = ((addr as usize) & 0x01FF_FFFF) & !1;
+        if let Some(slot) = self.cheat_rom.iter_mut().find(|(at, _)| *at == off) {
+            slot.1 = value;
+        } else {
+            self.cheat_rom.push((off, value));
+        }
+    }
+
+    fn cheat_rom_byte(&self, addr: u32) -> Option<u8> {
+        if self.cheat_rom.is_empty() {
+            return None;
+        }
+        let off = (addr as usize) & 0x01FF_FFFF;
+        let value = self
+            .cheat_rom
+            .iter()
+            .find(|(at, _)| *at == off & !1)?
+            .1;
+        Some(if off & 1 == 0 {
+            value as u8
+        } else {
+            (value >> 8) as u8
+        })
+    }
+
     pub fn read_u8(&self, addr: u32) -> u8 {
         match addr >> 24 {
             0x00 if addr < 0x4000 => self.bios[addr as usize],
@@ -1158,6 +1192,8 @@ impl Bus {
             0x07 => self.oam[(addr as usize) & (OAM - 1)],
             0x08..=0x0D => {
                 if let Some(value) = self.cart_gpio_read(addr) {
+                    value
+                } else if let Some(value) = self.cheat_rom_byte(addr) {
                     value
                 } else {
                     self.rom

@@ -1,5 +1,5 @@
 //! 金手指。CodeBreaker 按帧写进内存；9 开头的那行会给后面的码解密。
-//! GameShark / Action Replay v1 先按默认钥匙解开，再做 8、16、32 位写入。
+//! GameShark v1 和 Action Replay v3 先按各自的钥匙解开。v3 还能做间接写、加减、条件块，以及盖住卡带上的半字。
 
 use crate::bus::Bus;
 
@@ -7,6 +7,7 @@ use crate::bus::Bus;
 pub enum CheatFamily {
     CodeBreaker,
     GameShark,
+    ActionReplay,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,22 +49,112 @@ enum Op {
     IfButtons { mask: u16, mode: ButtonMode },
     /// GameShark：条件成立就跳过下一条。
     Unless { cond: Cond, addr: u32, value: u16 },
+    /// 同一数值写 `count` 次。每次把 `value_step` 加进数值，地址再走 `addr_step`。
+    Repeat {
+        addr: u32,
+        value: u32,
+        width: u8,
+        count: u32,
+        addr_step: u32,
+        value_step: u32,
+    },
+    /// 从 `addr` 读出指针，加上偏移再写。
+    Indirect {
+        addr: u32,
+        value: u32,
+        width: u8,
+        offset: u32,
+    },
+    /// 把数值加进原来的字节。
+    Add {
+        addr: u32,
+        value: u32,
+        width: u8,
+    },
+    /// 条件成立才执行后面 `then_len` 条；否则跳过它们，改走 `else_len` 条。
+    When {
+        kind: WhenKind,
+        addr: u32,
+        value: u32,
+        width: u8,
+        then_len: u16,
+        else_len: u16,
+        saw_else: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WhenKind {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Ult,
+    Ugt,
+    And,
+    Never,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheatProgram {
     ops: Vec<Op>,
+    rom: Vec<(u32, u16)>,
+}
+
+struct Effect {
+    pass: bool,
+    then_len: usize,
+    else_len: usize,
+}
+
+fn goes_through() -> Effect {
+    Effect {
+        pass: true,
+        then_len: 0,
+        else_len: 0,
+    }
+}
+
+fn skip_next(pass: bool) -> Effect {
+    Effect {
+        pass,
+        then_len: 1,
+        else_len: 0,
+    }
 }
 
 impl CheatProgram {
     pub fn apply(&self, bus: &mut Bus) {
-        let mut skip = false;
-        for op in &self.ops {
-            if skip {
-                skip = false;
+        for (addr, value) in &self.rom {
+            bus.patch_cheat_rom(*addr, *value);
+        }
+        let mut index = 0;
+        // 条件成立时，走到 then 的最后一条再跳过 else。
+        let mut jump_after: Option<(usize, usize)> = None;
+        while index < self.ops.len() {
+            let effect = apply_op(bus, &self.ops[index]);
+            if let Some((last_then, resume)) = jump_after {
+                if index == last_then {
+                    jump_after = None;
+                    index = resume;
+                    continue;
+                }
+            }
+            if !effect.pass && effect.then_len > 0 {
+                index = index.saturating_add(effect.then_len).saturating_add(1);
                 continue;
             }
-            skip = apply_op(bus, op);
+            if effect.pass && effect.else_len > 0 {
+                if effect.then_len == 0 {
+                    index = index.saturating_add(effect.else_len).saturating_add(1);
+                    continue;
+                }
+                jump_after = Some((
+                    index + effect.then_len,
+                    index + effect.then_len + effect.else_len + 1,
+                ));
+            }
+            index += 1;
         }
     }
 }
@@ -73,17 +164,18 @@ pub fn parse_cheat(family: CheatFamily, text: &str) -> Result<CheatProgram, Stri
     if pairs.is_empty() {
         return Err("金手指是空的".into());
     }
-    let ops = match family {
-        CheatFamily::CodeBreaker => parse_codebreaker(&pairs)?,
-        CheatFamily::GameShark => parse_gameshark(&pairs)?,
+    let (ops, rom) = match family {
+        CheatFamily::CodeBreaker => (parse_codebreaker(&pairs)?, Vec::new()),
+        CheatFamily::GameShark => (parse_gameshark(&pairs)?, Vec::new()),
+        CheatFamily::ActionReplay => parse_action_replay(&pairs)?,
     };
-    if ops.is_empty() {
+    if ops.is_empty() && rom.is_empty() {
         return Err("这些行没有要写入的码".into());
     }
-    Ok(CheatProgram { ops })
+    Ok(CheatProgram { ops, rom })
 }
 
-fn apply_op(bus: &mut Bus, op: &Op) -> bool {
+fn apply_op(bus: &mut Bus, op: &Op) -> Effect {
     match op {
         Op::Write8 { addr, value } => bus.write_u8(*addr, *value),
         Op::Write16 { addr, value } => bus.write_u16(*addr, *value),
@@ -123,7 +215,7 @@ fn apply_op(bus: &mut Bus, op: &Op) -> bool {
             }
         }
         Op::If { cond, addr, value } => {
-            return !cond_holds(*cond, bus.read_u16(*addr), *value);
+            return skip_next(cond_holds(*cond, bus.read_u16(*addr), *value));
         }
         Op::IfButtons { mask, mode } => {
             let pressed = !bus.read_u16(0x0400_0130) & 0x03FF;
@@ -132,13 +224,98 @@ fn apply_op(bus: &mut Bus, op: &Op) -> bool {
                 ButtonMode::None => pressed & mask == 0,
                 ButtonMode::Exact => pressed == *mask,
             };
-            return !ok;
+            return skip_next(ok);
         }
         Op::Unless { cond, addr, value } => {
-            return cond_holds(*cond, bus.read_u16(*addr), *value);
+            return skip_next(!cond_holds(*cond, bus.read_u16(*addr), *value));
+        }
+        Op::Repeat {
+            addr,
+            value,
+            width,
+            count,
+            addr_step,
+            value_step,
+        } => {
+            let mut at = *addr;
+            let mut current = *value;
+            for _ in 0..*count {
+                write_width(bus, at, *width, current);
+                at = at.wrapping_add(*addr_step);
+                current = current.wrapping_add(*value_step);
+            }
+        }
+        Op::Indirect {
+            addr,
+            value,
+            width,
+            offset,
+        } => {
+            let dest = bus.read_u32(*addr).wrapping_add(*offset);
+            write_width(bus, dest, *width, *value);
+        }
+        Op::Add { addr, value, width } => {
+            let next = read_width(bus, *addr, *width).wrapping_add(*value);
+            write_width(bus, *addr, *width, next);
+        }
+        Op::When {
+            kind,
+            addr,
+            value,
+            width,
+            then_len,
+            else_len,
+            ..
+        } => {
+            return Effect {
+                pass: when_holds(*kind, bus, *addr, *value, *width),
+                then_len: usize::from(*then_len),
+                else_len: usize::from(*else_len),
+            };
         }
     }
-    false
+    goes_through()
+}
+
+fn write_width(bus: &mut Bus, addr: u32, width: u8, value: u32) {
+    match width {
+        1 => bus.write_u8(addr, value as u8),
+        2 => bus.write_u16(addr, value as u16),
+        _ => bus.write_u32(addr, value),
+    }
+}
+
+fn read_width(bus: &Bus, addr: u32, width: u8) -> u32 {
+    match width {
+        1 => u32::from(bus.read_u8(addr)),
+        2 => u32::from(bus.read_u16(addr)),
+        _ => bus.read_u32(addr),
+    }
+}
+
+fn when_holds(kind: WhenKind, bus: &Bus, addr: u32, value: u32, width: u8) -> bool {
+    if kind == WhenKind::Never {
+        return false;
+    }
+    let have = read_width(bus, addr, width);
+    match kind {
+        WhenKind::Eq => have == value,
+        WhenKind::Ne => have != value,
+        WhenKind::Lt => signed_width(have, width) < signed_width(value, width),
+        WhenKind::Gt => signed_width(have, width) > signed_width(value, width),
+        WhenKind::Ult => have < value,
+        WhenKind::Ugt => have > value,
+        WhenKind::And => have & value != 0,
+        WhenKind::Never => false,
+    }
+}
+
+fn signed_width(value: u32, width: u8) -> i32 {
+    match width {
+        1 => i32::from(value as u8),
+        2 => i32::from(value as u16),
+        _ => value as i32,
+    }
 }
 
 fn cond_holds(cond: Cond, have: u16, want: u16) -> bool {
@@ -289,7 +466,7 @@ const GS_SEEDS: [u32; 4] = [0x09F4_FBBD, 0x9681_884A, 0x3520_27E9, 0xF3DE_E5A7];
 fn parse_gameshark(pairs: &[(u32, u32)]) -> Result<Vec<Op>, String> {
     let mut ops = Vec::new();
     for (op1, op2) in pairs {
-        let (op1, op2) = gameshark_decrypt(*op1, *op2);
+        let (op1, op2) = gameshark_decrypt(*op1, *op2, &GS_SEEDS);
         if op2 == 0x001D_C0DE {
             continue;
         }
@@ -331,24 +508,390 @@ fn parse_gameshark(pairs: &[(u32, u32)]) -> Result<Vec<Op>, String> {
     Ok(ops)
 }
 
-fn gameshark_decrypt(mut op1: u32, mut op2: u32) -> (u32, u32) {
+fn gameshark_decrypt(mut op1: u32, mut op2: u32, seeds: &[u32; 4]) -> (u32, u32) {
     let mut sum = 0xC6EF_3720u32;
     for _ in 0..32 {
         op2 = op2.wrapping_sub(
             op1.wrapping_shl(4)
-                .wrapping_add(GS_SEEDS[2])
+                .wrapping_add(seeds[2])
                 ^ op1.wrapping_add(sum)
-                ^ op1.wrapping_shr(5).wrapping_add(GS_SEEDS[3]),
+                ^ op1.wrapping_shr(5).wrapping_add(seeds[3]),
         );
         op1 = op1.wrapping_sub(
             op2.wrapping_shl(4)
-                .wrapping_add(GS_SEEDS[0])
+                .wrapping_add(seeds[0])
                 ^ op2.wrapping_add(sum)
-                ^ op2.wrapping_shr(5).wrapping_add(GS_SEEDS[1]),
+                ^ op2.wrapping_shr(5).wrapping_add(seeds[1]),
         );
         sum = sum.wrapping_sub(0x9E37_79B9);
     }
     (op1, op2)
+}
+
+const PAR_SEEDS: [u32; 4] = [0x7AA9_648F, 0x7FAE_6994, 0xC0EF_AAD5, 0x4271_2C57];
+
+const PAR_T1: [u8; 256] = [
+    0xD0, 0xFF, 0xBA, 0xE5, 0xC1, 0xC7, 0xDB, 0x5B, 0x16, 0xE3, 0x6E, 0x26, 0x62, 0x31, 0x2E, 0x2A,
+    0xD1, 0xBB, 0x4A, 0xE6, 0xAE, 0x2F, 0x0A, 0x90, 0x29, 0x90, 0xB6, 0x67, 0x58, 0x2A, 0xB4, 0x45,
+    0x7B, 0xCB, 0xF0, 0x73, 0x84, 0x30, 0x81, 0xC2, 0xD7, 0xBE, 0x89, 0xD7, 0x4E, 0x73, 0x5C, 0xC7,
+    0x80, 0x1B, 0xE5, 0xE4, 0x43, 0xC7, 0x46, 0xD6, 0x6F, 0x7B, 0xBF, 0xED, 0xE5, 0x27, 0xD1, 0xB5,
+    0xD0, 0xD8, 0xA3, 0xCB, 0x2B, 0x30, 0xA4, 0xF0, 0x84, 0x14, 0x72, 0x5C, 0xFF, 0xA4, 0xFB, 0x54,
+    0x9D, 0x70, 0xE2, 0xFF, 0xBE, 0xE8, 0x24, 0x76, 0xE5, 0x15, 0xFB, 0x1A, 0xBC, 0x87, 0x02, 0x2A,
+    0x58, 0x8F, 0x9A, 0x95, 0xBD, 0xAE, 0x8D, 0x0C, 0xA5, 0x4C, 0xF2, 0x5C, 0x7D, 0xAD, 0x51, 0xFB,
+    0xB1, 0x22, 0x07, 0xE0, 0x29, 0x7C, 0xEB, 0x98, 0x14, 0xC6, 0x31, 0x97, 0xE4, 0x34, 0x8F, 0xCC,
+    0x99, 0x56, 0x9F, 0x78, 0x43, 0x91, 0x85, 0x3F, 0xC2, 0xD0, 0xD1, 0x80, 0xD1, 0x77, 0xA7, 0xE2,
+    0x43, 0x99, 0x1D, 0x2F, 0x8B, 0x6A, 0xE4, 0x66, 0x82, 0xF7, 0x2B, 0x0B, 0x65, 0x14, 0xC0, 0xC2,
+    0x1D, 0x96, 0x78, 0x1C, 0xC4, 0xC3, 0xD2, 0xB1, 0x64, 0x07, 0xD7, 0x6F, 0x02, 0xE9, 0x44, 0x31,
+    0xDB, 0x3C, 0xEB, 0x93, 0xED, 0x9A, 0x57, 0x05, 0xB9, 0x0E, 0xAF, 0x1F, 0x48, 0x11, 0xDC, 0x35,
+    0x6C, 0xB8, 0xEE, 0x2A, 0x48, 0x2B, 0xBC, 0x89, 0x12, 0x59, 0xCB, 0xD1, 0x18, 0xEA, 0x72, 0x11,
+    0x01, 0x75, 0x3B, 0xB5, 0x56, 0xF4, 0x8B, 0xA0, 0x41, 0x75, 0x86, 0x7B, 0x94, 0x12, 0x2D, 0x4C,
+    0x0C, 0x22, 0xC9, 0x4A, 0xD8, 0xB1, 0x8D, 0xF0, 0x55, 0x2E, 0x77, 0x50, 0x1C, 0x64, 0x77, 0xAA,
+    0x3E, 0xAC, 0xD3, 0x3D, 0xCE, 0x60, 0xCA, 0x5D, 0xA0, 0x92, 0x78, 0xC6, 0x51, 0xFE, 0xF9, 0x30,
+];
+
+const PAR_T2: [u8; 256] = [
+    0xAA, 0xAF, 0xF0, 0x72, 0x90, 0xF7, 0x71, 0x27, 0x06, 0x11, 0xEB, 0x9C, 0x37, 0x12, 0x72, 0xAA,
+    0x65, 0xBC, 0x0D, 0x4A, 0x76, 0xF6, 0x5C, 0xAA, 0xB0, 0x7A, 0x7D, 0x81, 0xC1, 0xCE, 0x2F, 0x9F,
+    0x02, 0x75, 0x38, 0xC8, 0xFC, 0x66, 0x05, 0xC2, 0x2C, 0xBD, 0x91, 0xAD, 0x03, 0xB1, 0x88, 0x93,
+    0x31, 0xC6, 0xAB, 0x40, 0x23, 0x43, 0x76, 0x54, 0xCA, 0xE7, 0x00, 0x96, 0x9F, 0xD8, 0x24, 0x8B,
+    0xE4, 0xDC, 0xDE, 0x48, 0x2C, 0xCB, 0xF7, 0x84, 0x1D, 0x45, 0xE5, 0xF1, 0x75, 0xA0, 0xED, 0xCD,
+    0x4B, 0x24, 0x8A, 0xB3, 0x98, 0x7B, 0x12, 0xB8, 0xF5, 0x63, 0x97, 0xB3, 0xA6, 0xA6, 0x0B, 0xDC,
+    0xD8, 0x4C, 0xA8, 0x99, 0x27, 0x0F, 0x8F, 0x94, 0x63, 0x0F, 0xB0, 0x11, 0x94, 0xC7, 0xE9, 0x7F,
+    0x3B, 0x40, 0x72, 0x4C, 0xDB, 0x84, 0x78, 0xFE, 0xB8, 0x56, 0x08, 0x80, 0xDF, 0x20, 0x2F, 0xB9,
+    0x66, 0x2D, 0x60, 0x63, 0xF5, 0x18, 0x15, 0x1B, 0x86, 0x85, 0xB9, 0xB4, 0x68, 0x0E, 0xC6, 0xD1,
+    0x8A, 0x81, 0x2B, 0xB3, 0xF6, 0x48, 0xF0, 0x4F, 0x9C, 0x28, 0x1C, 0xA4, 0x51, 0x2F, 0xD7, 0x4B,
+    0x17, 0xE7, 0xCC, 0x50, 0x9F, 0xD0, 0xD1, 0x40, 0x0C, 0x0D, 0xCA, 0x83, 0xFA, 0x5E, 0xCA, 0xEC,
+    0xBF, 0x4E, 0x7C, 0x8F, 0xF0, 0xAE, 0xC2, 0xD3, 0x28, 0x41, 0x9B, 0xC8, 0x04, 0xB9, 0x4A, 0xBA,
+    0x72, 0xE2, 0xB5, 0x06, 0x2C, 0x1E, 0x0B, 0x2C, 0x7F, 0x11, 0xA9, 0x26, 0x51, 0x9D, 0x3F, 0xF8,
+    0x62, 0x11, 0x2E, 0x89, 0xD2, 0x9D, 0x35, 0xB1, 0xE4, 0x0A, 0x4D, 0x93, 0x01, 0xA7, 0xD1, 0x2D,
+    0x00, 0x87, 0xE2, 0x2D, 0xA4, 0xE9, 0x0A, 0x06, 0x66, 0xF8, 0x1F, 0x44, 0x75, 0xB5, 0x6B, 0x1C,
+    0xFC, 0x31, 0x09, 0x48, 0xA3, 0xFF, 0x92, 0x12, 0x58, 0xE9, 0xFA, 0xAE, 0x4F, 0xE2, 0xB4, 0xCC,
+];
+
+fn reseed(seeds: &mut [u32; 4], params: u16) {
+    let s0 = usize::from(params >> 8);
+    let s1 = usize::from(params & 0xFF);
+    for y in 0..4 {
+        for x in 0..4 {
+            let mixed = PAR_T1[(s0 + x) & 0xFF].wrapping_add(PAR_T2[(s1 + y) & 0xFF]);
+            seeds[y] = (seeds[y] << 8) | u32::from(mixed);
+        }
+    }
+}
+
+fn par_addr(word: u32) -> u32 {
+    (word & 0x000F_FFFF) | ((word << 4) & 0x0F00_0000)
+}
+
+fn mask_width(width: u32) -> u32 {
+    if width >= 4 {
+        u32::MAX
+    } else {
+        (1u32 << (width * 8)) - 1
+    }
+}
+
+fn fit_block(len: usize) -> Result<u16, String> {
+    u16::try_from(len).map_err(|_| "条件块太长".into())
+}
+
+enum Pending {
+    Assign { index: usize, button: bool },
+    Rom { addr: u32 },
+}
+
+struct ActionReplay {
+    seeds: [u32; 4],
+    ops: Vec<Op>,
+    rom: Vec<(u32, u16)>,
+    pending: Option<Pending>,
+    blocks: Vec<usize>,
+}
+
+fn parse_action_replay(pairs: &[(u32, u32)]) -> Result<(Vec<Op>, Vec<(u32, u16)>), String> {
+    let mut parser = ActionReplay {
+        seeds: PAR_SEEDS,
+        ops: Vec::new(),
+        rom: Vec::new(),
+        pending: None,
+        blocks: Vec::new(),
+    };
+    for (op1, op2) in pairs {
+        let (op1, op2) = gameshark_decrypt(*op1, *op2, &parser.seeds);
+        parser.line(op1, op2)?;
+    }
+    parser.finish()
+}
+
+impl ActionReplay {
+    fn line(&mut self, op1: u32, op2: u32) -> Result<(), String> {
+        if self.consume_pending(op1, op2)? {
+            return Ok(());
+        }
+        if op2 == 0x001D_C0DE {
+            return Ok(());
+        }
+        if op1 == 0 {
+            return self.special(op2);
+        }
+        if op1 == 0xDEAD_FACE {
+            reseed(&mut self.seeds, op2 as u16);
+            return Ok(());
+        }
+        // 钩子是让游戏自己去跑这条码。这里本来就每帧写，所以只收下这一行。
+        if op1 >> 24 == 0xC4 {
+            return Ok(());
+        }
+        if op1 & 0x3800_0000 != 0 {
+            return self.condition(op1, op2);
+        }
+        self.write(op1, op2)
+    }
+
+    fn consume_pending(&mut self, op1: u32, op2: u32) -> Result<bool, String> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(false);
+        };
+        match pending {
+            Pending::Rom { addr } => self.rom.push((addr, op1 as u16)),
+            Pending::Assign { index, button } => {
+                let width = match self.ops.get(index) {
+                    Some(Op::Repeat { width, .. }) => *width,
+                    _ => return Err("码的下一行对不上".into()),
+                };
+                let value = op1 & mask_width(u32::from(width));
+                match &mut self.ops[index] {
+                    Op::Repeat {
+                        value: slot,
+                        count,
+                        addr_step,
+                        value_step,
+                        ..
+                    } => {
+                        *slot = value;
+                        if !button {
+                            *count = (op2 >> 16) & 0xFF;
+                            *addr_step = (op2 & 0xFFFF).wrapping_mul(u32::from(width));
+                            *value_step = op2 >> 24;
+                        }
+                    }
+                    _ => return Err("码的下一行对不上".into()),
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    fn special(&mut self, op2: u32) -> Result<(), String> {
+        match op2 & 0xFF00_0000 {
+            0x0800_0000 => Err("这版不做减速码".into()),
+            0x1000_0000 => {
+                self.begin_assign(par_addr(op2), 1, true);
+                Ok(())
+            }
+            0x1200_0000 => {
+                self.begin_assign(par_addr(op2), 2, true);
+                Ok(())
+            }
+            0x1400_0000 => {
+                self.begin_assign(par_addr(op2), 4, true);
+                Ok(())
+            }
+            0x1800_0000 | 0x1A00_0000 | 0x1C00_0000 | 0x1E00_0000 => {
+                let addr = 0x0800_0000 | ((op2 & 0x00FF_FFFF) << 1);
+                self.pending = Some(Pending::Rom { addr });
+                Ok(())
+            }
+            0x4000_0000 => self.end_block(),
+            0x6000_0000 => self.else_block(),
+            0x8000_0000 => {
+                self.begin_assign(par_addr(op2), 1, false);
+                Ok(())
+            }
+            0x8200_0000 => {
+                self.begin_assign(par_addr(op2), 2, false);
+                Ok(())
+            }
+            0x8400_0000 => {
+                self.begin_assign(par_addr(op2), 4, false);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn begin_assign(&mut self, addr: u32, width: u8, button: bool) {
+        self.ops.push(Op::Repeat {
+            addr,
+            value: 0,
+            width,
+            count: u32::from(button),
+            addr_step: 0,
+            value_step: 0,
+        });
+        self.pending = Some(Pending::Assign {
+            index: self.ops.len() - 1,
+            button,
+        });
+    }
+
+    fn condition(&mut self, op1: u32, op2: u32) -> Result<(), String> {
+        if op1 & 0xC000_0000 == 0xC000_0000 {
+            return Err("这版不会按一条码关掉别的码".into());
+        }
+        let width = 1u32 << ((op1 & 0x0600_0000) >> 25);
+        let (kind, width) = if width > 4 {
+            (WhenKind::Never, 1)
+        } else {
+            let kind = match op1 & 0x3800_0000 {
+                0x0800_0000 => WhenKind::Eq,
+                0x1000_0000 => WhenKind::Ne,
+                0x1800_0000 => WhenKind::Lt,
+                0x2000_0000 => WhenKind::Gt,
+                0x2800_0000 => WhenKind::Ult,
+                0x3000_0000 => WhenKind::Ugt,
+                0x3800_0000 => WhenKind::And,
+                _ => WhenKind::Never,
+            };
+            (kind, width as u8)
+        };
+        let then_len = match op1 & 0xC000_0000 {
+            0x4000_0000 => 2,
+            0x8000_0000 => 0,
+            _ => 1,
+        };
+        self.ops.push(Op::When {
+            kind,
+            addr: par_addr(op1),
+            value: op2 & mask_width(u32::from(width)),
+            width,
+            then_len,
+            else_len: 0,
+            saw_else: false,
+        });
+        if then_len == 0 {
+            self.blocks.push(self.ops.len() - 1);
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, op1: u32, op2: u32) -> Result<(), String> {
+        if op1 & 0x0100_0000 != 0 && (op1 & 0xFE00_0000) != 0xC600_0000 {
+            return Err("这行 v3 码带了不认识的标志".into());
+        }
+        let base = op1 & 0xC000_0000;
+        let width = if base == 0xC000_0000 {
+            ((op1 >> 24) & 1) + 1
+        } else {
+            1u32 << ((op1 & 0x0600_0000) >> 25)
+        };
+        if width > 4 {
+            return Err("这行 v3 码的宽度不认识".into());
+        }
+        let width = width as u8;
+        let value = op2 & mask_width(u32::from(width));
+        match base {
+            0x0000_0000 => {
+                let count = if width < 4 {
+                    (op2 >> (u32::from(width) * 8)).wrapping_add(1)
+                } else {
+                    1
+                };
+                if count > 4096 {
+                    return Err("这行要连续写的次数太多".into());
+                }
+                self.ops.push(Op::Repeat {
+                    addr: par_addr(op1),
+                    value,
+                    width,
+                    count,
+                    addr_step: u32::from(width),
+                    value_step: 0,
+                });
+            }
+            0x4000_0000 => {
+                let offset = if width < 4 {
+                    (op2 >> (u32::from(width) * 8)).wrapping_mul(u32::from(width))
+                } else {
+                    0
+                };
+                self.ops.push(Op::Indirect {
+                    addr: par_addr(op1),
+                    value,
+                    width,
+                    offset,
+                });
+            }
+            0x8000_0000 => self.ops.push(Op::Add {
+                addr: par_addr(op1),
+                value,
+                width,
+            }),
+            _ => self.ops.push(Op::Repeat {
+                addr: 0x0400_0000 | (op1 & 0x00FF_FFFF),
+                value,
+                width,
+                count: 1,
+                addr_step: 0,
+                value_step: 0,
+            }),
+        }
+        Ok(())
+    }
+
+    fn else_block(&mut self) -> Result<(), String> {
+        let Some(&at) = self.blocks.last() else {
+            return Err("条件块没有开头".into());
+        };
+        let size = fit_block(self.ops.len() - at - 1)?;
+        match &mut self.ops[at] {
+            Op::When {
+                then_len, saw_else, ..
+            } => {
+                *then_len = size;
+                *saw_else = true;
+                Ok(())
+            }
+            _ => Err("条件块对不上".into()),
+        }
+    }
+
+    fn end_block(&mut self) -> Result<(), String> {
+        let Some(at) = self.blocks.pop() else {
+            return Err("条件块没有开头".into());
+        };
+        close_block(&mut self.ops, at)
+    }
+
+    fn finish(mut self) -> Result<(Vec<Op>, Vec<(u32, u16)>), String> {
+        if self.pending.is_some() {
+            return Err("这组码少了下一行".into());
+        }
+        while let Some(at) = self.blocks.pop() {
+            close_block(&mut self.ops, at)?;
+        }
+        Ok((self.ops, self.rom))
+    }
+}
+
+fn close_block(ops: &mut [Op], at: usize) -> Result<(), String> {
+    let size = fit_block(ops.len() - at - 1)?;
+    match &mut ops[at] {
+        Op::When {
+            then_len,
+            else_len,
+            saw_else,
+            ..
+        } => {
+            if *saw_else {
+                *else_len = size.saturating_sub(*then_len);
+            } else {
+                *then_len = size;
+            }
+            Ok(())
+        }
+        _ => Err("条件块对不上".into()),
+    }
 }
 
 struct CodeBreakerCipher {
@@ -592,28 +1135,162 @@ mod tests {
 
     #[test]
     fn gameshark_v1_decrypts_into_a_halfword_write() {
-        let (hi, lo) = encrypt_gameshark(0x1200_0000, 0x0000_BEEF);
+        let (hi, lo) = encrypt_gameshark(GS_SEEDS, 0x1200_0000, 0x0000_BEEF);
         let program = parse_cheat(CheatFamily::GameShark, &format!("{hi:08X} {lo:08X}")).unwrap();
         let mut bus = Bus::new();
         program.apply(&mut bus);
         assert_eq!(bus.read_u16(0x0200_0000), 0xBEEF);
     }
 
-    fn encrypt_gameshark(mut op1: u32, mut op2: u32) -> (u32, u32) {
+    #[test]
+    fn action_replay_v3_writes_adds_and_follows_a_pointer() {
+        let program = ar(&[
+            (0x0020_0010, 0x0000_00AB),
+            (0x0420_0000, 0x89AB_CDEF),
+            (0x8020_0020, 0x0000_0003),
+            (0x4020_0030, 0x0000_005A),
+            (0xC700_0008, 0x0000_1234),
+        ]);
+        let mut bus = Bus::new();
+        bus.write_u8(0x0200_0020, 0x10);
+        bus.write_u32(0x0200_0030, 0x0200_0040);
+        program.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0010), 0xAB);
+        assert_eq!(bus.read_u32(0x0200_0000), 0x89AB_CDEF);
+        assert_eq!(bus.read_u8(0x0200_0020), 0x13);
+        assert_eq!(bus.read_u8(0x0200_0040), 0x5A);
+        assert_eq!(bus.read_u16(0x0400_0008), 0x1234);
+    }
+
+    #[test]
+    fn action_replay_v3_repeats_a_byte_and_fills_from_the_next_line() {
+        let program = ar(&[
+            (0x0020_0050, 0x0000_02AB),
+            (0x0000_0000, 0x8020_0060),
+            (0x0000_0011, 0x0004_0002),
+            (0x0000_0000, 0x1020_0070),
+            (0x0000_0077, 0x0000_0000),
+        ]);
+        let mut bus = Bus::new();
+        program.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0050), 0xAB);
+        assert_eq!(bus.read_u8(0x0200_0051), 0xAB);
+        assert_eq!(bus.read_u8(0x0200_0052), 0xAB);
+        assert_eq!(bus.read_u8(0x0200_0053), 0);
+        assert_eq!(bus.read_u8(0x0200_0060), 0x11);
+        assert_eq!(bus.read_u8(0x0200_0062), 0x11);
+        assert_eq!(bus.read_u8(0x0200_0066), 0x11);
+        assert_eq!(bus.read_u8(0x0200_0068), 0);
+        assert_eq!(bus.read_u8(0x0200_0070), 0x77);
+    }
+
+    #[test]
+    fn action_replay_v3_skips_one_line_or_takes_the_else() {
+        let skip = ar(&[
+            (0x0820_0000, 0x0000_0001),
+            (0x0020_0002, 0x0000_0011),
+            (0x4820_0000, 0x0000_0001),
+            (0x0020_0004, 0x0000_0022),
+            (0x0020_0005, 0x0000_0033),
+            (0x0020_0006, 0x0000_0044),
+        ]);
+        let mut bus = Bus::new();
+        skip.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0002), 0);
+        assert_eq!(bus.read_u8(0x0200_0004), 0);
+        assert_eq!(bus.read_u8(0x0200_0005), 0);
+        assert_eq!(bus.read_u8(0x0200_0006), 0x44);
+        bus.write_u8(0x0200_0000, 1);
+        skip.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0002), 0x11);
+
+        let block = ar(&[
+            (0x8A20_0000, 0x0000_0001),
+            (0x0220_0002, 0x0000_1111),
+            (0x0000_0000, 0x6000_0000),
+            (0x0220_0004, 0x0000_2222),
+            (0x0000_0000, 0x4000_0000),
+        ]);
+        let mut bus = Bus::new();
+        block.apply(&mut bus);
+        assert_eq!(bus.read_u16(0x0200_0002), 0);
+        assert_eq!(bus.read_u16(0x0200_0004), 0x2222);
+        bus.write_u16(0x0200_0004, 0);
+        bus.write_u16(0x0200_0000, 1);
+        block.apply(&mut bus);
+        assert_eq!(bus.read_u16(0x0200_0002), 0x1111);
+        assert_eq!(bus.read_u16(0x0200_0004), 0);
+    }
+
+    #[test]
+    fn action_replay_v3_patches_a_rom_half_and_reseed_changes_the_next_line() {
+        let program = ar(&[
+            (0x0000_0000, 0x1A00_0080),
+            (0x0000_BEEF, 0x0000_0000),
+            (0xC400_0100, 0x0000_0000),
+            (0x0020_0080, 0x001D_C0DE),
+            (0x0020_0080, 0x0000_003C),
+        ]);
+        let mut bus = Bus::new();
+        program.apply(&mut bus);
+        assert_eq!(bus.read_u16(0x0800_0100), 0xBEEF);
+        assert_eq!(bus.read_u8(0x0200_0080), 0x3C);
+        bus.clear_cheat_rom();
+        assert_eq!(bus.read_u16(0x0800_0100), 0);
+
+        let mut seeds = PAR_SEEDS;
+        reseed(&mut seeds, 0x1234);
+        assert_eq!(
+            seeds,
+            [0x6D09_D152, 0x8D29_F172, 0xC05C_24A5, 0x9E3A_0283]
+        );
+        let (face_hi, face_lo) = encrypt_gameshark(PAR_SEEDS, 0xDEAD_FACE, 0x0000_1234);
+        let (write_hi, write_lo) = encrypt_gameshark(seeds, 0x0020_0090, 0x0000_004D);
+        let text = format!("{face_hi:08X} {face_lo:08X} {write_hi:08X} {write_lo:08X}");
+        let program = parse_cheat(CheatFamily::ActionReplay, &text).unwrap();
+        program.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0090), 0x4D);
+    }
+
+    #[test]
+    fn action_replay_v3_rejects_a_huge_repeat_and_a_slowdown() {
+        let huge = encrypt_gameshark(PAR_SEEDS, 0x0020_0000, 0x0010_0000);
+        let text = format!("{:08X} {:08X}", huge.0, huge.1);
+        let error = parse_cheat(CheatFamily::ActionReplay, &text).unwrap_err();
+        assert!(error.contains("太多"), "{error}");
+        let slow = encrypt_gameshark(PAR_SEEDS, 0, 0x0800_0000);
+        let text = format!("{:08X} {:08X}", slow.0, slow.1);
+        let error = parse_cheat(CheatFamily::ActionReplay, &text).unwrap_err();
+        assert!(error.contains("减速"), "{error}");
+    }
+
+    fn ar(pairs: &[(u32, u32)]) -> CheatProgram {
+        let text = pairs
+            .iter()
+            .map(|(op1, op2)| {
+                let (op1, op2) = encrypt_gameshark(PAR_SEEDS, *op1, *op2);
+                format!("{op1:08X} {op2:08X}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        parse_cheat(CheatFamily::ActionReplay, &text).unwrap()
+    }
+
+    fn encrypt_gameshark(seeds: [u32; 4], mut op1: u32, mut op2: u32) -> (u32, u32) {
         let mut sum = 0u32;
         for _ in 0..32 {
             sum = sum.wrapping_add(0x9E37_79B9);
             op1 = op1.wrapping_add(
                 op2.wrapping_shl(4)
-                    .wrapping_add(GS_SEEDS[0])
+                    .wrapping_add(seeds[0])
                     ^ op2.wrapping_add(sum)
-                    ^ op2.wrapping_shr(5).wrapping_add(GS_SEEDS[1]),
+                    ^ op2.wrapping_shr(5).wrapping_add(seeds[1]),
             );
             op2 = op2.wrapping_add(
                 op1.wrapping_shl(4)
-                    .wrapping_add(GS_SEEDS[2])
+                    .wrapping_add(seeds[2])
                     ^ op1.wrapping_add(sum)
-                    ^ op1.wrapping_shr(5).wrapping_add(GS_SEEDS[3]),
+                    ^ op1.wrapping_shr(5).wrapping_add(seeds[3]),
             );
         }
         (op1, op2)
