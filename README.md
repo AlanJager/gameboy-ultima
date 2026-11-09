@@ -108,7 +108,7 @@ macOS 可以打成独立应用，构建需要 Xcode Command Line Tools：
 cargo test
 ```
 
-`data/arm` 和 `data/thumb` 是单条指令的初态和终态。`roms/` 里的 `arm.gba`、`thumb.gba`、`memory.gba` 来自 [jsmolka/gba-tests](https://github.com/jsmolka/gba-tests)，许可证是 MIT，用来检查 CPU 和内存。
+`data/arm` 和 `data/thumb` 是单条指令的初态和终态。`roms/` 里的 `arm.gba`、`thumb.gba`、`memory.gba` 来自 [jsmolka/gba-tests](https://github.com/jsmolka/gba-tests)，许可证是 MIT，用来检查 CPU 和内存。`roms/sensors.gba` 是传感器实验卡，游戏代码 `ULTS`。陀螺仪、倾斜和太阳能一起打开，四条色带分别跟着 `[` `]`、`,` `.` `;` `'` 和右下角的日光走。
 
 ## 许可
 

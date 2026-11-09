@@ -1025,9 +1025,10 @@ impl Bus {
     pub fn load_rom(&mut self, rom: &[u8]) {
         self.rom = rom.to_vec();
         self.icache.clear();
-        self.gyro.set_present(crate::gyro::gyro_cart(&self.rom));
-        self.tilt.set_present(crate::tilt::tilt_cart(&self.rom));
-        self.solar.set_present(crate::solar::solar_cart(&self.rom));
+        let lab = sensor_lab(&self.rom);
+        self.gyro.set_present(crate::gyro::gyro_cart(&self.rom) || lab);
+        self.tilt.set_present(crate::tilt::tilt_cart(&self.rom) || lab);
+        self.solar.set_present(crate::solar::solar_cart(&self.rom) || lab);
     }
 
     /// 0 全黑，255 最亮。下一次复位才锁存。
@@ -1057,7 +1058,13 @@ impl Bus {
 
     fn cart_gpio_read(&self, addr: u32) -> Option<u8> {
         if self.gyro.present() {
-            return self.gyro.read(addr);
+            let mut value = self.gyro.read(addr)?;
+            if (addr & 0x01FF_FFFF) == 0xC4 {
+                if let Some(flag) = self.solar.driven_flag() {
+                    value = (value & !8) | flag;
+                }
+            }
+            return Some(value);
         }
         let mut value = self.rtc.read(addr)?;
         if (addr & 0x01FF_FFFF) == 0xC4 {
@@ -1073,8 +1080,8 @@ impl Bus {
             self.gyro.write(addr, value);
         } else {
             self.rtc.write(addr, value);
-            self.solar.write(addr, value);
         }
+        self.solar.write(addr, value);
     }
 
     /// 记下这一刻的机器。卡带字节不复制，快照里的 ROM 是空的。
@@ -1439,6 +1446,11 @@ impl Bus {
             *cell = value;
         }
     }
+}
+
+/// 实验卡 `ULTS` 把三路传感器同时打开。零售卡带仍只认自己的游戏代码。
+fn sensor_lab(rom: &[u8]) -> bool {
+    matches!(rom.get(0xAC..0xB0), Some(b"ULTS"))
 }
 
 fn next_hblank(now: u64) -> u64 {

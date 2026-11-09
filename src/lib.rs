@@ -28,6 +28,8 @@ mod serde_array;
 pub mod link;
 #[cfg(test)]
 mod link_rom;
+#[cfg(test)]
+mod sensor_rom;
 mod sio;
 mod solar;
 mod wireless;
