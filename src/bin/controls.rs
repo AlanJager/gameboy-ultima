@@ -539,15 +539,34 @@ pub(crate) fn read_controls(path: &Path) -> Result<SavedControls, String> {
     if file.version != 1 {
         return Err(format!("不支持的键位版本：{}", file.version));
     }
+    Ok(SavedControls {
+        map: map_from_bindings(&file.bindings),
+        speed: normalize_speed(file.speed),
+        turbo: normalize_turbo(file.turbo),
+    })
+}
+
+pub(crate) fn bindings_from_map(map: &KeyMap) -> HashMap<String, String> {
+    let mut bindings = HashMap::new();
+    for button in PadButton::ALL {
+        bindings.insert(button.id().to_string(), map.key(button).to_string());
+    }
+    for hotkey in Hotkey::ALL {
+        bindings.insert(hotkey.id().to_string(), map.hotkey(hotkey).to_string());
+    }
+    bindings
+}
+
+pub(crate) fn map_from_bindings(bindings: &HashMap<String, String>) -> KeyMap {
     let mut map = KeyMap::default();
     for button in PadButton::ALL {
-        let Some(key) = file.bindings.get(button.id()) else {
+        let Some(key) = bindings.get(button.id()) else {
             continue;
         };
         apply_saved_key(&mut map.keys[button.index()], key);
     }
     for hotkey in Hotkey::ALL {
-        let Some(key) = file.bindings.get(hotkey.id()) else {
+        let Some(key) = bindings.get(hotkey.id()) else {
             continue;
         };
         apply_saved_key(&mut map.hotkeys[hotkey.index()], key);
@@ -559,11 +578,7 @@ pub(crate) fn read_controls(path: &Path) -> Result<SavedControls, String> {
     for hotkey in Hotkey::ALL {
         claim_saved_key(&mut map.hotkeys[hotkey.index()], &mut seen);
     }
-    Ok(SavedControls {
-        map,
-        speed: normalize_speed(file.speed),
-        turbo: normalize_turbo(file.turbo),
-    })
+    map
 }
 
 fn apply_saved_key(slot: &mut String, key: &str) {
@@ -591,19 +606,9 @@ pub(crate) fn write_controls(path: &Path, saved: &SavedControls) -> Result<(), S
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("创建键位目录 {} 失败：{error}", parent.display()))?;
     }
-    let mut bindings: HashMap<String, String> = PadButton::ALL
-        .into_iter()
-        .map(|button| (button.id().to_string(), saved.map.key(button).to_string()))
-        .collect();
-    for hotkey in Hotkey::ALL {
-        bindings.insert(
-            hotkey.id().to_string(),
-            saved.map.hotkey(hotkey).to_string(),
-        );
-    }
     let bytes = serde_json::to_vec_pretty(&ControlsFile {
         version: 1,
-        bindings,
+        bindings: bindings_from_map(&saved.map),
         speed: normalize_speed(saved.speed),
         turbo: normalize_turbo(saved.turbo),
     })

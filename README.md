@@ -59,6 +59,7 @@
 | 图库 | 记下载入过的 `.gba`（不复制卡带文件）。没有自选封面时，大约 30 帧后用当时的画面做封面，也可以另选 PNG 或 JPEG |
 | 速度 | 1、2、3、4、5、8 倍；按住加速默认 4 倍，按住时取锁定速度和加速档里更高的一档 |
 | 键盘可以改键 | 手柄用 gilrs：东面键 A，南面键 B，Select / Start，十字键和左摇杆，左右扳机是 R / L |
+| 按卡带记住 | 速度、加速档、键位、BIOS 和当前滤镜写在 `cart_prefs/`。没有这张卡带自己的文件时，用全局键位和 `shell.json` |
 | 即时存档 | 三个槽加一份快速档，按卡带内容分开，写在应用数据目录的 `save_states/`。游戏自己的 `.sav` 仍写在卡带旁边，换卡或退出时如果改过就写回 |
 | 回退 | 按住回退键往回走大约十秒。每半秒记一档，不复制卡带。松手后从停下的地方继续。换卡、复位或读档会清掉 |
 | 金手指 | CodeBreaker（明文，以及 `9` 开头的加密）和 GameShark v1 的 8/16/32 位写入、条件。按卡带记在应用数据的 `cheats/`。开着的码每帧写一次 |
@@ -71,7 +72,6 @@
 | --- | --- |
 | 联合房间 | 登录能走完，`0x11` 仍是 `0xFF`，房间仍是 4 台 |
 | GameShark / Action Replay v3 | 未做。v1 的写入已经能用 |
-| 按卡带分开的速度、BIOS 或键位 | 未做 |
 | 跨网中继 | 未做 |
 | 陀螺仪、太阳能、震动 | 未做 |
 | 动态重编译 | 未做 |
@@ -87,7 +87,7 @@ cargo run --release --bin gameboy-ultima-gpui
 cargo run --release --bin gameboy-ultima-gpui -- 卡带.gba
 ```
 
-不带路径时打开图库。macOS 上应用数据在 `~/Library/Application Support/gameboy-ultima`（`library.json`、封面、即时存档、键位）。
+不带路径时打开图库。macOS 上应用数据在 `~/Library/Application Support/gameboy-ultima`（`library.json`、封面、即时存档、键位、`cart_prefs/`、`shell.json`）。
 
 macOS 可以打成独立应用，构建需要 Xcode Command Line Tools：
 

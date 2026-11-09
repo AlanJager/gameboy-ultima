@@ -90,7 +90,7 @@ struct SetLockedSpeed(u8);
 #[action(namespace = ultima, no_json)]
 struct SetTurboSpeed(u8);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PictureMode {
     #[cfg(target_os = "macos")]
     Metal,
@@ -131,6 +131,33 @@ impl PictureMode {
             PictureMode::CpuNearest | PictureMode::Linear => None,
         }
     }
+}
+
+fn picture_id(mode: PictureMode) -> &'static str {
+    match mode {
+        #[cfg(target_os = "macos")]
+        PictureMode::Metal => "metal",
+        #[cfg(target_os = "macos")]
+        PictureMode::Sharpen => "sharpen",
+        PictureMode::CpuNearest => "cpu-nearest",
+        PictureMode::Linear => "linear",
+    }
+}
+
+fn picture_from_id(id: &str) -> Option<PictureMode> {
+    match id {
+        #[cfg(target_os = "macos")]
+        "metal" => Some(PictureMode::Metal),
+        #[cfg(target_os = "macos")]
+        "sharpen" => Some(PictureMode::Sharpen),
+        "cpu-nearest" => Some(PictureMode::CpuNearest),
+        "linear" => Some(PictureMode::Linear),
+        _ => None,
+    }
+}
+
+fn initial_picture() -> PictureMode {
+    picture_from_id(&read_shell_prefs().picture).unwrap_or_else(main_picture)
 }
 
 fn picture_modes() -> Vec<PictureMode> {
@@ -192,7 +219,6 @@ enum Command {
         cover_path: PathBuf,
     },
     TogglePause,
-    ToggleBiosHle,
     SaveStateSlot(u8),
     LoadStateSlot(u8),
     QuickSaveState,
@@ -204,6 +230,7 @@ enum Command {
     JoinLink(String),
     StopLink,
     SetLinkName(String),
+    SetBios(bool),
     AddCheat {
         name: String,
         gameshark: bool,
@@ -256,6 +283,9 @@ struct Snapshot {
     resume_prompt: bool,
     boot_animation_started: Option<Instant>,
     rom_path: Option<PathBuf>,
+    rom_id: String,
+    prefs_token: u64,
+    picture_id: String,
     notice: String,
     frame_number: u64,
     image_version: u64,
@@ -349,6 +379,7 @@ struct AppView {
     rewind_held: Arc<AtomicBool>,
     focus_handle: FocusHandle,
     image_version: u64,
+    applied_prefs: u64,
     picture: PictureMode,
     compare: bool,
     labeled: bool,
@@ -413,6 +444,7 @@ impl AppView {
             rewind_held,
             focus_handle,
             image_version: 0,
+            applied_prefs: 0,
             picture,
             compare,
             labeled: compare,
@@ -492,12 +524,57 @@ impl AppView {
     }
 
     fn persist_controls(&self, saved: &SavedControls) {
-        let Ok(path) = controls_file_path() else {
-            return;
-        };
-        if let Err(error) = write_controls(&path, saved) {
+        if let Err(error) = persist_open_cart(&self.snapshot, saved) {
             let _ = self.commands.send(Command::Error(error));
         }
+    }
+
+    fn apply_open_cart(&mut self, rom_id: &str, window: &Window, cx: &mut Context<Self>) {
+        let Some(prefs) = read_cart_prefs(rom_id) else {
+            let global = load_saved_controls();
+            let shell = read_shell_prefs();
+            self.install_runtime(&global, shell.bios_hle, &shell.picture, window, cx);
+            return;
+        };
+        let saved = SavedControls {
+            map: prefs.map,
+            speed: prefs.speed,
+            turbo: prefs.turbo,
+        };
+        self.install_runtime(&saved, prefs.bios_hle, &prefs.picture, window, cx);
+    }
+
+    fn install_runtime(
+        &mut self,
+        saved: &SavedControls,
+        bios_hle: bool,
+        picture: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        {
+            let mut settings = self.controls_settings();
+            settings.map = saved.map.clone();
+            settings.speed = saved.speed;
+            settings.turbo = saved.turbo;
+        }
+        self.locked_speed.store(saved.speed, Ordering::Relaxed);
+        self.turbo_ratio.store(saved.turbo, Ordering::Relaxed);
+        if !self.compare {
+            if let Some(mode) = picture_from_id(picture) {
+                self.snapshot.lock().expect("emulator snapshot poisoned").picture_id =
+                    picture_id(mode).to_string();
+                self.adopt_picture(mode, window);
+            }
+        }
+        if self.snapshot.lock().expect("emulator snapshot poisoned").bios_hle != bios_hle {
+            let _ = self.commands.send(Command::SetBios(bios_hle));
+        }
+        let picture_windows = Arc::clone(&self.picture_windows);
+        let controls = Arc::clone(&self.controls);
+        cx.defer(move |cx| {
+            refresh_picture_chrome(cx, &picture_windows, &controls);
+        });
     }
 
     fn link_open(&self) -> bool {
@@ -968,6 +1045,10 @@ impl AppView {
         if !moved {
             return;
         }
+        if !self.compare {
+            self.snapshot.lock().expect("emulator snapshot poisoned").picture_id =
+                picture_id(mode).to_string();
+        }
         self.install_picture(mode, window);
         self.picture = mode;
         self.image_version = 0;
@@ -1211,6 +1292,8 @@ impl Render for AppView {
             link_seats,
             cheats,
             cheat_error,
+            rom_id,
+            prefs_token,
         ) = {
             let snapshot = self.snapshot.lock().expect("emulator snapshot poisoned");
             (
@@ -1231,8 +1314,16 @@ impl Render for AppView {
                 snapshot.link_seats.clone(),
                 snapshot.cheats.clone(),
                 snapshot.cheat_error.clone(),
+                snapshot.rom_id.clone(),
+                snapshot.prefs_token,
             )
         };
+        if prefs_token != self.applied_prefs {
+            self.applied_prefs = prefs_token;
+            if !rom_id.is_empty() {
+                self.apply_open_cart(&rom_id, window, cx);
+            }
+        }
         let (link_open, link_address, link_draft, link_touched, link_field) = {
             let link = self.link_ui.lock().expect("link ui poisoned");
             (
@@ -2738,7 +2829,7 @@ fn start_emulator(
     let (commands, receiver) = mpsc::channel();
     let snapshot = Arc::new(Mutex::new(Snapshot {
         status: "READY".into(),
-        bios_hle: true,
+        bios_hle: read_shell_prefs().bios_hle,
         error: library_error.clone(),
         library_error,
         library,
@@ -3035,6 +3126,197 @@ fn apply_cheats(bus: &mut Bus, cheats: &[LiveCheat]) {
     }
 }
 
+struct CartPrefs {
+    speed: u8,
+    turbo: u8,
+    bios_hle: bool,
+    picture: String,
+    map: KeyMap,
+}
+
+struct ShellPrefs {
+    bios_hle: bool,
+    picture: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CartPrefsFile {
+    version: u8,
+    speed: u8,
+    turbo: u8,
+    bios_hle: bool,
+    #[serde(default)]
+    picture: String,
+    bindings: HashMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ShellFile {
+    version: u8,
+    #[serde(default = "shell_bios_default")]
+    bios_hle: bool,
+    #[serde(default)]
+    picture: String,
+}
+
+fn shell_bios_default() -> bool {
+    true
+}
+
+fn cart_prefs_path(rom_id: &str) -> Result<PathBuf, String> {
+    Ok(application_data_dir()?.join("cart_prefs").join(format!("{rom_id}.json")))
+}
+
+fn shell_prefs_path() -> Result<PathBuf, String> {
+    Ok(application_data_dir()?.join("shell.json"))
+}
+
+fn read_cart_prefs(rom_id: &str) -> Option<CartPrefs> {
+    let path = cart_prefs_path(rom_id).ok()?;
+    read_cart_prefs_file(&path)
+}
+
+fn read_cart_prefs_file(path: &Path) -> Option<CartPrefs> {
+    let bytes = std::fs::read(path).ok()?;
+    let file: CartPrefsFile = serde_json::from_slice(&bytes).ok()?;
+    if file.version != 1 {
+        return None;
+    }
+    Some(CartPrefs {
+        speed: normalize_speed(file.speed),
+        turbo: normalize_turbo(file.turbo),
+        bios_hle: file.bios_hle,
+        picture: file.picture,
+        map: map_from_bindings(&file.bindings),
+    })
+}
+
+fn write_cart_prefs_file(path: &Path, prefs: &CartPrefs) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("创建卡带设置目录 {} 失败：{error}", parent.display()))?;
+    }
+    let file = CartPrefsFile {
+        version: 1,
+        speed: normalize_speed(prefs.speed),
+        turbo: normalize_turbo(prefs.turbo),
+        bios_hle: prefs.bios_hle,
+        picture: prefs.picture.clone(),
+        bindings: bindings_from_map(&prefs.map),
+    };
+    let bytes = serde_json::to_vec_pretty(&file)
+        .map_err(|error| format!("整理卡带设置失败：{error}"))?;
+    std::fs::write(path, bytes)
+        .map_err(|error| format!("保存卡带设置 {} 失败：{error}", path.display()))
+}
+
+fn write_cart_prefs(rom_id: &str, prefs: &CartPrefs) -> Result<(), String> {
+    write_cart_prefs_file(&cart_prefs_path(rom_id)?, prefs)
+}
+
+fn read_shell_prefs() -> ShellPrefs {
+    let Ok(path) = shell_prefs_path() else {
+        return ShellPrefs {
+            bios_hle: true,
+            picture: String::new(),
+        };
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return ShellPrefs {
+            bios_hle: true,
+            picture: String::new(),
+        };
+    };
+    let Ok(file) = serde_json::from_slice::<ShellFile>(&bytes) else {
+        return ShellPrefs {
+            bios_hle: true,
+            picture: String::new(),
+        };
+    };
+    if file.version != 1 {
+        return ShellPrefs {
+            bios_hle: true,
+            picture: String::new(),
+        };
+    }
+    ShellPrefs {
+        bios_hle: file.bios_hle,
+        picture: file.picture,
+    }
+}
+
+fn write_shell_prefs(bios_hle: bool, picture: &str) -> Result<(), String> {
+    let path = shell_prefs_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("创建设置目录 {} 失败：{error}", parent.display()))?;
+    }
+    let file = ShellFile {
+        version: 1,
+        bios_hle,
+        picture: picture.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&file)
+        .map_err(|error| format!("整理界面设置失败：{error}"))?;
+    std::fs::write(&path, bytes)
+        .map_err(|error| format!("保存界面设置 {} 失败：{error}", path.display()))
+}
+
+fn persist_open_cart(snapshot: &Mutex<Snapshot>, saved: &SavedControls) -> Result<(), String> {
+    let (rom_id, bios, picture) = {
+        let state = snapshot.lock().expect("emulator snapshot poisoned");
+        (state.rom_id.clone(), state.bios_hle, state.picture_id.clone())
+    };
+    persist_runtime(&rom_id, saved, bios, &picture)
+}
+
+fn persist_runtime(
+    rom_id: &str,
+    saved: &SavedControls,
+    bios_hle: bool,
+    picture: &str,
+) -> Result<(), String> {
+    if rom_id.is_empty() {
+        write_controls(&controls_file_path()?, saved)?;
+        write_shell_prefs(bios_hle, picture)?;
+        return Ok(());
+    }
+    write_cart_prefs(
+        rom_id,
+        &CartPrefs {
+            speed: saved.speed,
+            turbo: saved.turbo,
+            bios_hle,
+            picture: picture.to_string(),
+            map: saved.map.clone(),
+        },
+    )
+}
+
+fn adopt_cart_runtime(
+    rom_id: &str,
+    cart: &mut ActiveCart,
+    bios_hle: &mut bool,
+    locked_speed: &AtomicU8,
+    turbo_ratio: &AtomicU8,
+    snapshot: &Mutex<Snapshot>,
+) {
+    let shell = read_shell_prefs();
+    let global = load_saved_controls();
+    let prefs = read_cart_prefs(rom_id);
+    let bios = prefs.as_ref().map(|item| item.bios_hle).unwrap_or(shell.bios_hle);
+    let speed = prefs.as_ref().map(|item| item.speed).unwrap_or(global.speed);
+    let turbo = prefs.as_ref().map(|item| item.turbo).unwrap_or(global.turbo);
+    *bios_hle = bios;
+    cart.bus.set_bios_hle(bios);
+    locked_speed.store(speed, Ordering::Relaxed);
+    turbo_ratio.store(turbo, Ordering::Relaxed);
+    let mut state = snapshot.lock().expect("emulator snapshot poisoned");
+    state.rom_id = rom_id.to_string();
+    state.bios_hle = bios;
+    state.prefs_token = state.prefs_token.wrapping_add(1);
+}
+
 /// 大约十秒。每半秒一档，按住时每四帧退一档。
 const REWIND_EVERY: u32 = 30;
 const REWIND_SLOTS: usize = 20;
@@ -3127,7 +3409,7 @@ fn emulator_worker(
     let mut cart: Option<ActiveCart> = None;
     let mut audio: Option<AudioPlay> = None;
     let mut paused = false;
-    let mut bios_hle = true;
+    let mut bios_hle = read_shell_prefs().bios_hle;
     let mut frame_number = 0u64;
     let mut screenshot_frames_left: Option<u32> = None;
     let frame_interval = Duration::from_secs_f64(CYCLES_PER_FRAME as f64 / 16_777_216.0);
@@ -3146,6 +3428,18 @@ fn emulator_worker(
             .map(|active| active.rom_id.clone())
             .unwrap_or_default();
         if rom_id != cheat_rom {
+            if !rom_id.is_empty() {
+                if let Some(active) = cart.as_mut() {
+                    adopt_cart_runtime(
+                        &rom_id,
+                        active,
+                        &mut bios_hle,
+                        &locked_speed,
+                        &turbo_ratio,
+                        &snapshot,
+                    );
+                }
+            }
             cheat_rom = rom_id;
             cheats = load_cheats(&cheat_rom);
             publish_cheats(&snapshot, &cheats, None);
@@ -3603,15 +3897,15 @@ fn apply_command(
                 }
             }
         }
-        Command::ToggleBiosHle => {
-            *bios_hle = !*bios_hle;
+        Command::SetBios(enabled) => {
+            *bios_hle = enabled;
             if let Some(active) = cart.as_mut() {
-                active.bus.set_bios_hle(*bios_hle);
+                active.bus.set_bios_hle(enabled);
             }
             let mut state = snapshot.lock().expect("emulator snapshot poisoned");
-            state.bios_hle = *bios_hle;
+            state.bios_hle = enabled;
             state.error = state.library_error.clone();
-            state.notice = if *bios_hle {
+            state.notice = if enabled {
                 "BIOS HLE 快速路径已开启".into()
             } else {
                 "BIOS HLE 快速路径已关闭".into()
@@ -4781,10 +5075,7 @@ fn apply_speed_choice(launch: &WindowLaunch, locked: Option<u8>, turbo: Option<u
     }
     let saved = settings.saved();
     drop(settings);
-    let Ok(path) = controls_file_path() else {
-        return;
-    };
-    if let Err(error) = write_controls(&path, &saved) {
+    if let Err(error) = persist_open_cart(&launch.snapshot, &saved) {
         let _ = launch.commands.send(Command::Error(error));
     }
 }
@@ -4879,6 +5170,10 @@ fn toggle_picture(cx: &mut App, mode: PictureMode, launch: &WindowLaunch) {
                     view.adopt_picture(mode, window);
                     cx.notify();
                 });
+            }
+            let saved = launch.controls.lock().expect("control settings poisoned").saved();
+            if let Err(error) = persist_open_cart(&launch.snapshot, &saved) {
+                let _ = launch.commands.send(Command::Error(error));
             }
             refresh_picture_chrome(cx, &launch.picture_windows, &launch.controls);
         }
@@ -5015,9 +5310,14 @@ fn main() {
     let menu_commands = commands.clone();
     let menu_library_mode = Arc::clone(&library_mode);
     let menu_snapshot = Arc::clone(&snapshot);
+    let startup_picture = initial_picture();
+    {
+        let mut state = snapshot.lock().expect("emulator snapshot poisoned");
+        state.picture_id = picture_id(startup_picture).to_string();
+    }
     Application::new().run(move |cx: &mut App| {
         let (display_w, display_h) = display_point_size(cx);
-        let main_mode = main_picture();
+        let main_mode = startup_picture;
         let picture_token = launch
             .picture_windows
             .lock()
@@ -5178,8 +5478,20 @@ fn main() {
             cx.refresh_windows();
         });
         let bios_commands = menu_commands.clone();
-        cx.on_action(move |_: &ToggleBiosHle, _| {
-            let _ = bios_commands.send(Command::ToggleBiosHle);
+        let bios_snapshot = Arc::clone(&snapshot);
+        let bios_controls = Arc::clone(&controls);
+        cx.on_action(move |_: &ToggleBiosHle, cx| {
+            let (rom_id, bios, picture) = {
+                let state = bios_snapshot.lock().expect("emulator snapshot poisoned");
+                (state.rom_id.clone(), state.bios_hle, state.picture_id.clone())
+            };
+            let saved = bios_controls.lock().expect("control settings poisoned").saved();
+            let next = !bios;
+            if let Err(error) = persist_runtime(&rom_id, &saved, next, &picture) {
+                let _ = bios_commands.send(Command::Error(error));
+            }
+            let _ = bios_commands.send(Command::SetBios(next));
+            cx.refresh_windows();
         });
         let save_commands = menu_commands.clone();
         cx.on_action(move |_: &SaveSlot1, _| {
@@ -5249,6 +5561,56 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cart_prefs_roundtrip_keeps_its_own_keys_and_leaves_unknown_picture() {
+        let dir = std::env::temp_dir().join(format!(
+            "ultima-cart-prefs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cart.json");
+        let mut map = KeyMap::default();
+        map.bind_target(BindingTarget::Pad(PadButton::A), "k");
+        write_cart_prefs_file(
+            &path,
+            &CartPrefs {
+                speed: 2,
+                turbo: 8,
+                bios_hle: false,
+                picture: "not-a-filter".into(),
+                map: map.clone(),
+            },
+        )
+        .unwrap();
+        let loaded = read_cart_prefs_file(&path).expect("prefs file");
+        assert_eq!(loaded.speed, 2);
+        assert_eq!(loaded.turbo, 8);
+        assert!(!loaded.bios_hle);
+        assert_eq!(loaded.picture, "not-a-filter");
+        assert_eq!(loaded.map.key(PadButton::A), "k");
+        assert_eq!(loaded.map.hotkey(Hotkey::Rewind), "f6");
+        assert!(picture_from_id(&loaded.picture).is_none());
+        assert_eq!(picture_from_id("linear"), Some(PictureMode::Linear));
+        assert!(read_cart_prefs_file(&dir.join("missing.json")).is_none());
+        std::fs::write(dir.join("old.json"), br#"{"version":2}"#).unwrap();
+        assert!(read_cart_prefs_file(&dir.join("old.json")).is_none());
+        let mut partial: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        partial["bindings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rewind");
+        std::fs::write(&path, partial.to_string()).unwrap();
+        let partial = read_cart_prefs_file(&path).expect("prefs without rewind");
+        assert_eq!(partial.map.hotkey(Hotkey::Rewind), "f6");
+        assert_eq!(partial.map.key(PadButton::A), "k");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn rewind_keeps_half_second_slots_and_steps_back_slowly() {
