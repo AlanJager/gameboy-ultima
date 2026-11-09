@@ -12,6 +12,7 @@ use crate::ppu::{
 };
 use crate::gyro::Gyro;
 use crate::rtc::Rtc;
+use crate::solar::Solar;
 use crate::tilt::Tilt;
 use crate::sched::{EventKind, Scheduler};
 use crate::sound::{sample_hz, sample_period, Sampler};
@@ -90,6 +91,9 @@ pub struct Bus {
     /// 耀西万有引力的两轴加速度。其它卡带不拦截 SRAM 窗口。
     #[serde(default)]
     tilt: Tilt,
+    /// 我们的太阳的感光。其它卡带不改 GPIO 的 bit 3。
+    #[serde(default)]
+    solar: Solar,
     /// 下一次定时器、消隐、采样。空档里只把拍数加上去。
     scheduler: Scheduler,
     /// 译过的指令。命中不再拆位域，执行还是解释。
@@ -139,6 +143,7 @@ impl Bus {
             rtc: Rtc::default(),
             gyro: Gyro::default(),
             tilt: Tilt::default(),
+            solar: Solar::default(),
             scheduler: Scheduler::new(),
             icache: ICache::new(),
             dirty: DirtyLines::new(),
@@ -1022,6 +1027,16 @@ impl Bus {
         self.icache.clear();
         self.gyro.set_present(crate::gyro::gyro_cart(&self.rom));
         self.tilt.set_present(crate::tilt::tilt_cart(&self.rom));
+        self.solar.set_present(crate::solar::solar_cart(&self.rom));
+    }
+
+    /// 0 全黑，255 最亮。下一次复位才锁存。
+    pub fn set_solar(&mut self, brightness: u8) {
+        self.solar.set_brightness(brightness);
+    }
+
+    pub fn solar_present(&self) -> bool {
+        self.solar.present()
     }
 
     /// `-1`、`0`、`1`。只有陀螺仪卡带会在 GPIO 上送出。
@@ -1042,10 +1057,15 @@ impl Bus {
 
     fn cart_gpio_read(&self, addr: u32) -> Option<u8> {
         if self.gyro.present() {
-            self.gyro.read(addr)
-        } else {
-            self.rtc.read(addr)
+            return self.gyro.read(addr);
         }
+        let mut value = self.rtc.read(addr)?;
+        if (addr & 0x01FF_FFFF) == 0xC4 {
+            if let Some(flag) = self.solar.driven_flag() {
+                value = (value & !8) | flag;
+            }
+        }
+        Some(value)
     }
 
     fn cart_gpio_write(&mut self, addr: u32, value: u8) {
@@ -1053,6 +1073,7 @@ impl Bus {
             self.gyro.write(addr, value);
         } else {
             self.rtc.write(addr, value);
+            self.solar.write(addr, value);
         }
     }
 

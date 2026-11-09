@@ -29,6 +29,7 @@ pub mod link;
 #[cfg(test)]
 mod link_rom;
 mod sio;
+mod solar;
 mod wireless;
 mod sound;
 mod thumb;
@@ -47,5 +48,6 @@ pub use ppu::{
     Ppu, ScanPos, CYCLES_PER_FRAME, CYCLES_PER_LINE, HEIGHT, WIDTH,
 };
 pub use registers::Registers;
+pub use solar::DEFAULT_SOLAR;
 pub use sound::{audio_pace, sample_hz, wav_bytes, AudioPlay, Sample};
 pub use thumb::disassemble_thumb;

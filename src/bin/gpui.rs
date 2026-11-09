@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use gameboy_ultima::link::{normalize_link_name, LinkHub, LinkSeat};
 use gameboy_ultima::{
     audio_pace, parse_cheat, rgb555_to_888, step_quiet, AudioPlay, Bus, CheatFamily, CheatProgram,
-    Registers, CYCLES_PER_FRAME, HEIGHT, WIDTH,
+    Registers, CYCLES_PER_FRAME, DEFAULT_SOLAR, HEIGHT, WIDTH,
 };
 #[path = "controls.rs"]
 mod controls;
@@ -336,6 +336,8 @@ struct Snapshot {
     link_seats: Vec<LinkSeat>,
     cheats: Vec<CheatView>,
     cheat_error: Option<String>,
+    solar_cart: bool,
+    solar: u8,
 }
 
 enum LinkField {
@@ -414,6 +416,7 @@ struct AppView {
     rewind_held: Arc<AtomicBool>,
     gyro_keys: Arc<AtomicI8>,
     tilt_keys: Arc<AtomicI8>,
+    solar: Arc<AtomicU8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
     focus_handle: FocusHandle,
@@ -454,6 +457,7 @@ impl AppView {
         rewind_held: Arc<AtomicBool>,
         gyro_keys: Arc<AtomicI8>,
         tilt_keys: Arc<AtomicI8>,
+        solar: Arc<AtomicU8>,
         lcd_ghost: Arc<AtomicBool>,
         color_correct: Arc<AtomicBool>,
         library_mode: Arc<AtomicBool>,
@@ -487,6 +491,7 @@ impl AppView {
             rewind_held,
             gyro_keys,
             tilt_keys,
+            solar,
             lcd_ghost,
             color_correct,
             focus_handle,
@@ -583,6 +588,17 @@ impl AppView {
         cx.defer(move |cx| {
             refresh_picture_chrome(cx, &picture_windows, &controls);
         });
+        cx.notify();
+    }
+
+    fn set_solar_level(&self, level: u8, cx: &mut Context<Self>) {
+        self.solar.store(level, Ordering::Relaxed);
+        {
+            let mut state = self.snapshot.lock().expect("emulator snapshot poisoned");
+            state.solar = level;
+        }
+        let saved = self.controls_settings().saved();
+        self.persist_controls(&saved);
         cx.notify();
     }
 
@@ -1390,6 +1406,7 @@ impl Render for AppView {
             cheat_error,
             rom_id,
             prefs_token,
+            solar_cart,
         ) = {
             let snapshot = self.snapshot.lock().expect("emulator snapshot poisoned");
             (
@@ -1412,6 +1429,7 @@ impl Render for AppView {
                 snapshot.cheat_error.clone(),
                 snapshot.rom_id.clone(),
                 snapshot.prefs_token,
+                snapshot.solar_cart,
             )
         };
         if prefs_token != self.applied_prefs {
@@ -1526,6 +1544,12 @@ impl Render for AppView {
                 .when(link_in_room, |game| game.child(link_board(&link_seats)))
                 .when(!link_in_room && !link_line.is_empty(), |game| {
                     game.child(link_chip(&link_line))
+                })
+                .when(solar_cart && !self.compare, |game| {
+                    game.child(solar_meter(
+                        self.solar.load(Ordering::Relaxed),
+                        cx,
+                    ))
                 })
                 .when_some(error, |content, message| {
                     content.child(
@@ -2322,6 +2346,63 @@ fn key_field(
         )
 }
 
+const SOLAR_STEPS: u8 = 16;
+const SOLAR_IDS: [&str; 17] = [
+    "solar-0", "solar-1", "solar-2", "solar-3", "solar-4", "solar-5", "solar-6", "solar-7",
+    "solar-8", "solar-9", "solar-10", "solar-11", "solar-12", "solar-13", "solar-14", "solar-15",
+    "solar-16",
+];
+
+fn solar_step(level: u8) -> u8 {
+    u8::try_from((u16::from(level) * u16::from(SOLAR_STEPS) + 127) / 255).unwrap_or(SOLAR_STEPS)
+}
+
+fn solar_level_for_step(step: u8) -> u8 {
+    let step = step.min(SOLAR_STEPS);
+    u8::try_from(u16::from(step) * 255 / u16::from(SOLAR_STEPS)).unwrap_or(255)
+}
+
+fn solar_meter(level: u8, cx: &mut Context<AppView>) -> impl IntoElement {
+    let step = solar_step(level);
+    let percent = u16::from(level) * 100 / 255;
+    let mut cells = div().flex().items_center().gap(px(3.));
+    for index in 0..=SOLAR_STEPS {
+        let lit = index <= step;
+        cells = cells.child(
+            div()
+                .id(SOLAR_IDS[usize::from(index)])
+                .w(px(10.))
+                .h(px(18.))
+                .rounded(px(2.))
+                .cursor_pointer()
+                .bg(rgb(if lit { ACCENT } else { 0x334044 }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_solar_level(solar_level_for_step(index), cx);
+                })),
+        );
+    }
+    div()
+        .absolute()
+        .bottom(px(12.))
+        .right(px(12.))
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .px(px(10.))
+        .py(px(8.))
+        .rounded(px(6.))
+        .bg(rgb(PANEL_HI))
+        .child(div().text_sm().text_color(rgb(TEXT)).child("日光"))
+        .child(cells)
+        .child(
+            div()
+                .w(px(36.))
+                .text_sm()
+                .text_color(rgb(ACCENT))
+                .child(format!("{percent}%")),
+        )
+}
+
 fn link_chip(line: &str) -> impl IntoElement {
     div()
         .absolute()
@@ -2954,6 +3035,7 @@ fn start_emulator(
     rewind_held: Arc<AtomicBool>,
     gyro_keys: Arc<AtomicI8>,
     tilt_keys: Arc<AtomicI8>,
+    solar: Arc<AtomicU8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
 ) -> (
@@ -2995,6 +3077,7 @@ fn start_emulator(
     let worker_rewind_held = Arc::clone(&rewind_held);
     let worker_gyro_keys = Arc::clone(&gyro_keys);
     let worker_tilt_keys = Arc::clone(&tilt_keys);
+    let worker_solar = Arc::clone(&solar);
     let worker_lcd_ghost = Arc::clone(&lcd_ghost);
     let worker_color_correct = Arc::clone(&color_correct);
     let worker = thread::Builder::new()
@@ -3013,6 +3096,7 @@ fn start_emulator(
                 worker_rewind_held,
                 worker_gyro_keys,
                 worker_tilt_keys,
+                worker_solar,
                 worker_lcd_ghost,
                 worker_color_correct,
             )
@@ -3314,6 +3398,7 @@ struct CartPrefs {
     picture: String,
     lcd_ghost: bool,
     color_correct: bool,
+    solar: u8,
     map: KeyMap,
 }
 
@@ -3336,7 +3421,13 @@ struct CartPrefsFile {
     lcd_ghost: bool,
     #[serde(default)]
     color_correct: bool,
+    #[serde(default = "default_solar_level")]
+    solar: u8,
     bindings: HashMap<String, String>,
+}
+
+fn default_solar_level() -> u8 {
+    DEFAULT_SOLAR
 }
 
 #[derive(Serialize, Deserialize)]
@@ -3382,6 +3473,7 @@ fn read_cart_prefs_file(path: &Path) -> Option<CartPrefs> {
         picture: file.picture,
         lcd_ghost: file.lcd_ghost,
         color_correct: file.color_correct,
+        solar: file.solar,
         map: map_from_bindings(&file.bindings),
     })
 }
@@ -3399,6 +3491,7 @@ fn write_cart_prefs_file(path: &Path, prefs: &CartPrefs) -> Result<(), String> {
         picture: prefs.picture.clone(),
         lcd_ghost: prefs.lcd_ghost,
         color_correct: prefs.color_correct,
+        solar: prefs.solar,
         bindings: bindings_from_map(&prefs.map),
     };
     let bytes = serde_json::to_vec_pretty(&file)
@@ -3461,7 +3554,7 @@ fn write_shell_prefs(prefs: &ShellPrefs) -> Result<(), String> {
 }
 
 fn persist_open_cart(snapshot: &Mutex<Snapshot>, saved: &SavedControls) -> Result<(), String> {
-    let (rom_id, bios, picture, lcd_ghost, color_correct) = {
+    let (rom_id, bios, picture, lcd_ghost, color_correct, solar) = {
         let state = snapshot.lock().expect("emulator snapshot poisoned");
         (
             state.rom_id.clone(),
@@ -3469,9 +3562,18 @@ fn persist_open_cart(snapshot: &Mutex<Snapshot>, saved: &SavedControls) -> Resul
             state.picture_id.clone(),
             state.lcd_ghost,
             state.color_correct,
+            state.solar,
         )
     };
-    persist_runtime(&rom_id, saved, bios, &picture, lcd_ghost, color_correct)
+    persist_runtime(
+        &rom_id,
+        saved,
+        bios,
+        &picture,
+        lcd_ghost,
+        color_correct,
+        solar,
+    )
 }
 
 fn persist_runtime(
@@ -3481,6 +3583,7 @@ fn persist_runtime(
     picture: &str,
     lcd_ghost: bool,
     color_correct: bool,
+    solar: u8,
 ) -> Result<(), String> {
     if rom_id.is_empty() {
         write_controls(&controls_file_path()?, saved)?;
@@ -3501,6 +3604,7 @@ fn persist_runtime(
             picture: picture.to_string(),
             lcd_ghost,
             color_correct,
+            solar,
             map: saved.map.clone(),
         },
     )
@@ -3514,6 +3618,7 @@ fn adopt_cart_runtime(
     turbo_ratio: &AtomicU8,
     lcd_ghost: &AtomicBool,
     color_correct: &AtomicBool,
+    solar_level: &AtomicU8,
     snapshot: &Mutex<Snapshot>,
 ) {
     let shell = read_shell_prefs();
@@ -3531,13 +3636,17 @@ fn adopt_cart_runtime(
     cart.bus.set_bios_hle(bios);
     locked_speed.store(speed, Ordering::Relaxed);
     turbo_ratio.store(turbo, Ordering::Relaxed);
+    let sun = prefs.as_ref().map(|item| item.solar).unwrap_or(DEFAULT_SOLAR);
     lcd_ghost.store(ghost, Ordering::Relaxed);
     color_correct.store(color, Ordering::Relaxed);
+    solar_level.store(sun, Ordering::Relaxed);
     let mut state = snapshot.lock().expect("emulator snapshot poisoned");
     state.rom_id = rom_id.to_string();
     state.bios_hle = bios;
     state.lcd_ghost = ghost;
     state.color_correct = color;
+    state.solar_cart = cart.bus.solar_present();
+    state.solar = sun;
     state.prefs_token = state.prefs_token.wrapping_add(1);
 }
 
@@ -3631,6 +3740,7 @@ fn emulator_worker(
     rewind_held: Arc<AtomicBool>,
     gyro_keys: Arc<AtomicI8>,
     tilt_keys: Arc<AtomicI8>,
+    solar: Arc<AtomicU8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
 ) {
@@ -3667,9 +3777,12 @@ fn emulator_worker(
                         &turbo_ratio,
                         &lcd_ghost,
                         &color_correct,
+                        &solar,
                         &snapshot,
                     );
                 }
+            } else {
+                snapshot.lock().expect("emulator snapshot poisoned").solar_cart = false;
             }
             cheat_rom = rom_id;
             cheats = load_cheats(&cheat_rom);
@@ -3846,6 +3959,7 @@ fn emulator_worker(
             active
                 .bus
                 .set_tilt_bits(tilt_keys.load(Ordering::Relaxed));
+            active.bus.set_solar(solar.load(Ordering::Relaxed));
             if let Err(error) = step_quiet(&mut active.regs, &mut active.bus) {
                 paused = true;
                 let mut state = snapshot.lock().expect("emulator snapshot poisoned");
@@ -5055,6 +5169,7 @@ struct WindowLaunch {
     rewind_held: Arc<AtomicBool>,
     gyro_keys: Arc<AtomicI8>,
     tilt_keys: Arc<AtomicI8>,
+    solar: Arc<AtomicU8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
     library_mode: Arc<AtomicBool>,
@@ -5334,6 +5449,7 @@ fn open_game_window(
                     Arc::clone(&launch.rewind_held),
                     Arc::clone(&launch.gyro_keys),
                     Arc::clone(&launch.tilt_keys),
+                    Arc::clone(&launch.solar),
                     Arc::clone(&launch.lcd_ghost),
                     Arc::clone(&launch.color_correct),
                     launch.library_mode,
@@ -5492,7 +5608,7 @@ fn refresh_picture_chrome(
 }
 
 fn toggle_screen_option(cx: &mut App, launch: &WindowLaunch, ghost: bool) {
-    let (rom_id, bios, picture, mut lcd_ghost, mut color_correct) = {
+    let (rom_id, bios, picture, mut lcd_ghost, mut color_correct, solar) = {
         let state = launch.snapshot.lock().expect("emulator snapshot poisoned");
         (
             state.rom_id.clone(),
@@ -5500,6 +5616,7 @@ fn toggle_screen_option(cx: &mut App, launch: &WindowLaunch, ghost: bool) {
             state.picture_id.clone(),
             state.lcd_ghost,
             state.color_correct,
+            state.solar,
         )
     };
     if ghost {
@@ -5520,7 +5637,9 @@ fn toggle_screen_option(cx: &mut App, launch: &WindowLaunch, ghost: bool) {
     launch.lcd_ghost.store(lcd_ghost, Ordering::Relaxed);
     launch.color_correct.store(color_correct, Ordering::Relaxed);
     let saved = launch.controls.lock().expect("control settings poisoned").saved();
-    if let Err(error) = persist_runtime(&rom_id, &saved, bios, &picture, lcd_ghost, color_correct) {
+    if let Err(error) =
+        persist_runtime(&rom_id, &saved, bios, &picture, lcd_ghost, color_correct, solar)
+    {
         let _ = launch.commands.send(Command::Error(error));
     }
     refresh_picture_chrome(cx, &launch.picture_windows, &launch.controls);
@@ -5638,6 +5757,7 @@ fn main() {
     let rewind_held = Arc::new(AtomicBool::new(false));
     let gyro_keys = Arc::new(AtomicI8::new(0));
     let tilt_keys = Arc::new(AtomicI8::new(0));
+    let solar = Arc::new(AtomicU8::new(DEFAULT_SOLAR));
     let lcd_ghost = Arc::new(AtomicBool::new(shell.lcd_ghost));
     let color_correct = Arc::new(AtomicBool::new(shell.color_correct));
     let (snapshot, commands, keys, audio_volume, worker) = start_emulator(
@@ -5647,6 +5767,7 @@ fn main() {
         Arc::clone(&rewind_held),
         Arc::clone(&gyro_keys),
         Arc::clone(&tilt_keys),
+        Arc::clone(&solar),
         Arc::clone(&lcd_ghost),
         Arc::clone(&color_correct),
     );
@@ -5692,6 +5813,7 @@ fn main() {
         rewind_held: Arc::clone(&rewind_held),
         gyro_keys: Arc::clone(&gyro_keys),
         tilt_keys: Arc::clone(&tilt_keys),
+        solar: Arc::clone(&solar),
         lcd_ghost: Arc::clone(&lcd_ghost),
         color_correct: Arc::clone(&color_correct),
         library_mode: Arc::clone(&library_mode),
@@ -5903,7 +6025,7 @@ fn main() {
         let bios_snapshot = Arc::clone(&snapshot);
         let bios_controls = Arc::clone(&controls);
         cx.on_action(move |_: &ToggleBiosHle, cx| {
-            let (rom_id, bios, picture, lcd_ghost, color_correct) = {
+            let (rom_id, bios, picture, lcd_ghost, color_correct, solar) = {
                 let state = bios_snapshot.lock().expect("emulator snapshot poisoned");
                 (
                     state.rom_id.clone(),
@@ -5911,12 +6033,20 @@ fn main() {
                     state.picture_id.clone(),
                     state.lcd_ghost,
                     state.color_correct,
+                    state.solar,
                 )
             };
             let saved = bios_controls.lock().expect("control settings poisoned").saved();
             let next = !bios;
-            if let Err(error) =
-                persist_runtime(&rom_id, &saved, next, &picture, lcd_ghost, color_correct)
+            if let Err(error) = persist_runtime(
+                &rom_id,
+                &saved,
+                next,
+                &picture,
+                lcd_ghost,
+                color_correct,
+                solar,
+            )
             {
                 let _ = bios_commands.send(Command::Error(error));
             }
@@ -6015,6 +6145,7 @@ mod tests {
                 picture: "not-a-filter".into(),
                 lcd_ghost: false,
                 color_correct: false,
+                solar: 40,
                 map: map.clone(),
             },
         )
@@ -6026,6 +6157,7 @@ mod tests {
         assert_eq!(loaded.picture, "not-a-filter");
         assert_eq!(loaded.map.key(PadButton::A), "k");
         assert_eq!(loaded.map.hotkey(Hotkey::Rewind), "f6");
+        assert_eq!(loaded.solar, 40);
         assert!(picture_from_id(&loaded.picture).is_none());
         assert_eq!(picture_from_id("linear"), Some(PictureMode::Linear));
         assert!(read_cart_prefs_file(&dir.join("missing.json")).is_none());
@@ -6049,6 +6181,12 @@ mod tests {
         let bare = read_cart_prefs_file(&dir.join("bare.json")).expect("old prefs");
         assert!(!bare.lcd_ghost);
         assert!(!bare.color_correct);
+        assert_eq!(bare.solar, DEFAULT_SOLAR);
+        assert_eq!(solar_step(0), 0);
+        assert_eq!(solar_step(DEFAULT_SOLAR), 8);
+        assert_eq!(solar_step(255), SOLAR_STEPS);
+        assert_eq!(solar_level_for_step(0), 0);
+        assert_eq!(solar_level_for_step(SOLAR_STEPS), 255);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
