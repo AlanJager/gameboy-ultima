@@ -125,14 +125,18 @@ pub(crate) enum Hotkey {
     QuickLoad,
     FastForward,
     Rewind,
+    GyroLeft,
+    GyroRight,
 }
 
 impl Hotkey {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::QuickSave,
         Self::QuickLoad,
         Self::FastForward,
         Self::Rewind,
+        Self::GyroLeft,
+        Self::GyroRight,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -141,6 +145,8 @@ impl Hotkey {
             Self::QuickLoad => 1,
             Self::FastForward => 2,
             Self::Rewind => 3,
+            Self::GyroLeft => 4,
+            Self::GyroRight => 5,
         }
     }
 
@@ -150,6 +156,8 @@ impl Hotkey {
             Self::QuickLoad => "快速读档",
             Self::FastForward => "按住加速",
             Self::Rewind => "按住回退",
+            Self::GyroLeft => "陀螺仪向左",
+            Self::GyroRight => "陀螺仪向右",
         }
     }
 
@@ -159,6 +167,8 @@ impl Hotkey {
             Self::QuickLoad => "quick_load",
             Self::FastForward => "fast_forward",
             Self::Rewind => "rewind",
+            Self::GyroLeft => "gyro_left",
+            Self::GyroRight => "gyro_right",
         }
     }
 
@@ -168,6 +178,8 @@ impl Hotkey {
             Self::QuickLoad => "hotkey-quick-load",
             Self::FastForward => "hotkey-fast-forward",
             Self::Rewind => "hotkey-rewind",
+            Self::GyroLeft => "hotkey-gyro-left",
+            Self::GyroRight => "hotkey-gyro-right",
         }
     }
 }
@@ -197,7 +209,7 @@ impl BindingTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KeyMap {
     keys: [String; 11],
-    hotkeys: [String; 4],
+    hotkeys: [String; 6],
 }
 
 impl Default for KeyMap {
@@ -216,7 +228,14 @@ impl Default for KeyMap {
                 "a".into(),
                 "r".into(),
             ],
-            hotkeys: ["f5".into(), "f8".into(), "tab".into(), "f6".into()],
+            hotkeys: [
+                "f5".into(),
+                "f8".into(),
+                "tab".into(),
+                "f6".into(),
+                "[".into(),
+                "]".into(),
+            ],
         }
     }
 }
@@ -822,6 +841,8 @@ mod tests {
         assert_eq!(legacy.map.hotkey(Hotkey::QuickLoad), "f8");
         assert_eq!(legacy.map.hotkey(Hotkey::FastForward), "tab");
         assert_eq!(legacy.map.hotkey(Hotkey::Rewind), "f6");
+        assert_eq!(legacy.map.hotkey(Hotkey::GyroLeft), "[");
+        assert_eq!(legacy.map.hotkey(Hotkey::GyroRight), "]");
         assert_eq!(key_label("left"), "←");
         assert_eq!(key_label("f5"), "F5");
         assert_eq!(key_label(""), "未设置");

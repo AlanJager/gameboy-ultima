@@ -14,6 +14,7 @@
 | 背景模式 0–5，精灵、旋转缩放、窗口、混合、马赛克 | |
 | SRAM、Flash（64 KiB / 128 KiB）和 EEPROM 存档 | |
 | 卡带 RTC | S-3511。写入日期后按真实时间走，记在卡带旁边的 `.rtc` |
+| 陀螺仪 | 瓦里奥制造 Twisted（`RZWJ`、`RZWE`、`RZWP`）。静止读数 `0x700`。按住 `[` 向左转，`]` 向右转，松开回到静止。不占用十字键 |
 
 ### 声音
 
@@ -73,7 +74,7 @@
 | --- | --- |
 | 联合房间 | 登录能走完，`0x11` 仍是 `0xFF`，房间仍是 4 台 |
 | GameShark / Action Replay v3 | 未做。v1 的写入已经能用 |
-| 陀螺仪、太阳能、震动 | 未做 |
+| 太阳能、震动 | 未做 |
 | 动态重编译 | 未做 |
 | e-Reader | 未做 |
 | GameCube 联机 | 未做 |
@@ -97,7 +98,7 @@ macOS 可以打成独立应用，构建需要 Xcode Command Line Tools：
 
 产物是 `target/ULTIMA.app`。
 
-默认按键：方向键是十字键，X / Z 是 A / B，A / S 是 L / R，Enter 是 Start，Backspace 是 Select，R 复位，Space 暂停。F5 快速存档，F8 快速读档，Tab 按住加速，F6 按住回退。这些都可以在键位设置里改。
+默认按键：方向键是十字键，X / Z 是 A / B，A / S 是 L / R，Enter 是 Start，Backspace 是 Select，R 复位，Space 暂停。F5 快速存档，F8 快速读档，Tab 按住加速，F6 按住回退，`[` / `]` 是陀螺仪。这些都可以在键位设置里改。
 
 ## 测试
 

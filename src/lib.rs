@@ -13,6 +13,7 @@ pub mod decode;
 mod disasm;
 mod dma;
 mod gfxcache;
+mod gyro;
 mod icache;
 mod keypad;
 mod music;

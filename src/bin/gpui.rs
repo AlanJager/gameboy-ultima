@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -253,7 +253,24 @@ impl Hotkey {
             Self::QuickLoad => Some(Command::QuickLoadState),
             Self::FastForward => None,
             Self::Rewind => None,
+            Self::GyroLeft | Self::GyroRight => None,
         }
+    }
+}
+
+fn gyro_bits(held: i8, mask: i8, pressed: bool) -> i8 {
+    if pressed {
+        held | mask
+    } else {
+        held & !mask
+    }
+}
+
+fn gyro_rate(bits: i8) -> i8 {
+    match (bits & 1 != 0, bits & 2 != 0) {
+        (true, false) => -1,
+        (false, true) => 1,
+        _ => 0,
     }
 }
 
@@ -385,6 +402,7 @@ struct AppView {
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
     rewind_held: Arc<AtomicBool>,
+    gyro_keys: Arc<AtomicI8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
     focus_handle: FocusHandle,
@@ -423,6 +441,7 @@ impl AppView {
         turbo_ratio: Arc<AtomicU8>,
         turbo_held: Arc<AtomicBool>,
         rewind_held: Arc<AtomicBool>,
+        gyro_keys: Arc<AtomicI8>,
         lcd_ghost: Arc<AtomicBool>,
         color_correct: Arc<AtomicBool>,
         library_mode: Arc<AtomicBool>,
@@ -454,6 +473,7 @@ impl AppView {
             turbo_ratio,
             turbo_held,
             rewind_held,
+            gyro_keys,
             lcd_ghost,
             color_correct,
             focus_handle,
@@ -498,6 +518,7 @@ impl AppView {
     fn release_turbo(&self) {
         self.turbo_held.store(false, Ordering::Relaxed);
         self.rewind_held.store(false, Ordering::Relaxed);
+        self.gyro_keys.store(0, Ordering::Relaxed);
     }
 
     fn begin_capture(&self, target: BindingTarget, cx: &mut Context<Self>) {
@@ -930,6 +951,13 @@ impl AppView {
                 self.rewind_held.store(true, Ordering::Relaxed);
                 return;
             }
+            if hotkey == Hotkey::GyroLeft || hotkey == Hotkey::GyroRight {
+                let mask = if hotkey == Hotkey::GyroLeft { 1 } else { 2 };
+                let _ = self.gyro_keys.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                    Some(gyro_bits(held, mask, true))
+                });
+                return;
+            }
             if !event.is_held {
                 if let Some(command) = hotkey.command() {
                     let _ = self.commands.send(command);
@@ -951,6 +979,12 @@ impl AppView {
         }
         if released == Some(Hotkey::Rewind) {
             self.rewind_held.store(false, Ordering::Relaxed);
+        }
+        if released == Some(Hotkey::GyroLeft) || released == Some(Hotkey::GyroRight) {
+            let mask = if released == Some(Hotkey::GyroLeft) { 1 } else { 2 };
+            let _ = self.gyro_keys.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(gyro_bits(held, mask, false))
+            });
         }
         if open || self.link_open() || self.cheat_open() {
             return;
@@ -2197,12 +2231,15 @@ fn function_bindings(
 ) -> impl IntoElement {
     div()
         .flex()
+        .flex_wrap()
         .items_center()
         .gap(px(22.))
         .child(named_hotkey(cx, map, capturing, Hotkey::QuickSave))
         .child(named_hotkey(cx, map, capturing, Hotkey::QuickLoad))
         .child(named_hotkey(cx, map, capturing, Hotkey::FastForward))
         .child(named_hotkey(cx, map, capturing, Hotkey::Rewind))
+        .child(named_hotkey(cx, map, capturing, Hotkey::GyroLeft))
+        .child(named_hotkey(cx, map, capturing, Hotkey::GyroRight))
 }
 
 fn named_hotkey(
@@ -2890,6 +2927,7 @@ fn start_emulator(
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
     rewind_held: Arc<AtomicBool>,
+    gyro_keys: Arc<AtomicI8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
 ) -> (
@@ -2929,6 +2967,7 @@ fn start_emulator(
     let worker_turbo_ratio = Arc::clone(&turbo_ratio);
     let worker_turbo_held = Arc::clone(&turbo_held);
     let worker_rewind_held = Arc::clone(&rewind_held);
+    let worker_gyro_keys = Arc::clone(&gyro_keys);
     let worker_lcd_ghost = Arc::clone(&lcd_ghost);
     let worker_color_correct = Arc::clone(&color_correct);
     let worker = thread::Builder::new()
@@ -2945,6 +2984,7 @@ fn start_emulator(
                 worker_turbo_ratio,
                 worker_turbo_held,
                 worker_rewind_held,
+                worker_gyro_keys,
                 worker_lcd_ghost,
                 worker_color_correct,
             )
@@ -3561,6 +3601,7 @@ fn emulator_worker(
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
     rewind_held: Arc<AtomicBool>,
+    gyro_keys: Arc<AtomicI8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
 ) {
@@ -3770,6 +3811,9 @@ fn emulator_worker(
             }
             let active = cart.as_mut().expect("running cart exists");
             active.bus.set_keys(held_keys(keys.load(Ordering::Relaxed), pad));
+            active
+                .bus
+                .set_gyro_rate(gyro_rate(gyro_keys.load(Ordering::Relaxed)));
             if let Err(error) = step_quiet(&mut active.regs, &mut active.bus) {
                 paused = true;
                 let mut state = snapshot.lock().expect("emulator snapshot poisoned");
@@ -4977,6 +5021,7 @@ struct WindowLaunch {
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
     rewind_held: Arc<AtomicBool>,
+    gyro_keys: Arc<AtomicI8>,
     lcd_ghost: Arc<AtomicBool>,
     color_correct: Arc<AtomicBool>,
     library_mode: Arc<AtomicBool>,
@@ -5254,6 +5299,7 @@ fn open_game_window(
                     Arc::clone(&launch.turbo_ratio),
                     Arc::clone(&launch.turbo_held),
                     Arc::clone(&launch.rewind_held),
+                    Arc::clone(&launch.gyro_keys),
                     Arc::clone(&launch.lcd_ghost),
                     Arc::clone(&launch.color_correct),
                     launch.library_mode,
@@ -5556,6 +5602,7 @@ fn main() {
     let turbo_ratio = Arc::new(AtomicU8::new(saved.turbo));
     let turbo_held = Arc::new(AtomicBool::new(false));
     let rewind_held = Arc::new(AtomicBool::new(false));
+    let gyro_keys = Arc::new(AtomicI8::new(0));
     let lcd_ghost = Arc::new(AtomicBool::new(shell.lcd_ghost));
     let color_correct = Arc::new(AtomicBool::new(shell.color_correct));
     let (snapshot, commands, keys, audio_volume, worker) = start_emulator(
@@ -5563,6 +5610,7 @@ fn main() {
         Arc::clone(&turbo_ratio),
         Arc::clone(&turbo_held),
         Arc::clone(&rewind_held),
+        Arc::clone(&gyro_keys),
         Arc::clone(&lcd_ghost),
         Arc::clone(&color_correct),
     );
@@ -5606,6 +5654,7 @@ fn main() {
         turbo_ratio,
         turbo_held: Arc::clone(&turbo_held),
         rewind_held: Arc::clone(&rewind_held),
+        gyro_keys: Arc::clone(&gyro_keys),
         lcd_ghost: Arc::clone(&lcd_ghost),
         color_correct: Arc::clone(&color_correct),
         library_mode: Arc::clone(&library_mode),

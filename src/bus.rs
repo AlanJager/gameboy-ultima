@@ -10,6 +10,7 @@ use crate::ppu::{
     latch_span, next_paint, scan_at, Affine, DirtyLines, Frame, Sample, CYCLES_PER_FRAME,
     CYCLES_PER_LINE, LINES_PER_FRAME, VISIBLE_CYCLES, VISIBLE_LINES,
 };
+use crate::gyro::Gyro;
 use crate::rtc::Rtc;
 use crate::sched::{EventKind, Scheduler};
 use crate::sound::{sample_hz, sample_period, Sampler};
@@ -82,6 +83,9 @@ pub struct Bus {
     /// 卡带实时时钟。老的即时存档没有这块，读进来按掉电处理。
     #[serde(default)]
     rtc: Rtc,
+    /// 瓦里奥制造 Twisted 的角速度。其它卡带 `present` 为假，GPIO 仍归时钟。
+    #[serde(default)]
+    gyro: Gyro,
     /// 下一次定时器、消隐、采样。空档里只把拍数加上去。
     scheduler: Scheduler,
     /// 译过的指令。命中不再拆位域，执行还是解释。
@@ -129,6 +133,7 @@ impl Bus {
             sound_vsync: true,
             backup: Backup::new(),
             rtc: Rtc::default(),
+            gyro: Gyro::default(),
             scheduler: Scheduler::new(),
             icache: ICache::new(),
             dirty: DirtyLines::new(),
@@ -1010,6 +1015,28 @@ impl Bus {
     pub fn load_rom(&mut self, rom: &[u8]) {
         self.rom = rom.to_vec();
         self.icache.clear();
+        self.gyro.set_present(crate::gyro::gyro_cart(&self.rom));
+    }
+
+    /// `-1`、`0`、`1`。只有陀螺仪卡带会在 GPIO 上送出。
+    pub fn set_gyro_rate(&mut self, rate: i8) {
+        self.gyro.set_rate(rate);
+    }
+
+    fn cart_gpio_read(&self, addr: u32) -> Option<u8> {
+        if self.gyro.present() {
+            self.gyro.read(addr)
+        } else {
+            self.rtc.read(addr)
+        }
+    }
+
+    fn cart_gpio_write(&mut self, addr: u32, value: u8) {
+        if self.gyro.present() {
+            self.gyro.write(addr, value);
+        } else {
+            self.rtc.write(addr, value);
+        }
     }
 
     /// 记下这一刻的机器。卡带字节不复制，快照里的 ROM 是空的。
@@ -1066,7 +1093,7 @@ impl Bus {
             0x06 => self.vram[vram_index(addr)],
             0x07 => self.oam[(addr as usize) & (OAM - 1)],
             0x08..=0x0D => {
-                if let Some(value) = self.rtc.read(addr) {
+                if let Some(value) = self.cart_gpio_read(addr) {
                     value
                 } else {
                     self.rom
@@ -1130,7 +1157,7 @@ impl Bus {
                     self.gfx.invalidate_sprite_lines();
                 }
             }
-            0x08..=0x0D => self.rtc.write(addr, value),
+            0x08..=0x0D => self.cart_gpio_write(addr, value),
             0x0E => self.backup.write(addr, value),
             _ => {}
         }
