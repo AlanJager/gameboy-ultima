@@ -14,6 +14,7 @@ mod dma;
 mod gfxcache;
 mod icache;
 mod keypad;
+mod music;
 mod lesson;
 mod ppu;
 mod registers;

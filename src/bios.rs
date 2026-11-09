@@ -42,8 +42,15 @@ pub(crate) fn call(regs: &mut Registers, bus: &mut Bus, number: u8) -> Option<(u
         0x19 => sound_bias(regs, bus),
         0x1A => sound_init(regs, bus),
         0x1B => sound_mode(regs, bus),
-        0x1C | 0x1D | 0x1E | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 => idle(bus),
+        0x1C => sound_main(bus),
+        0x1D => sound_driver_vsync(bus),
+        0x1E => sound_channel_clear(bus),
         0x1F => midi_key_to_freq(regs, bus),
+        0x20 => sound_player_open(regs, bus),
+        0x21 => sound_player_start(regs, bus),
+        0x22 => sound_player_stop(regs, bus),
+        0x23 => sound_player_continue(regs, bus),
+        0x24 => sound_player_fade(regs, bus),
         0x25 => multiboot(regs, bus),
         0x26 => hard_reset(regs, bus),
         0x27 => custom_halt(regs, bus),
@@ -706,36 +713,70 @@ fn sound_bias(regs: &mut Registers, bus: &mut Bus) -> (u32, bool) {
 }
 
 fn sound_init(regs: &mut Registers, bus: &mut Bus) -> (u32, bool) {
-    bus.set_sound_area(regs.get(0));
-    bus.set_sound_vsync(true);
+    crate::music::init(bus, regs.get(0));
     idle(bus)
 }
 
 fn sound_mode(regs: &mut Registers, bus: &mut Bus) -> (u32, bool) {
-    bus.set_sound_mode(regs.get(0));
+    crate::music::mode(bus, regs.get(0));
+    idle(bus)
+}
+
+fn sound_main(bus: &mut Bus) -> (u32, bool) {
+    crate::music::main(bus);
+    idle(bus)
+}
+
+fn sound_driver_vsync(bus: &mut Bus) -> (u32, bool) {
+    crate::music::vsync(bus);
+    idle(bus)
+}
+
+fn sound_channel_clear(bus: &mut Bus) -> (u32, bool) {
+    crate::music::clear_channels(bus);
     idle(bus)
 }
 
 fn sound_vsync(bus: &mut Bus, on: bool) -> (u32, bool) {
-    bus.set_sound_vsync(on);
+    if on {
+        crate::music::vsync_on(bus);
+    } else {
+        crate::music::vsync_off(bus);
+    }
+    idle(bus)
+}
+
+fn sound_player_open(regs: &mut Registers, bus: &mut Bus) -> (u32, bool) {
+    crate::music::player_open(bus, regs.get(0), regs.get(1), regs.get(2));
+    idle(bus)
+}
+
+fn sound_player_start(regs: &mut Registers, bus: &mut Bus) -> (u32, bool) {
+    crate::music::player_start(bus, regs.get(0), regs.get(1));
+    idle(bus)
+}
+
+fn sound_player_stop(regs: &mut Registers, bus: &mut Bus) -> (u32, bool) {
+    crate::music::player_stop(bus, regs.get(0));
+    idle(bus)
+}
+
+fn sound_player_continue(regs: &mut Registers, bus: &mut Bus) -> (u32, bool) {
+    crate::music::player_continue(bus, regs.get(0));
+    idle(bus)
+}
+
+fn sound_player_fade(regs: &mut Registers, bus: &mut Bus) -> (u32, bool) {
+    crate::music::player_fade(bus, regs.get(0), regs.get(1));
     idle(bus)
 }
 
 fn midi_key_to_freq(regs: &mut Registers, bus: &mut Bus) -> (u32, bool) {
     let wave = regs.get(0);
-    let key = regs.get(1) & 0xFF;
-    let fine = regs.get(2) & 0xFF;
+    let key = (regs.get(1) & 0xFF) as i32;
+    let fine = (regs.get(2) & 0xFF) as i32;
     let freq = bus.read_u32(wave.wrapping_add(4));
-    let steps = f64::from(key as i32 - 60) + f64::from(fine) / 256.0;
-    let scaled = f64::from(freq) * (steps / 12.0).exp2();
-    let result = if !scaled.is_finite() || scaled <= 0.0 {
-        0
-    } else if scaled >= f64::from(u32::MAX) {
-        u32::MAX
-    } else {
-        scaled.round() as u32
-    };
-    regs.set(0, result);
+    regs.set(0, crate::music::midi_freq(freq, key, fine));
     bus.note_internal(16);
     (20, false)
 }
@@ -1109,6 +1150,127 @@ mod tests {
         assert_eq!(bus.read_u32(0x0200_0100), 0x188);
         assert_eq!(bus.read_u32(0x0200_0100 + 35 * 4), 0x188);
         assert_eq!(bus.read_u32(0x188), 0xE12F_FF1E);
+    }
+
+    #[test]
+    fn bios_song_mixes_a_note_and_the_transport_stops_it() {
+        const AREA: u32 = 0x0200_0000;
+        const WAVE: u32 = 0x0200_1000;
+        const TONE: u32 = 0x0200_1100;
+        const SCORE: u32 = 0x0200_1200;
+        const SONG: u32 = 0x0200_1300;
+        const PLAYER: u32 = 0x0200_1400;
+        const TRACKS: u32 = 0x0200_1500;
+
+        let mut regs = Registers::arm_start(0x0800_0000);
+        let mut bus = Bus::new();
+        regs.set(0, AREA);
+        call(&mut regs, &mut bus, 0x1A).unwrap();
+        assert_eq!(bus.read_u32(AREA), 0x6873_6D53);
+        assert_eq!(bus.read_u32(0x0300_7FF0), AREA);
+        assert_eq!(bus.sound_area(), AREA);
+        assert!(bus.sound_vsync());
+        assert_eq!(bus.read_u8(AREA + 0x06), 8);
+        assert_eq!(bus.read_u8(AREA + 0x07), 15);
+        assert_eq!(bus.read_u32(AREA + 0x10), 224);
+        assert_eq!(bus.read_u16(0x0400_0084) & 0x80, 0x80);
+
+        regs.set(0, 0x0002_3800);
+        call(&mut regs, &mut bus, 0x1B).unwrap();
+        assert_eq!(bus.sound_mode(), 0x0002_3800);
+        assert_eq!(bus.read_u8(AREA + 0x06), 8);
+        assert_eq!(bus.read_u8(AREA + 0x07), 3);
+        assert_eq!(bus.read_u32(AREA + 0x10), 132);
+        assert!(bus.sound_vsync());
+
+        bus.write_u16(WAVE + 2, 0xC000);
+        bus.write_u32(WAVE + 4, 13_379);
+        bus.write_u32(WAVE + 8, 0);
+        bus.write_u32(WAVE + 0x0C, 8);
+        for index in 0..8u32 {
+            bus.write_u8(WAVE + 0x10 + index, 0x7F);
+        }
+        bus.write_u8(TONE + 1, 60);
+        bus.write_u32(TONE + 4, WAVE);
+        bus.write_u8(TONE + 8, 255);
+        bus.write_u8(TONE + 9, 255);
+        bus.write_u8(TONE + 10, 255);
+        bus.write_u8(TONE + 11, 255);
+        let score = [
+            0xBDu8, 0x00, 0xBE, 0x7F, 0xBF, 0x40, 0xCF, 60, 0x7F, 10, 0xCE, 0xB1,
+        ];
+        for (index, byte) in score.iter().enumerate() {
+            bus.write_u8(SCORE + index as u32, *byte);
+        }
+        bus.write_u8(SONG, 1);
+        bus.write_u32(SONG + 4, TONE);
+        bus.write_u32(SONG + 8, SCORE);
+
+        regs.set(0, PLAYER);
+        regs.set(1, TRACKS);
+        regs.set(2, 1);
+        call(&mut regs, &mut bus, 0x20).unwrap();
+        assert_eq!(bus.read_u32(PLAYER + 0x34), 0x6873_6D53);
+        assert_eq!(bus.read_u32(PLAYER + 0x04), 0x8000);
+        assert_eq!(bus.read_u32(PLAYER + 0x2C), TRACKS);
+        assert_eq!(bus.read_u32(AREA + 0x40), PLAYER);
+        assert_eq!(bus.read_u8(TRACKS), 0);
+
+        regs.set(0, PLAYER);
+        regs.set(1, SONG);
+        call(&mut regs, &mut bus, 0x21).unwrap();
+        assert_eq!(bus.read_u32(PLAYER), SONG);
+        assert_eq!(bus.read_u8(TRACKS), 0xC0);
+        assert_eq!(bus.read_u32(TRACKS + 0x40), SCORE);
+
+        call(&mut regs, &mut bus, 0x1C).unwrap();
+        let loud = (0..132u32).any(|index| {
+            bus.read_u8(AREA + 0x350 + index) != 0 || bus.read_u8(AREA + 0x980 + index) != 0
+        });
+        assert!(loud, "音符应该写进左右两块混音缓冲");
+        assert_ne!(bus.read_u8(AREA + 0x50) & 0x01, 0);
+
+        let period = u32::from(bus.read_u8(AREA + 0x0B));
+        for _ in 0..period {
+            call(&mut regs, &mut bus, 0x1D).unwrap();
+        }
+        assert_eq!(bus.read_u16(0x0400_00C6), 0xB640);
+        assert_eq!(bus.read_u16(0x0400_00D2), 0xB640);
+        assert_eq!(bus.read_u16(0x0400_0102) & 0x80, 0x80);
+
+        for _ in 0..16 {
+            call(&mut regs, &mut bus, 0x1C).unwrap();
+        }
+        assert_eq!(bus.read_u8(TRACKS), 0);
+
+        regs.set(0, PLAYER);
+        regs.set(1, SONG);
+        call(&mut regs, &mut bus, 0x21).unwrap();
+        call(&mut regs, &mut bus, 0x1C).unwrap();
+        regs.set(0, PLAYER);
+        call(&mut regs, &mut bus, 0x1E).unwrap();
+        assert_eq!(bus.read_u8(AREA + 0x50), 0);
+
+        regs.set(0, PLAYER);
+        regs.set(1, SONG);
+        call(&mut regs, &mut bus, 0x21).unwrap();
+        call(&mut regs, &mut bus, 0x1C).unwrap();
+        regs.set(0, PLAYER);
+        call(&mut regs, &mut bus, 0x22).unwrap();
+        assert_eq!(bus.read_u32(PLAYER + 0x04) & 1, 1);
+        assert_eq!(bus.read_u8(AREA + 0x50), 0);
+        let cmd = bus.read_u32(TRACKS + 0x40);
+        call(&mut regs, &mut bus, 0x1C).unwrap();
+        assert_eq!(bus.read_u32(TRACKS + 0x40), cmd);
+        call(&mut regs, &mut bus, 0x23).unwrap();
+        assert_eq!(bus.read_u32(PLAYER + 0x04) & 1, 0);
+
+        regs.set(1, 1);
+        call(&mut regs, &mut bus, 0x24).unwrap();
+        for _ in 0..16 {
+            call(&mut regs, &mut bus, 0x1C).unwrap();
+        }
+        assert_eq!(bus.read_u32(PLAYER + 0x04) & 1, 1);
     }
 
     #[test]
