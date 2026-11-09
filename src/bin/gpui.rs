@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gameboy_ultima::link::{normalize_link_name, LinkHub, LinkSeat};
+use gameboy_ultima::link::{normalize_link_name, LinkHub, LinkSeat, LINK_ROOM};
 use gameboy_ultima::{
     audio_pace, parse_cheat, rgb555_to_888, step_quiet, AudioPlay, Bus, CheatFamily, CheatProgram,
     Registers, CYCLES_PER_FRAME, DEFAULT_SOLAR, HEIGHT, WIDTH,
@@ -2622,8 +2622,14 @@ fn cheat_overlay(
         )
 }
 
+fn shown_link_seats(seats: &[LinkSeat]) -> usize {
+    let named = seats.iter().filter(|seat| !seat.name.is_empty()).count();
+    named.max(4).min(seats.len())
+}
+
 fn link_board(seats: &[LinkSeat]) -> impl IntoElement {
     let online = seats.iter().filter(|seat| !seat.name.is_empty()).count();
+    let shown = shown_link_seats(seats);
     div()
         .absolute()
         .bottom(px(12.))
@@ -2642,9 +2648,9 @@ fn link_board(seats: &[LinkSeat]) -> impl IntoElement {
                 .text_xs()
                 .text_color(rgb(ACCENT))
                 .child("联机")
-                .child(format!("在线 {online}/4")),
+                .child(format!("在线 {online}/{LINK_ROOM}")),
         )
-        .children(seats.iter().map(|seat| {
+        .children(seats.iter().take(shown).map(|seat| {
             let open = seat.name.is_empty();
             div()
                 .flex()
@@ -2697,8 +2703,8 @@ fn link_overlay(
     } else {
         name.to_string()
     };
-    let room = if in_room && seats.len() == 4 {
-        seats.to_vec()
+    let room: Vec<LinkSeat> = if in_room && !seats.is_empty() {
+        seats.iter().take(shown_link_seats(seats)).cloned().collect()
     } else {
         (1..=4)
             .map(|number| LinkSeat {
@@ -2708,9 +2714,9 @@ fn link_overlay(
             })
             .collect()
     };
-    let online = room.iter().filter(|seat| !seat.name.is_empty()).count();
+    let online = seats.iter().filter(|seat| !seat.name.is_empty()).count();
     let room_label = if in_room {
-        format!("房间 · 在线 {online}/4")
+        format!("房间 · 在线 {online}/{LINK_ROOM}")
     } else {
         "房间 · 还没进入".to_string()
     };

@@ -2,7 +2,7 @@
 //!
 //! 游戏用 32 位普通模式登录。口令是 `NINTENDO` 再加 `0x8001`，对完才发 `0x9966` 命令。
 //! 真正的电波由联机房间转发。没进房间时适配器还在，只是搜不到别人。
-//! `0x11` 固定回 `0xFF`，一个房间最多 4 台。
+//! `0x11` 按已经连上的客户给出信号，空位是 0。一次广播扫描最多交出 4 台，再问能看到后面的。
 
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum WirelessOut {
     Announce([u32; 6]),
     Connect(u32),
-    Accept(u32),
+    Accept(u32, u8),
     Data(Vec<u32>),
 }
 
@@ -18,7 +18,7 @@ pub(crate) enum WirelessOut {
 pub(crate) enum WirelessIn {
     Directory(Vec<(u32, [u32; 6])>),
     Connect(u32),
-    Accept,
+    Accept(u8),
     Data(Vec<u32>),
 }
 
@@ -48,6 +48,15 @@ pub(crate) struct Adapter {
     si_invert: bool,
     holding: bool,
     connect_ok: bool,
+    /// 作为主机时，四个客户槽。空槽是还没人连上。
+    #[serde(default)]
+    clients: [Option<u32>; 4],
+    /// 作为客户时，自己被分到的槽。
+    #[serde(default)]
+    client_slot: Option<u8>,
+    /// `0x13` 的高字节。0 空闲，1 关房，2 开房，3 搜索，4 正在连，5 已连上。
+    #[serde(default)]
+    serving: u8,
     /// 登录还没开始。第一拍回 0，让游戏自己对齐。
     #[serde(skip)]
     login_started: bool,
@@ -80,6 +89,9 @@ impl Adapter {
             si_invert: false,
             holding: false,
             connect_ok: false,
+            clients: [None; 4],
+            client_slot: None,
+            serving: 0,
             login_started: false,
             login_index: 0,
             login_prev_lo: 0,
@@ -127,7 +139,11 @@ impl Adapter {
                 self.dir_cursor = 0;
             }
             WirelessIn::Connect(from) => self.connect_inbox.push(from),
-            WirelessIn::Accept => self.connect_ok = true,
+            WirelessIn::Accept(slot) => {
+                self.connect_ok = true;
+                self.client_slot = Some(slot);
+                self.serving = 5;
+            }
             WirelessIn::Data(words) => {
                 if !words.is_empty() {
                     self.data_inbox.push(words);
@@ -259,8 +275,22 @@ impl Adapter {
     fn handle(&mut self, cmd: u8, params: &[u32]) -> Vec<u32> {
         match cmd {
             0x10 | 0x3D | 0x21 => Vec::new(),
-            0x11 => vec![0xFF],
-            0x13 => vec![0x0200_1234],
+            0x11 => vec![self.signal_word()],
+            0x13 => vec![self.system_status()],
+            0x19 => {
+                self.serving = 2;
+                Vec::new()
+            }
+            0x1B => {
+                self.serving = 1;
+                self.client_words()
+            }
+            0x1C => {
+                if self.serving == 0 {
+                    self.serving = 3;
+                }
+                Vec::new()
+            }
             0x16 => {
                 let mut words = [0u32; 6];
                 for (slot, value) in words.iter_mut().zip(params.iter().copied()) {
@@ -272,23 +302,19 @@ impl Adapter {
             }
             0x17 if params.is_empty() => self.next_directory_entry(),
             0x17 => Vec::new(),
-            0x1A => match self.connect_inbox.pop() {
-                Some(from) => {
-                    self.outgoing.push(WirelessOut::Accept(from));
-                    vec![from]
-                }
-                None => Vec::new(),
-            },
-            0x1D | 0x1E => self.directory_blob(),
+            0x1A => self.poll_connections(),
+            0x1D | 0x1E => self.directory_page(),
             0x1F => {
                 self.connect_ok = false;
+                self.client_slot = None;
+                self.serving = 4;
                 if let Some(target) = params.first().copied() {
                     self.outgoing.push(WirelessOut::Connect(target));
                 }
                 self.dir_cursor = 0;
                 Vec::new()
             }
-            0x20 => vec![if self.connect_ok { 0 } else { 0x0100_0000 }],
+            0x20 => vec![self.connection_result()],
             0x24 => {
                 if !params.is_empty() {
                     self.outgoing.push(WirelessOut::Data(params.to_vec()));
@@ -304,12 +330,79 @@ impl Adapter {
             0x26 => self.data_inbox.pop().unwrap_or_default(),
             0x27 => Vec::new(),
             0x30 => {
+                let mask = params.first().copied().unwrap_or(0xF) as u8;
+                let mask = if mask == 0 { 0xF } else { mask };
+                for slot in 0..4 {
+                    if mask & (1 << slot) != 0 {
+                        self.clients[slot] = None;
+                    }
+                }
                 self.connect_ok = false;
+                self.client_slot = None;
                 self.connect_inbox.clear();
+                if self.serving == 5 {
+                    self.serving = 0;
+                }
                 Vec::new()
             }
             _ => Vec::new(),
         }
+    }
+
+    /// 主机看到四个客户槽。客户只看到自己那一字节。没人连上时是 0。
+    fn signal_word(&self) -> u32 {
+        if let Some(slot) = self.client_slot.filter(|slot| *slot < 4) {
+            return 0xFF << (u32::from(slot) * 8);
+        }
+        let mut word = 0u32;
+        for (slot, client) in self.clients.iter().enumerate() {
+            if client.is_some() {
+                word |= 0xFFu32 << (slot * 8);
+            }
+        }
+        word
+    }
+
+    fn system_status(&self) -> u32 {
+        let id = if self.serving == 0 { 0 } else { self.id & 0xFFFF };
+        let slots = self.client_slot.map(|slot| 1u32 << slot).unwrap_or(0);
+        id | (slots << 16) | (u32::from(self.serving) << 24)
+    }
+
+    fn connection_result(&self) -> u32 {
+        if !self.connect_ok {
+            return 0x0100_0000;
+        }
+        let slot = u32::from(self.client_slot.unwrap_or(0));
+        (slot << 16) | (self.id & 0xFFFF)
+    }
+
+    fn poll_connections(&mut self) -> Vec<u32> {
+        while let Some(from) = self.connect_inbox.pop() {
+            if let Some((slot, fresh)) = self.assign_client(from) {
+                if fresh {
+                    self.outgoing.push(WirelessOut::Accept(from, slot));
+                }
+            }
+        }
+        self.client_words()
+    }
+
+    fn assign_client(&mut self, id: u32) -> Option<(u8, bool)> {
+        if let Some(slot) = self.clients.iter().position(|slot| *slot == Some(id)) {
+            return Some((slot as u8, false));
+        }
+        let slot = self.clients.iter().position(|slot| slot.is_none())?;
+        self.clients[slot] = Some(id);
+        Some((slot as u8, true))
+    }
+
+    fn client_words(&self) -> Vec<u32> {
+        self.clients
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, id)| id.map(|id| ((slot as u32) << 16) | (id & 0xFFFF)))
+            .collect()
     }
 
     fn next_directory_entry(&mut self) -> Vec<u32> {
@@ -323,11 +416,23 @@ impl Adapter {
         reply
     }
 
-    fn directory_blob(&self) -> Vec<u32> {
-        let mut reply = Vec::with_capacity(self.directory.len() * 7);
-        for (id, words) in &self.directory {
-            reply.push(*id);
+    /// 一次最多 4 台。读完这一页，下一次从后面继续；名单走完就回到开头。
+    fn directory_page(&mut self) -> Vec<u32> {
+        if self.directory.is_empty() {
+            self.dir_cursor = 0;
+            return Vec::new();
+        }
+        if self.dir_cursor >= self.directory.len() {
+            self.dir_cursor = 0;
+        }
+        let mut reply = Vec::new();
+        let mut taken = 0;
+        while taken < 4 && self.dir_cursor < self.directory.len() {
+            let (id, words) = self.directory[self.dir_cursor];
+            self.dir_cursor += 1;
+            reply.push(id & 0xFFFF);
             reply.extend(words);
+            taken += 1;
         }
         reply
     }
@@ -345,11 +450,8 @@ fn fresh_id() -> u32 {
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         .wrapping_mul(0x9E37_79B9)
         ^ std::process::id();
-    if mixed == 0 {
-        1
-    } else {
-        mixed
-    }
+    let id = mixed & 0xFFFF;
+    if id == 0 { 1 } else { id }
 }
 
 #[cfg(test)]
@@ -392,7 +494,64 @@ mod tests {
         }
         assert_eq!(pull(&mut adapter, 0x9966_0011), 0x8000_0000);
         assert_eq!(pull(&mut adapter, 0x8000_0000), 0x9966_0191);
-        assert_eq!(pull(&mut adapter, 0x8000_0000), 0xFF);
+        assert_eq!(pull(&mut adapter, 0x8000_0000), 0);
+    }
+
+    #[test]
+    fn signal_level_follows_the_clients_that_actually_connected() {
+        let mut host = Adapter::new();
+        assert_eq!(pull(&mut host, 0x9966_0011), 0x8000_0000);
+        assert_eq!(pull(&mut host, 0x8000_0000), 0x9966_0191);
+        assert_eq!(pull(&mut host, 0x8000_0000), 0);
+
+        host.apply(WirelessIn::Connect(0x1111));
+        host.apply(WirelessIn::Connect(0x2222));
+        assert_eq!(pull(&mut host, 0x9966_001A), 0x8000_0000);
+        assert_eq!(pull(&mut host, 0x8000_0000), 0x9966_029A);
+        let mut seen = [pull(&mut host, 0x8000_0000), pull(&mut host, 0x8000_0000)];
+        seen.sort();
+        assert_eq!(seen, [0x0000_2222, 0x0001_1111]);
+        let accepted: Vec<_> = host
+            .take_outgoing()
+            .into_iter()
+            .map(|event| match event {
+                WirelessOut::Accept(id, slot) => (id, slot),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(accepted, vec![(0x2222, 0), (0x1111, 1)]);
+
+        assert_eq!(pull(&mut host, 0x9966_0011), 0x8000_0000);
+        assert_eq!(pull(&mut host, 0x8000_0000), 0x9966_0191);
+        assert_eq!(pull(&mut host, 0x8000_0000), 0x0000_FFFF);
+
+        let mut client = Adapter::new();
+        client.apply(WirelessIn::Accept(1));
+        assert_eq!(pull(&mut client, 0x9966_0011), 0x8000_0000);
+        assert_eq!(pull(&mut client, 0x8000_0000), 0x9966_0191);
+        assert_eq!(pull(&mut client, 0x8000_0000), 0x0000_FF00);
+    }
+
+    #[test]
+    fn a_scan_returns_four_hosts_and_the_next_scan_returns_the_rest() {
+        let mut adapter = Adapter::new();
+        let hosts: Vec<_> = (1..=5)
+            .map(|id| (id, [id, 0, 0, 0, 0, 0]))
+            .collect();
+        adapter.apply(WirelessIn::Directory(hosts));
+        assert_eq!(pull(&mut adapter, 0x9966_001D), 0x8000_0000);
+        assert_eq!(pull(&mut adapter, 0x8000_0000), 0x9966_1C9D);
+        let mut ids = Vec::new();
+        for index in 0..28 {
+            let word = pull(&mut adapter, 0x8000_0000);
+            if index % 7 == 0 {
+                ids.push(word & 0xFFFF);
+            }
+        }
+        assert_eq!(ids, [1, 2, 3, 4]);
+        assert_eq!(pull(&mut adapter, 0x9966_001D), 0x8000_0000);
+        assert_eq!(pull(&mut adapter, 0x8000_0000), 0x9966_079D);
+        assert_eq!(pull(&mut adapter, 0x8000_0000) & 0xFFFF, 5);
     }
 
     #[test]

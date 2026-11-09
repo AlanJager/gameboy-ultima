@@ -1,4 +1,4 @@
-//! 局域网上的联机房间，最多四台。不在同一网络时，经中继向外连接。
+//! 局域网上的联机房间。线缆对战仍是四台，联合房间可以到 16 台。不在同一网络时，经中继向外连接。
 //!
 //! 主机听 `0.0.0.0:5576`，并每半秒往局域网广播自己。客人搜到名字就能加入，也可以手填地址。
 //! 中继听 `5578`。主机和客人都主动连过去，房间号写成 `地址#房间`。中继只把两边的字节对上，
@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use crate::bus::Bus;
 
 pub const LINK_PORT: u16 = 5576;
+/// 联合房间里能同时待着的台数。线缆对战只用前 4 台。
+pub const LINK_ROOM: usize = 16;
 pub const RELAY_PORT: u16 = 5578;
 const DISCOVERY_PORT: u16 = 5577;
 const RELAY_MAGIC: &[u8] = b"URELAY1";
@@ -113,14 +115,14 @@ struct Peer {
     assigned: u8,
     roster: u8,
     names_dirty: bool,
-    room: [Option<String>; 4],
+    room: [Option<String>; LINK_ROOM],
 }
 
 enum WireFrame {
     Who(u32),
     Announce { id: u32, words: [u32; 6] },
     Connect { from: u32, target: u32 },
-    Accept { from: u32, target: u32 },
+    Accept { from: u32, target: u32, slot: u8 },
     Data { from: u32, words: Vec<u32> },
     Roster(u8),
 }
@@ -239,7 +241,11 @@ impl LinkHub {
         });
         self.player = None;
         self.error = None;
-        self.line = format!("中继 {} · 等待加入 · 1/4 · {}", room_text(&room), self.relay_share());
+        self.line = format!(
+            "中继 {} · 等待加入 · 1/{LINK_ROOM} · {}",
+            room_text(&room),
+            self.relay_share()
+        );
         self.beacon();
         Ok(room_text(&room))
     }
@@ -264,7 +270,7 @@ impl LinkHub {
         self.role = Role::Host(Peer::new(Some(listener), port, rom_id));
         self.player = None;
         self.error = None;
-        self.line = format!("等待加入 · 1/4 · {}:{port}", self.lan_ip);
+        self.line = format!("等待加入 · 1/{LINK_ROOM} · {}:{port}", self.lan_ip);
         self.beacon();
         Ok(port)
     }
@@ -457,8 +463,13 @@ impl LinkHub {
 
     pub fn service(&mut self, bus: &mut Bus) {
         self.poll();
-        let peers = if self.player.is_some() { self.peers } else { 1 };
-        bus.set_link_roster(self.player, peers);
+        let cable_player = self.player.filter(|id| *id < 4);
+        let peers = if cable_player.is_some() {
+            self.peers.min(4)
+        } else {
+            1
+        };
+        bus.set_link_roster(cable_player, peers);
         match &mut self.role {
             Role::Idle => {}
             Role::Host(peer) => {
@@ -473,7 +484,7 @@ impl LinkHub {
                             heard = true;
                         }
                     }
-                    if heard || peer.welcomed_count() == 0 {
+                    if heard || peer.cable_welcomed() == 0 {
                         peer.send_result(words);
                         bus.finish_link(words);
                     } else {
@@ -519,23 +530,24 @@ impl LinkHub {
                 let welcomed = peer.welcomed_count();
                 if welcomed > 0 {
                     self.player = Some(0);
-                    self.peers = (1 + welcomed).min(4);
+                    self.peers = (1 + peer.cable_welcomed()).min(4);
                     peer.note_roster(self.peers);
                     if self.error.is_none() {
+                        let room = 1 + welcomed;
                         self.line = if relay_share.is_empty() {
-                            format!("联机 · {}/4 · 1号机", self.peers)
+                            format!("联机 · {room}/{LINK_ROOM} · 1号机")
                         } else {
-                            format!("联机 · {}/4 · 1号机 · {relay_share}", self.peers)
+                            format!("联机 · {room}/{LINK_ROOM} · 1号机 · {relay_share}")
                         };
                     }
                 } else if self.error.is_none() {
                     self.player = None;
                     self.peers = 1;
                     self.line = if relay_share.is_empty() {
-                        format!("等待加入 · 1/4 · {}:{port}", self.lan_ip)
+                        format!("等待加入 · 1/{LINK_ROOM} · {}:{port}", self.lan_ip)
                     } else {
                         let code = relay_share.rsplit_once('#').map(|(_, code)| code).unwrap_or("");
-                        format!("中继 {code} · 等待加入 · 1/4 · {relay_share}")
+                        format!("中继 {code} · 等待加入 · 1/{LINK_ROOM} · {relay_share}")
                     };
                 }
                 false
@@ -551,7 +563,8 @@ impl LinkHub {
                     self.player = Some(peer.assigned);
                     self.peers = peer.roster.max(2).min(4);
                     let number = u16::from(peer.assigned) + 1;
-                    self.line = format!("联机 · {}/4 · {number}号机", self.peers);
+                    let room = peer.named_count().max(2);
+                    self.line = format!("联机 · {room}/{LINK_ROOM} · {number}号机");
                     self.error = None;
                     false
                 } else {
@@ -610,7 +623,7 @@ impl LinkHub {
         let frame = match event {
             crate::wireless::WirelessOut::Announce(words) => announce_frame(local, words),
             crate::wireless::WirelessOut::Connect(target) => connect_frame(local, target),
-            crate::wireless::WirelessOut::Accept(from) => accept_frame(local, from),
+            crate::wireless::WirelessOut::Accept(from, slot) => accept_frame(local, from, slot),
             crate::wireless::WirelessOut::Data(words) => data_frame(local, &words),
         };
         self.send_all(&frame);
@@ -650,11 +663,11 @@ impl LinkHub {
                     }
                     forward.push((seat_id, connect_frame(from, target)));
                 }
-                WireFrame::Accept { from, target } => {
+                WireFrame::Accept { from, target, slot } => {
                     if target == local {
-                        incoming.push(crate::wireless::WirelessIn::Accept);
+                        incoming.push(crate::wireless::WirelessIn::Accept(slot));
                     }
-                    forward.push((seat_id, accept_frame(from, target)));
+                    forward.push((seat_id, accept_frame(from, target, slot)));
                 }
                 WireFrame::Data { from, words } => {
                     if from != local {
@@ -903,7 +916,7 @@ impl Peer {
             assigned: 1,
             roster: 2,
             names_dirty: false,
-            room: [None, None, None, None],
+            room: std::array::from_fn(|_| None),
         }
     }
 
@@ -928,15 +941,15 @@ impl Peer {
         }
     }
 
-    fn occupied_names(&self, host_name: &str) -> [Option<String>; 4] {
-        let mut names = [None, None, None, None];
+    fn occupied_names(&self, host_name: &str) -> [Option<String>; LINK_ROOM] {
+        let mut names = std::array::from_fn(|_| None);
         names[0] = Some(host_name.to_string());
         for seat in &self.seats {
             if !seat.welcomed || seat.closed {
                 continue;
             }
             let index = seat.player_id as usize;
-            if (1..4).contains(&index) {
+            if (1..LINK_ROOM).contains(&index) {
                 names[index] = Some(if seat.name.is_empty() {
                     format!("{}号机", index + 1)
                 } else {
@@ -982,6 +995,17 @@ impl Peer {
         self.seats.first_mut()?.results.pop_front()
     }
 
+    fn named_count(&self) -> u8 {
+        self.room.iter().filter(|name| name.is_some()).count() as u8
+    }
+
+    fn cable_welcomed(&self) -> u8 {
+        self.seats
+            .iter()
+            .filter(|seat| seat.welcomed && !seat.closed && seat.player_id < 4)
+            .count() as u8
+    }
+
     fn welcomed_count(&self) -> u8 {
         self.seats
             .iter()
@@ -1006,7 +1030,7 @@ impl Peer {
         let Some(listener) = self.listener.as_ref() else {
             return;
         };
-        if self.seats.len() >= 3 {
+        if self.seats.len() >= LINK_ROOM - 1 {
             if let Ok((stream, _)) = listener.accept() {
                 drop(stream);
             }
@@ -1019,7 +1043,7 @@ impl Peer {
     }
 
     fn adopt_guest(&mut self, stream: TcpStream) {
-        if self.seats.len() >= 3 {
+        if self.seats.len() >= LINK_ROOM - 1 {
             return;
         }
         if prepare_stream(&stream).is_err() {
@@ -1092,7 +1116,7 @@ impl Peer {
             }
         }
         if let Some(id) = assigned {
-            self.assigned = id.clamp(1, 3);
+            self.assigned = id.clamp(1, (LINK_ROOM - 1) as u8);
         }
         if let Some(count) = roster {
             self.roster = count.clamp(2, 4);
@@ -1132,7 +1156,7 @@ impl Peer {
         let mut pending: Vec<u8> = self
             .seats
             .iter()
-            .filter(|seat| seat.welcomed)
+            .filter(|seat| seat.welcomed && seat.player_id < 4)
             .map(|seat| seat.player_id)
             .collect();
         let mut got = Vec::new();
@@ -1282,7 +1306,8 @@ impl Seat {
             },
             WHO if self.inbox.len() >= 5 => 5,
             ANNOUNCE if self.inbox.len() >= 29 => 29,
-            CONNECT | ACCEPT if self.inbox.len() >= 9 => 9,
+            CONNECT if self.inbox.len() >= 9 => 9,
+            ACCEPT if self.inbox.len() >= 10 => 10,
             DATA if self.inbox.len() >= 7 => {
                 let count = u16::from_le_bytes([self.inbox[5], self.inbox[6]]) as usize;
                 if self.inbox.len() < 7 + count * 4 {
@@ -1353,6 +1378,7 @@ fn decode_frame(bytes: &[u8]) -> SeatFrame {
         ACCEPT => SeatFrame::Wire(WireFrame::Accept {
             from: read_u32(bytes, 1),
             target: read_u32(bytes, 5),
+            slot: bytes[9],
         }),
         DATA => {
             let count = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
@@ -1405,7 +1431,7 @@ fn seats_len(inbox: &[u8]) -> FrameLen {
         return FrameLen::NeedMore;
     }
     let count = inbox[1] as usize;
-    if count > 4 {
+    if count > LINK_ROOM {
         return FrameLen::Skip;
     }
     let mut at = 2;
@@ -1429,7 +1455,7 @@ fn decode_seats(bytes: &[u8]) -> Vec<(u8, String)> {
     let count = bytes.get(1).copied().unwrap_or(0) as usize;
     let mut list = Vec::new();
     let mut at = 2;
-    for _ in 0..count.min(4) {
+    for _ in 0..count.min(LINK_ROOM) {
         if bytes.len() < at + 2 {
             break;
         }
@@ -1446,8 +1472,8 @@ fn decode_seats(bytes: &[u8]) -> Vec<(u8, String)> {
     list
 }
 
-fn room_from(list: &[(u8, String)]) -> [Option<String>; 4] {
-    let mut room = [None, None, None, None];
+fn room_from(list: &[(u8, String)]) -> [Option<String>; LINK_ROOM] {
+    let mut room = std::array::from_fn(|_| None);
     for (id, name) in list {
         let index = *id as usize;
         if index < room.len() && !name.is_empty() {
@@ -1465,7 +1491,7 @@ fn name_frame(name: &str) -> Vec<u8> {
     frame
 }
 
-fn seats_frame(names: &[Option<String>; 4]) -> Vec<u8> {
+fn seats_frame(names: &[Option<String>]) -> Vec<u8> {
     let present: Vec<(u8, String)> = names
         .iter()
         .enumerate()
@@ -1517,10 +1543,11 @@ fn connect_frame(from: u32, target: u32) -> Vec<u8> {
     frame
 }
 
-fn accept_frame(from: u32, target: u32) -> Vec<u8> {
+fn accept_frame(from: u32, target: u32, slot: u8) -> Vec<u8> {
     let mut frame = vec![ACCEPT];
     frame.extend(from.to_le_bytes());
     frame.extend(target.to_le_bytes());
+    frame.push(slot);
     frame
 }
 
@@ -1715,7 +1742,7 @@ fn relay_guest(
             let _ = write_relay_reply(&mut stream, RELAY_UNKNOWN, request.room);
             return;
         };
-        if room.guests >= 3 {
+        if room.guests as usize >= LINK_ROOM - 1 {
             let _ = write_relay_reply(&mut stream, RELAY_FULL, request.room);
             return;
         }
@@ -2432,12 +2459,16 @@ mod tests {
         let mut bus = Bus::new();
         for _ in 0..80 {
             host.service(&mut bus);
-            if host.view().line.contains("4/4") {
+            if host.view().line.contains(&format!("4/{LINK_ROOM}")) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(host.view().line.contains("4/4"), "{}", host.view().line);
+        assert!(
+            host.view().line.contains(&format!("4/{LINK_ROOM}")),
+            "{}",
+            host.view().line
+        );
         bus.write_u16(0x0400_012A, 0x0001);
         bus.write_u16(0x0400_0128, (1 << 13) | 3 | (1 << 7));
         for _ in 0..80 {
@@ -2562,5 +2593,57 @@ mod tests {
         assert_eq!(guest_seats[1].name, "卧室");
         assert!(guest_seats[1].mine);
         assert!(guest_seats[2].name.is_empty() && guest_seats[3].name.is_empty());
+    }
+
+    #[test]
+    fn a_fifth_machine_stays_in_the_union_room() {
+        let mut host = LinkHub::new();
+        host.set_name("主机");
+        let port = host.host_on(0, "same-rom").expect("host");
+        let guests: Vec<_> = (0..4)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let mut guest = LinkHub::new();
+                    guest.set_name(&format!("客{index}"));
+                    guest
+                        .join(&format!("127.0.0.1:{port}"), "same-rom")
+                        .expect("join");
+                    let mut bus = Bus::new();
+                    for _ in 0..80 {
+                        guest.service(&mut bus);
+                        if guest.connected() && guest.view().seats.len() == LINK_ROOM {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert!(guest.connected(), "guest {index} did not join");
+                    for _ in 0..40 {
+                        guest.service(&mut bus);
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                })
+            })
+            .collect();
+        let mut bus = Bus::new();
+        let mut line = String::new();
+        for _ in 0..100 {
+            host.service(&mut bus);
+            line = host.view().line.clone();
+            if line.contains(&format!("5/{LINK_ROOM}")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(line.contains(&format!("5/{LINK_ROOM}")), "{line}");
+        let named = host
+            .view()
+            .seats
+            .iter()
+            .filter(|seat| !seat.name.is_empty())
+            .count();
+        assert_eq!(named, 5);
+        for guest in guests {
+            guest.join().expect("guest");
+        }
     }
 }
