@@ -10,6 +10,7 @@ use crate::ppu::{
     latch_span, next_paint, scan_at, Affine, DirtyLines, Frame, Sample, CYCLES_PER_FRAME,
     CYCLES_PER_LINE, LINES_PER_FRAME, VISIBLE_CYCLES, VISIBLE_LINES,
 };
+use crate::rtc::Rtc;
 use crate::sched::{EventKind, Scheduler};
 use crate::sound::{sample_hz, sample_period, Sampler};
 use crate::timer::Timers;
@@ -78,6 +79,9 @@ pub struct Bus {
     sound_mode: u32,
     sound_vsync: bool,
     backup: Backup,
+    /// 卡带实时时钟。老的即时存档没有这块，读进来按掉电处理。
+    #[serde(default)]
+    rtc: Rtc,
     /// 下一次定时器、消隐、采样。空档里只把拍数加上去。
     scheduler: Scheduler,
     /// 译过的指令。命中不再拆位域，执行还是解释。
@@ -124,6 +128,7 @@ impl Bus {
             sound_mode: 0,
             sound_vsync: true,
             backup: Backup::new(),
+            rtc: Rtc::default(),
             scheduler: Scheduler::new(),
             icache: ICache::new(),
             dirty: DirtyLines::new(),
@@ -165,6 +170,29 @@ impl Bus {
 
     pub fn backup_dirty(&self) -> bool {
         self.backup.dirty()
+    }
+
+    /// 游戏改过时钟之后的偏移。没改过就是 `None`，旁边不用写 `.rtc`。
+    pub fn rtc_bytes(&self) -> Option<Vec<u8>> {
+        if self.rtc.dirty() {
+            Some(self.rtc.bytes())
+        } else {
+            None
+        }
+    }
+
+    pub fn load_rtc(&mut self, bytes: &[u8]) -> bool {
+        self.rtc.load(bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_rtc_unix(&mut self, unix: i64) {
+        self.rtc.set_unix(unix);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rtc_dirty(&self) -> bool {
+        self.rtc.dirty()
     }
 
     // 左声道、右声道。主开关关掉时是 `(0, 0)`
@@ -361,7 +389,6 @@ impl Bus {
         self.sound_mode = mode;
     }
 
-    #[cfg(test)]
     pub(crate) fn sound_vsync(&self) -> bool {
         self.sound_vsync
     }
@@ -1021,11 +1048,16 @@ impl Bus {
             0x05 => self.palette[(addr as usize) & (PALETTE - 1)],
             0x06 => self.vram[vram_index(addr)],
             0x07 => self.oam[(addr as usize) & (OAM - 1)],
-            0x08..=0x0D => self
-                .rom
-                .get((addr as usize) & 0x01FF_FFFF)
-                .copied()
-                .unwrap_or(0),
+            0x08..=0x0D => {
+                if let Some(value) = self.rtc.read(addr) {
+                    value
+                } else {
+                    self.rom
+                        .get((addr as usize) & 0x01FF_FFFF)
+                        .copied()
+                        .unwrap_or(0)
+                }
+            }
             0x0E => self.backup.read(addr),
             _ => 0,
         }
@@ -1081,6 +1113,7 @@ impl Bus {
                     self.gfx.invalidate_sprite_lines();
                 }
             }
+            0x08..=0x0D => self.rtc.write(addr, value),
             0x0E => self.backup.write(addr, value),
             _ => {}
         }

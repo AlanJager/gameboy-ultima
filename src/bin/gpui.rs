@@ -3042,6 +3042,12 @@ fn load_cart(path: PathBuf) -> Result<ActiveCart, String> {
             .map_err(|error| format!("读不到存档 {}：{error}", sav_path.display()))?;
         bus.load_backup(&bytes);
     }
+    let rtc_path = path.with_extension("rtc");
+    if rtc_path.is_file() {
+        let bytes = std::fs::read(&rtc_path)
+            .map_err(|error| format!("读不到时钟 {}：{error}", rtc_path.display()))?;
+        bus.load_rtc(&bytes);
+    }
     let mut regs = Registers::arm_start(0x0800_0000);
     regs.set_boot_stacks();
     let (title, game_code) = rom_metadata(&rom, &path);
@@ -3402,12 +3408,17 @@ fn read_state(
 }
 
 fn save_cart(cart: &ActiveCart) -> Result<(), String> {
-    if !cart.bus.backup_dirty() {
-        return Ok(());
+    if cart.bus.backup_dirty() {
+        let sav_path = cart.path.with_extension("sav");
+        std::fs::write(&sav_path, cart.bus.backup_bytes())
+            .map_err(|error| format!("写存档 {} 失败：{error}", sav_path.display()))?;
     }
-    let sav_path = cart.path.with_extension("sav");
-    std::fs::write(&sav_path, cart.bus.backup_bytes())
-        .map_err(|error| format!("写存档 {} 失败：{error}", sav_path.display()))
+    if let Some(bytes) = cart.bus.rtc_bytes() {
+        let rtc_path = cart.path.with_extension("rtc");
+        std::fs::write(&rtc_path, bytes)
+            .map_err(|error| format!("写时钟 {} 失败：{error}", rtc_path.display()))?;
+    }
+    Ok(())
 }
 
 fn frame_to_rgba(frame: &gameboy_ultima::Frame) -> Vec<u8> {
