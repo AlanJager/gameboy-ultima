@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 use gilrs::{Axis, Button, Gilrs};
 use serde::{Deserialize, Serialize};
@@ -122,15 +123,17 @@ impl PadButton {
 pub(crate) enum Hotkey {
     QuickSave,
     QuickLoad,
+    FastForward,
 }
 
 impl Hotkey {
-    pub(crate) const ALL: [Self; 2] = [Self::QuickSave, Self::QuickLoad];
+    pub(crate) const ALL: [Self; 3] = [Self::QuickSave, Self::QuickLoad, Self::FastForward];
 
     pub(crate) fn index(self) -> usize {
         match self {
             Self::QuickSave => 0,
             Self::QuickLoad => 1,
+            Self::FastForward => 2,
         }
     }
 
@@ -138,6 +141,7 @@ impl Hotkey {
         match self {
             Self::QuickSave => "快速存档",
             Self::QuickLoad => "快速读档",
+            Self::FastForward => "按住加速",
         }
     }
 
@@ -145,6 +149,7 @@ impl Hotkey {
         match self {
             Self::QuickSave => "quick_save",
             Self::QuickLoad => "quick_load",
+            Self::FastForward => "fast_forward",
         }
     }
 
@@ -152,6 +157,7 @@ impl Hotkey {
         match self {
             Self::QuickSave => "hotkey-quick-save",
             Self::QuickLoad => "hotkey-quick-load",
+            Self::FastForward => "hotkey-fast-forward",
         }
     }
 }
@@ -181,7 +187,7 @@ impl BindingTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KeyMap {
     keys: [String; 11],
-    hotkeys: [String; 2],
+    hotkeys: [String; 3],
 }
 
 impl Default for KeyMap {
@@ -200,7 +206,7 @@ impl Default for KeyMap {
                 "a".into(),
                 "r".into(),
             ],
-            hotkeys: ["f5".into(), "f8".into()],
+            hotkeys: ["f5".into(), "f8".into(), "tab".into()],
         }
     }
 }
@@ -256,10 +262,66 @@ impl KeyMap {
     }
 }
 
+pub(crate) const SPEEDS: [u8; 6] = [1, 2, 3, 4, 5, 8];
+pub(crate) const DEFAULT_SPEED: u8 = 1;
+pub(crate) const DEFAULT_TURBO: u8 = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SavedControls {
+    pub(crate) map: KeyMap,
+    pub(crate) speed: u8,
+    pub(crate) turbo: u8,
+}
+
+impl Default for SavedControls {
+    fn default() -> Self {
+        Self {
+            map: KeyMap::default(),
+            speed: DEFAULT_SPEED,
+            turbo: DEFAULT_TURBO,
+        }
+    }
+}
+
+pub(crate) fn normalize_speed(speed: u8) -> u8 {
+    if SPEEDS.contains(&speed) {
+        speed
+    } else {
+        DEFAULT_SPEED
+    }
+}
+
+pub(crate) fn normalize_turbo(speed: u8) -> u8 {
+    if SPEEDS.contains(&speed) {
+        speed
+    } else {
+        DEFAULT_TURBO
+    }
+}
+
+/// 锁定速度一直生效。按住加速键时，用锁定速度和加速档里更高的一档。
+pub(crate) fn effective_speed(locked: u8, turbo: u8, holding: bool) -> u8 {
+    let locked = normalize_speed(locked);
+    let turbo = normalize_turbo(turbo);
+    if holding {
+        locked.max(turbo)
+    } else {
+        locked
+    }
+}
+
+pub(crate) fn frame_pace(base: Duration, speed: u8) -> Duration {
+    base / u32::from(speed.max(1))
+}
+
 #[derive(Serialize, Deserialize)]
 struct ControlsFile {
     version: u8,
     bindings: HashMap<String, String>,
+    #[serde(default)]
+    speed: u8,
+    #[serde(default)]
+    turbo: u8,
 }
 
 pub(crate) fn normalize_key(key: &str) -> String {
@@ -456,9 +518,9 @@ pub(crate) fn key_label(key: &str) -> String {
     }
 }
 
-pub(crate) fn read_controls(path: &Path) -> Result<KeyMap, String> {
+pub(crate) fn read_controls(path: &Path) -> Result<SavedControls, String> {
     if !path.exists() {
-        return Ok(KeyMap::default());
+        return Ok(SavedControls::default());
     }
     let bytes = std::fs::read(path)
         .map_err(|error| format!("读取键位 {} 失败：{error}", path.display()))?;
@@ -487,7 +549,11 @@ pub(crate) fn read_controls(path: &Path) -> Result<KeyMap, String> {
     for hotkey in Hotkey::ALL {
         claim_saved_key(&mut map.hotkeys[hotkey.index()], &mut seen);
     }
-    Ok(map)
+    Ok(SavedControls {
+        map,
+        speed: normalize_speed(file.speed),
+        turbo: normalize_turbo(file.turbo),
+    })
 }
 
 fn apply_saved_key(slot: &mut String, key: &str) {
@@ -510,21 +576,26 @@ fn claim_saved_key(slot: &mut String, seen: &mut Vec<String>) {
     }
 }
 
-pub(crate) fn write_controls(path: &Path, map: &KeyMap) -> Result<(), String> {
+pub(crate) fn write_controls(path: &Path, saved: &SavedControls) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("创建键位目录 {} 失败：{error}", parent.display()))?;
     }
     let mut bindings: HashMap<String, String> = PadButton::ALL
         .into_iter()
-        .map(|button| (button.id().to_string(), map.key(button).to_string()))
+        .map(|button| (button.id().to_string(), saved.map.key(button).to_string()))
         .collect();
     for hotkey in Hotkey::ALL {
-        bindings.insert(hotkey.id().to_string(), map.hotkey(hotkey).to_string());
+        bindings.insert(
+            hotkey.id().to_string(),
+            saved.map.hotkey(hotkey).to_string(),
+        );
     }
     let bytes = serde_json::to_vec_pretty(&ControlsFile {
         version: 1,
         bindings,
+        speed: normalize_speed(saved.speed),
+        turbo: normalize_turbo(saved.turbo),
     })
     .map_err(|error| format!("写入键位失败：{error}"))?;
     std::fs::write(path, bytes)
@@ -656,6 +727,21 @@ mod tests {
     }
 
     #[test]
+    fn locked_speed_stays_on_and_the_held_key_uses_the_faster_ratio() {
+        assert_eq!(effective_speed(1, 4, false), 1);
+        assert_eq!(effective_speed(1, 4, true), 4);
+        assert_eq!(effective_speed(2, 8, true), 8);
+        assert_eq!(effective_speed(8, 4, true), 8);
+        assert_eq!(effective_speed(2, 2, true), 2);
+        assert_eq!(effective_speed(0, 7, false), DEFAULT_SPEED);
+        assert_eq!(effective_speed(0, 7, true), DEFAULT_TURBO);
+        let base = Duration::from_millis(16);
+        assert_eq!(frame_pace(base, 1), base);
+        assert_eq!(frame_pace(base, 4), Duration::from_millis(4));
+        assert_eq!(frame_pace(base, 0), base);
+    }
+
+    #[test]
     fn a_missing_gamepad_context_holds_nothing() {
         assert_eq!(poll_gamepad(&mut None), 0);
     }
@@ -692,19 +778,33 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("controls.json");
-        write_controls(&path, &map).unwrap();
+        write_controls(
+            &path,
+            &SavedControls {
+                map: map.clone(),
+                speed: 2,
+                turbo: 8,
+            },
+        )
+        .unwrap();
         let loaded = read_controls(&path).unwrap();
-        assert_eq!(loaded.key(PadButton::B), "k");
-        assert_eq!(loaded.key(PadButton::A), "");
-        assert_eq!(loaded.key(PadButton::Reset), "r");
-        assert_eq!(loaded.hotkey(Hotkey::QuickSave), "f5");
-        assert_eq!(loaded.hotkey(Hotkey::QuickLoad), "f8");
+        assert_eq!(loaded.speed, 2);
+        assert_eq!(loaded.turbo, 8);
+        assert_eq!(loaded.map.key(PadButton::B), "k");
+        assert_eq!(loaded.map.key(PadButton::A), "");
+        assert_eq!(loaded.map.key(PadButton::Reset), "r");
+        assert_eq!(loaded.map.hotkey(Hotkey::QuickSave), "f5");
+        assert_eq!(loaded.map.hotkey(Hotkey::QuickLoad), "f8");
+        assert_eq!(loaded.map.hotkey(Hotkey::FastForward), "tab");
         let legacy = dir.join("legacy.json");
         std::fs::write(&legacy, r#"{"version":1,"bindings":{"a":"k"}}"#).unwrap();
         let legacy = read_controls(&legacy).unwrap();
-        assert_eq!(legacy.key(PadButton::A), "k");
-        assert_eq!(legacy.hotkey(Hotkey::QuickSave), "f5");
-        assert_eq!(legacy.hotkey(Hotkey::QuickLoad), "f8");
+        assert_eq!(legacy.speed, DEFAULT_SPEED);
+        assert_eq!(legacy.turbo, DEFAULT_TURBO);
+        assert_eq!(legacy.map.key(PadButton::A), "k");
+        assert_eq!(legacy.map.hotkey(Hotkey::QuickSave), "f5");
+        assert_eq!(legacy.map.hotkey(Hotkey::QuickLoad), "f8");
+        assert_eq!(legacy.map.hotkey(Hotkey::FastForward), "tab");
         assert_eq!(key_label("left"), "←");
         assert_eq!(key_label("f5"), "F5");
         assert_eq!(key_label(""), "未设置");
@@ -733,7 +833,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let missing = dir.join("missing.json");
-        assert_eq!(read_controls(&missing).unwrap(), KeyMap::default());
+        assert_eq!(read_controls(&missing).unwrap(), SavedControls::default());
 
         let duplicate = dir.join("duplicate.json");
         std::fs::write(
@@ -742,9 +842,9 @@ mod tests {
         )
         .unwrap();
         let loaded = read_controls(&duplicate).unwrap();
-        assert_eq!(loaded.key(PadButton::A), "k");
-        assert_eq!(loaded.key(PadButton::B), "");
-        assert_eq!(loaded.hotkey(Hotkey::QuickSave), "");
+        assert_eq!(loaded.map.key(PadButton::A), "k");
+        assert_eq!(loaded.map.key(PadButton::B), "");
+        assert_eq!(loaded.map.hotkey(Hotkey::QuickSave), "");
 
         let cleared = dir.join("cleared.json");
         std::fs::write(
@@ -753,11 +853,11 @@ mod tests {
         )
         .unwrap();
         let loaded = read_controls(&cleared).unwrap();
-        assert_eq!(loaded.key(PadButton::A), "");
-        assert_eq!(loaded.key(PadButton::B), "z");
-        assert_eq!(loaded.key(PadButton::Right), "left");
-        assert_eq!(loaded.key(PadButton::Left), "");
-        assert_eq!(game_key_mask("left", &loaded), Some(1 << 4));
+        assert_eq!(loaded.map.key(PadButton::A), "");
+        assert_eq!(loaded.map.key(PadButton::B), "z");
+        assert_eq!(loaded.map.key(PadButton::Right), "left");
+        assert_eq!(loaded.map.key(PadButton::Left), "");
+        assert_eq!(game_key_mask("left", &loaded.map), Some(1 << 4));
 
         let broken = dir.join("broken.json");
         std::fs::write(&broken, "{").unwrap();

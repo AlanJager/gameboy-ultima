@@ -34,6 +34,7 @@ struct Control {
     produced: AtomicU64,
     overruns: AtomicU64,
     consumed: AtomicU64,
+    discard: AtomicBool,
 }
 
 /// 模拟和播放之间的那条路。克隆只是多一个把手，环还是同一个。
@@ -58,6 +59,8 @@ const AUDIO_CAP: usize = 8192;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Sampler {
     accum: u32,
+    #[serde(default)]
+    muted: bool,
     #[serde(skip, default = "state_audio_link")]
     link: AudioLink,
 }
@@ -75,6 +78,7 @@ impl AudioLink {
                 produced: AtomicU64::new(0),
                 overruns: AtomicU64::new(0),
                 consumed: AtomicU64::new(0),
+                discard: AtomicBool::new(false),
             }),
             data: Arc::new(Ring::new(capacity)),
         }
@@ -89,6 +93,22 @@ impl AudioLink {
         } else {
             self.control.overruns.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// 模拟线程请求播放端丢掉积压。环仍然只有播放端在取。
+    fn request_discard(&self) {
+        self.control.discard.store(true, Ordering::Release);
+    }
+
+    /// 播放端丢掉积压并清掉请求。返回这次是不是真的清过。
+    fn acknowledge_discard(&self) -> bool {
+        if !self.control.discard.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        while self.data.pop().is_some() {
+            self.control.consumed.fetch_add(1, Ordering::Relaxed);
+        }
+        true
     }
 
     /// 播放端取走最早的一帧。
@@ -293,6 +313,10 @@ fn fill_output<T: Copy>(
         return;
     }
     let volume = i32::from(volume.load(Ordering::Relaxed).min(100));
+    if link.acknowledge_discard() {
+        state.last = Sample::default();
+        state.phase = 0;
+    }
     for frame in output.chunks_exact_mut(channels) {
         state.phase += u64::from(link.hz());
         while state.phase >= u64::from(output_hz) {
@@ -331,6 +355,7 @@ fn signed_sample(sample: Sample, bias: u16) -> Sample {
 }
 
 fn drain(link: &AudioLink, taken: &Mutex<Vec<Sample>>, collect: bool) -> bool {
+    let _ = link.acknowledge_discard();
     let mut any = false;
     while let Some(sample) = link.pop() {
         any = true;
@@ -345,8 +370,17 @@ impl Sampler {
     pub(crate) fn new() -> Self {
         Self {
             accum: 0,
+            muted: false,
             link: AudioLink::new(AUDIO_CAP),
         }
+    }
+
+    pub(crate) fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+    }
+
+    pub(crate) fn discard(&self) {
+        self.link.request_discard();
     }
 
     pub(crate) fn accum(&self) -> u32 {
@@ -358,6 +392,10 @@ impl Sampler {
     }
 
     pub(crate) fn latch(&mut self, level: (i16, i16), bias: u16) {
+        if self.muted {
+            self.accum = 0;
+            return;
+        }
         self.link.produce(
             Sample {
                 left: pwm(level.0, bias),
@@ -447,6 +485,21 @@ mod tests {
         bus.write_u16(SOUND + 0x84, 0x0080);
         bus.write_u16(SOUND + 0x80, (1 << 9) | 0x0077);
         bus.write_u16(SOUND + 0x82, 2);
+    }
+
+    #[test]
+    fn a_muted_sampler_drops_pending_audio_and_produces_nothing() {
+        let mut sampler = Sampler::new();
+        sampler.latch((0, 0), 0x200);
+        assert_eq!(sampler.samples().0.len(), 1);
+        sampler.set_muted(true);
+        sampler.discard();
+        assert!(sampler.link().acknowledge_discard());
+        sampler.latch((100, 100), 0x200);
+        assert!(sampler.samples().0.is_empty());
+        sampler.set_muted(false);
+        sampler.latch((0, 0), 0x200);
+        assert_eq!(sampler.samples().0.len(), 1);
     }
 
     #[test]

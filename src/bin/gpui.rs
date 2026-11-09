@@ -78,6 +78,14 @@ actions!(
     ]
 );
 
+#[derive(Clone, PartialEq, Eq, Debug, gpui::Action)]
+#[action(namespace = ultima, no_json)]
+struct SetLockedSpeed(u8);
+
+#[derive(Clone, PartialEq, Eq, Debug, gpui::Action)]
+#[action(namespace = ultima, no_json)]
+struct SetTurboSpeed(u8);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PictureMode {
     #[cfg(target_os = "macos")]
@@ -193,10 +201,11 @@ enum Command {
 }
 
 impl Hotkey {
-    fn command(self) -> Command {
+    fn command(self) -> Option<Command> {
         match self {
-            Self::QuickSave => Command::QuickSaveState,
-            Self::QuickLoad => Command::QuickLoadState,
+            Self::QuickSave => Some(Command::QuickSaveState),
+            Self::QuickLoad => Some(Command::QuickLoadState),
+            Self::FastForward => None,
         }
     }
 }
@@ -205,6 +214,18 @@ struct ControlSettings {
     open: bool,
     capturing: Option<BindingTarget>,
     map: KeyMap,
+    speed: u8,
+    turbo: u8,
+}
+
+impl ControlSettings {
+    fn saved(&self) -> SavedControls {
+        SavedControls {
+            map: self.map.clone(),
+            speed: self.speed,
+            turbo: self.turbo,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -255,6 +276,9 @@ struct AppView {
     snapshot: Arc<Mutex<Snapshot>>,
     commands: mpsc::Sender<Command>,
     keys: Arc<AtomicU16>,
+    locked_speed: Arc<AtomicU8>,
+    turbo_ratio: Arc<AtomicU8>,
+    turbo_held: Arc<AtomicBool>,
     focus_handle: FocusHandle,
     image_version: u64,
     picture: PictureMode,
@@ -284,6 +308,9 @@ impl AppView {
         snapshot: Arc<Mutex<Snapshot>>,
         commands: mpsc::Sender<Command>,
         keys: Arc<AtomicU16>,
+        locked_speed: Arc<AtomicU8>,
+        turbo_ratio: Arc<AtomicU8>,
+        turbo_held: Arc<AtomicBool>,
         library_mode: Arc<AtomicBool>,
         controls: Arc<Mutex<ControlSettings>>,
         windows_alive: Arc<AtomicUsize>,
@@ -307,6 +334,9 @@ impl AppView {
             snapshot,
             commands,
             keys,
+            locked_speed,
+            turbo_ratio,
+            turbo_held,
             focus_handle,
             image_version: 0,
             picture,
@@ -343,9 +373,14 @@ impl AppView {
         self.controls.lock().expect("control settings poisoned")
     }
 
+    fn release_turbo(&self) {
+        self.turbo_held.store(false, Ordering::Relaxed);
+    }
+
     fn begin_capture(&self, target: BindingTarget, cx: &mut Context<Self>) {
         self.controls_settings().capturing = Some(target);
         self.keys.store(0, Ordering::Relaxed);
+        self.release_turbo();
         cx.notify();
     }
 
@@ -355,24 +390,35 @@ impl AppView {
         settings.capturing = None;
         drop(settings);
         self.keys.store(0, Ordering::Relaxed);
+        self.release_turbo();
         cx.notify();
     }
 
     fn restore_default_controls(&self, cx: &mut Context<Self>) {
         let mut settings = self.controls_settings();
         settings.map = KeyMap::default();
+        settings.speed = DEFAULT_SPEED;
+        settings.turbo = DEFAULT_TURBO;
         settings.capturing = None;
-        let map = settings.map.clone();
+        let saved = settings.saved();
         drop(settings);
-        self.persist_controls(&map);
+        self.locked_speed.store(DEFAULT_SPEED, Ordering::Relaxed);
+        self.turbo_ratio.store(DEFAULT_TURBO, Ordering::Relaxed);
+        self.release_turbo();
+        self.persist_controls(&saved);
+        let picture_windows = Arc::clone(&self.picture_windows);
+        let controls = Arc::clone(&self.controls);
+        cx.defer(move |cx| {
+            refresh_picture_chrome(cx, &picture_windows, &controls);
+        });
         cx.notify();
     }
 
-    fn persist_controls(&self, map: &KeyMap) {
+    fn persist_controls(&self, saved: &SavedControls) {
         let Ok(path) = controls_file_path() else {
             return;
         };
-        if let Err(error) = write_controls(&path, map) {
+        if let Err(error) = write_controls(&path, saved) {
             let _ = self.commands.send(Command::Error(error));
         }
     }
@@ -393,6 +439,7 @@ impl AppView {
                 settings.open = false;
                 drop(settings);
                 self.keys.store(0, Ordering::Relaxed);
+                self.release_turbo();
                 cx.notify();
                 return;
             }
@@ -402,9 +449,9 @@ impl AppView {
                 }
                 settings.map.bind_target(target, &key);
                 settings.capturing = None;
-                let map = settings.map.clone();
+                let saved = settings.saved();
                 drop(settings);
-                self.persist_controls(&map);
+                self.persist_controls(&saved);
                 cx.notify();
             }
             return;
@@ -418,8 +465,14 @@ impl AppView {
             return;
         }
         if let Some(hotkey) = map.hotkey_for_key(&key) {
+            if hotkey == Hotkey::FastForward {
+                self.turbo_held.store(true, Ordering::Relaxed);
+                return;
+            }
             if !event.is_held {
-                let _ = self.commands.send(hotkey.command());
+                if let Some(command) = hotkey.command() {
+                    let _ = self.commands.send(command);
+                }
             }
             return;
         }
@@ -428,11 +481,15 @@ impl AppView {
 
     fn handle_key_up(&self, event: &KeyUpEvent) {
         let settings = self.controls_settings();
-        if settings.open {
-            return;
-        }
+        let open = settings.open;
         let map = settings.map.clone();
         drop(settings);
+        if map.hotkey_for_key(&event.keystroke.key) == Some(Hotkey::FastForward) {
+            self.release_turbo();
+        }
+        if open {
+            return;
+        }
         self.set_key_bit(&event.keystroke.key, &map, false);
     }
 
@@ -784,8 +841,9 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.chrome_dirty.swap(false, Ordering::AcqRel) {
             let picture_windows = Arc::clone(&self.picture_windows);
+            let controls = Arc::clone(&self.controls);
             window.defer(cx, move |_, cx| {
-                refresh_picture_chrome(cx, &picture_windows);
+                refresh_picture_chrome(cx, &picture_windows, &controls);
             });
         }
         let (
@@ -880,6 +938,11 @@ impl Render for AppView {
             let settings = self.controls_settings();
             (settings.open, settings.capturing, settings.map.clone())
         };
+        let speed_now = effective_speed(
+            self.locked_speed.load(Ordering::Relaxed),
+            self.turbo_ratio.load(Ordering::Relaxed),
+            self.turbo_held.load(Ordering::Relaxed),
+        );
 
         let screen = self.game_picture(screen_w, screen_h, screen_scale);
         let content = if !self.compare && self.library_mode.load(Ordering::Relaxed) {
@@ -889,6 +952,7 @@ impl Render for AppView {
                 .size_full()
                 .relative()
                 .child(letterboxed_screen(screen, screen_h))
+                .when(speed_now > 1, |game| game.child(speed_badge(speed_now)))
                 .when_some(error, |content, message| {
                     content.child(
                         div()
@@ -1299,12 +1363,12 @@ fn controls_file_path() -> Result<PathBuf, String> {
     Ok(application_data_dir()?.join("controls.json"))
 }
 
-fn load_saved_controls() -> KeyMap {
+fn load_saved_controls() -> SavedControls {
     match controls_file_path().and_then(|path| read_controls(&path)) {
-        Ok(map) => map,
+        Ok(saved) => saved,
         Err(error) => {
             eprintln!("{error}");
-            KeyMap::default()
+            SavedControls::default()
         }
     }
 }
@@ -1562,6 +1626,7 @@ fn function_bindings(
         .gap(px(22.))
         .child(named_hotkey(cx, map, capturing, Hotkey::QuickSave))
         .child(named_hotkey(cx, map, capturing, Hotkey::QuickLoad))
+        .child(named_hotkey(cx, map, capturing, Hotkey::FastForward))
 }
 
 fn named_hotkey(
@@ -1619,7 +1684,25 @@ fn key_field(
         )
 }
 
-fn start_emulator() -> (
+fn speed_badge(speed: u8) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(12.))
+        .right(px(12.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(4.))
+        .bg(rgb(PANEL_HI))
+        .text_color(rgb(ACCENT))
+        .text_sm()
+        .child(format!("{speed}×"))
+}
+
+fn start_emulator(
+    locked_speed: Arc<AtomicU8>,
+    turbo_ratio: Arc<AtomicU8>,
+    turbo_held: Arc<AtomicBool>,
+) -> (
     Arc<Mutex<Snapshot>>,
     mpsc::Sender<Command>,
     Arc<AtomicU16>,
@@ -1649,6 +1732,9 @@ fn start_emulator() -> (
     let worker_keys = Arc::clone(&keys);
     let worker_audio_volume = Arc::clone(&audio_volume);
     let worker_library_path = library_path;
+    let worker_locked_speed = Arc::clone(&locked_speed);
+    let worker_turbo_ratio = Arc::clone(&turbo_ratio);
+    let worker_turbo_held = Arc::clone(&turbo_held);
     let worker = thread::Builder::new()
         .name("ultima-emulator".into())
         .stack_size(8 * 1024 * 1024)
@@ -1659,6 +1745,9 @@ fn start_emulator() -> (
                 worker_keys,
                 worker_audio_volume,
                 worker_library_path,
+                worker_locked_speed,
+                worker_turbo_ratio,
+                worker_turbo_held,
             )
         })
         .expect("start emulator worker");
@@ -1671,6 +1760,9 @@ fn emulator_worker(
     keys: Arc<AtomicU16>,
     audio_volume: Arc<AtomicU8>,
     library_path: Option<PathBuf>,
+    locked_speed: Arc<AtomicU8>,
+    turbo_ratio: Arc<AtomicU8>,
+    turbo_held: Arc<AtomicBool>,
 ) {
     let mut cart: Option<ActiveCart> = None;
     let mut audio: Option<AudioPlay> = None;
@@ -1712,6 +1804,16 @@ fn emulator_worker(
             }
             continue;
         }
+
+        let speed = effective_speed(
+            locked_speed.load(Ordering::Relaxed),
+            turbo_ratio.load(Ordering::Relaxed),
+            turbo_held.load(Ordering::Relaxed),
+        );
+        cart.as_mut()
+            .expect("running cart exists")
+            .bus
+            .set_fast_forward(speed > 1);
 
         let frame_end = cart
             .as_ref()
@@ -1797,11 +1899,12 @@ fn emulator_worker(
         state.rgba = rgba;
         drop(state);
 
-        next_frame_deadline += frame_interval;
+        let pace = frame_pace(frame_interval, speed);
+        next_frame_deadline += pace;
         let now = Instant::now();
         if next_frame_deadline > now {
             thread::sleep(next_frame_deadline - now);
-        } else if now.duration_since(next_frame_deadline) > frame_interval {
+        } else if now.duration_since(next_frame_deadline) > pace {
             next_frame_deadline = now;
         }
     }
@@ -2572,7 +2675,25 @@ fn picture_menu_item(mode: PictureMode, open: bool) -> MenuItem {
     }
 }
 
-fn app_menus(open: &[PictureMode]) -> Vec<Menu> {
+fn speed_choice_menu(name: &'static str, selected: u8, locked: bool) -> MenuItem {
+    let items = SPEEDS
+        .into_iter()
+        .map(|speed| {
+            let label = picture_option_label(&format!("{speed}×"), speed == selected);
+            if locked {
+                MenuItem::action(label, SetLockedSpeed(speed))
+            } else {
+                MenuItem::action(label, SetTurboSpeed(speed))
+            }
+        })
+        .collect();
+    MenuItem::submenu(Menu {
+        name: name.into(),
+        items,
+    })
+}
+
+fn app_menus(open: &[PictureMode], speed: u8, turbo: u8) -> Vec<Menu> {
     let mut compare_items: Vec<MenuItem> = picture_modes()
         .into_iter()
         .map(|mode| picture_menu_item(mode, open.contains(&mode)))
@@ -2618,6 +2739,8 @@ fn app_menus(open: &[PictureMode]) -> Vec<Menu> {
             items: vec![
                 MenuItem::action("暂停 / 继续", TogglePause),
                 MenuItem::action("复位", ResetConsole),
+                speed_choice_menu("速度", speed, true),
+                speed_choice_menu("按住加速", turbo, false),
                 MenuItem::action("键位设置…", ShowControls),
                 MenuItem::action("切换 BIOS HLE", ToggleBiosHle),
                 MenuItem::separator(),
@@ -2795,6 +2918,9 @@ struct WindowLaunch {
     snapshot: Arc<Mutex<Snapshot>>,
     commands: mpsc::Sender<Command>,
     keys: Arc<AtomicU16>,
+    locked_speed: Arc<AtomicU8>,
+    turbo_ratio: Arc<AtomicU8>,
+    turbo_held: Arc<AtomicBool>,
     library_mode: Arc<AtomicBool>,
     controls: Arc<Mutex<ControlSettings>>,
     windows_alive: Arc<AtomicUsize>,
@@ -3064,6 +3190,9 @@ fn open_game_window(
                     launch.snapshot,
                     launch.commands,
                     launch.keys,
+                    Arc::clone(&launch.locked_speed),
+                    Arc::clone(&launch.turbo_ratio),
+                    Arc::clone(&launch.turbo_held),
                     launch.library_mode,
                     launch.controls,
                     launch.windows_alive,
@@ -3135,7 +3264,33 @@ fn open_picture_mode(cx: &mut App, mode: PictureMode, launch: &WindowLaunch) {
         .insert(mode, PictureSlot { token, handle });
 }
 
-fn refresh_picture_chrome(cx: &mut App, picture_windows: &Mutex<PictureWindows>) {
+fn apply_speed_choice(launch: &WindowLaunch, locked: Option<u8>, turbo: Option<u8>) {
+    let mut settings = launch.controls.lock().expect("control settings poisoned");
+    if let Some(speed) = locked {
+        let speed = normalize_speed(speed);
+        settings.speed = speed;
+        launch.locked_speed.store(speed, Ordering::Relaxed);
+    }
+    if let Some(speed) = turbo {
+        let speed = normalize_turbo(speed);
+        settings.turbo = speed;
+        launch.turbo_ratio.store(speed, Ordering::Relaxed);
+    }
+    let saved = settings.saved();
+    drop(settings);
+    let Ok(path) = controls_file_path() else {
+        return;
+    };
+    if let Err(error) = write_controls(&path, &saved) {
+        let _ = launch.commands.send(Command::Error(error));
+    }
+}
+
+fn refresh_picture_chrome(
+    cx: &mut App,
+    picture_windows: &Mutex<PictureWindows>,
+    controls: &Mutex<ControlSettings>,
+) {
     let live = {
         let windows = picture_windows.lock().expect("picture windows poisoned");
         picture_candidates(&windows)
@@ -3182,7 +3337,11 @@ fn refresh_picture_chrome(cx: &mut App, picture_windows: &Mutex<PictureWindows>)
         });
     }
     let open = live.iter().map(|(mode, _)| *mode).collect::<Vec<_>>();
-    cx.set_menus(app_menus(&open));
+    let (speed, turbo) = {
+        let settings = controls.lock().expect("control settings poisoned");
+        (settings.speed, settings.turbo)
+    };
+    cx.set_menus(app_menus(&open, speed, turbo));
 }
 
 fn toggle_picture(cx: &mut App, mode: PictureMode, launch: &WindowLaunch) {
@@ -3218,7 +3377,7 @@ fn toggle_picture(cx: &mut App, mode: PictureMode, launch: &WindowLaunch) {
                     cx.notify();
                 });
             }
-            refresh_picture_chrome(cx, &launch.picture_windows);
+            refresh_picture_chrome(cx, &launch.picture_windows, &launch.controls);
         }
         PictureToggle::Close => {
             let slot = launch
@@ -3257,11 +3416,11 @@ fn toggle_picture(cx: &mut App, mode: PictureMode, launch: &WindowLaunch) {
                     .handle
                     .update(cx, |_, window, _| window.remove_window());
             }
-            refresh_picture_chrome(cx, &launch.picture_windows);
+            refresh_picture_chrome(cx, &launch.picture_windows, &launch.controls);
         }
         PictureToggle::Open => {
             open_picture_mode(cx, mode, launch);
-            refresh_picture_chrome(cx, &launch.picture_windows);
+            refresh_picture_chrome(cx, &launch.picture_windows, &launch.controls);
         }
     }
 }
@@ -3281,11 +3440,19 @@ fn open_screen_comparison(cx: &mut App, launch: &WindowLaunch) {
             open_picture_mode(cx, mode, launch);
         }
     }
-    refresh_picture_chrome(cx, &launch.picture_windows);
+    refresh_picture_chrome(cx, &launch.picture_windows, &launch.controls);
 }
 
 fn main() {
-    let (snapshot, commands, keys, audio_volume, worker) = start_emulator();
+    let saved = load_saved_controls();
+    let locked_speed = Arc::new(AtomicU8::new(saved.speed));
+    let turbo_ratio = Arc::new(AtomicU8::new(saved.turbo));
+    let turbo_held = Arc::new(AtomicBool::new(false));
+    let (snapshot, commands, keys, audio_volume, worker) = start_emulator(
+        Arc::clone(&locked_speed),
+        Arc::clone(&turbo_ratio),
+        Arc::clone(&turbo_held),
+    );
     let (launch_rom, compare_on_launch) = launch_arguments();
     if let Some(path) = &launch_rom {
         let _ = commands.send(Command::Load(path.clone()));
@@ -3294,12 +3461,17 @@ fn main() {
     let controls = Arc::new(Mutex::new(ControlSettings {
         open: false,
         capturing: None,
-        map: load_saved_controls(),
+        map: saved.map,
+        speed: saved.speed,
+        turbo: saved.turbo,
     }));
     let launch = WindowLaunch {
         snapshot: Arc::clone(&snapshot),
         commands: commands.clone(),
         keys: Arc::clone(&keys),
+        locked_speed,
+        turbo_ratio,
+        turbo_held: Arc::clone(&turbo_held),
         library_mode: Arc::clone(&library_mode),
         controls: Arc::clone(&controls),
         windows_alive: Arc::new(AtomicUsize::new(0)),
@@ -3377,8 +3549,22 @@ fn main() {
             open_screen_comparison(cx, &launch_all);
         });
         if !compare_on_launch {
-            cx.set_menus(app_menus(&[main_mode]));
+            let (speed, turbo) = {
+                let settings = launch.controls.lock().expect("control settings poisoned");
+                (settings.speed, settings.turbo)
+            };
+            cx.set_menus(app_menus(&[main_mode], speed, turbo));
         }
+        let speed_launch = launch.clone();
+        cx.on_action(move |action: &SetLockedSpeed, cx| {
+            apply_speed_choice(&speed_launch, Some(action.0), None);
+            refresh_picture_chrome(cx, &speed_launch.picture_windows, &speed_launch.controls);
+        });
+        let turbo_launch = launch.clone();
+        cx.on_action(move |action: &SetTurboSpeed, cx| {
+            apply_speed_choice(&turbo_launch, None, Some(action.0));
+            refresh_picture_chrome(cx, &turbo_launch.picture_windows, &turbo_launch.controls);
+        });
         cx.bind_keys([
             KeyBinding::new("cmd-o", OpenRom, None),
             KeyBinding::new("cmd-shift-o", ShowLibrary, None),
@@ -3413,12 +3599,14 @@ fn main() {
         });
         let show_controls = Arc::clone(&controls);
         let show_keys = Arc::clone(&keys);
+        let show_turbo = Arc::clone(&turbo_held);
         cx.on_action(move |_: &ShowControls, cx| {
             let mut settings = show_controls.lock().expect("control settings poisoned");
             settings.open = true;
             settings.capturing = None;
             drop(settings);
             show_keys.store(0, Ordering::Relaxed);
+            show_turbo.store(false, Ordering::Relaxed);
             cx.refresh_windows();
         });
         let bios_commands = menu_commands.clone();

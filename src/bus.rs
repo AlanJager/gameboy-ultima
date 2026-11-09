@@ -924,6 +924,14 @@ impl Bus {
         cycles
     }
 
+    /// 加速时关掉采样并清掉已经进环的声音，避免满环之后一直播旧样本。
+    pub fn set_fast_forward(&mut self, fast: bool) {
+        self.sound.set_muted(fast);
+        if fast {
+            self.sound.discard();
+        }
+    }
+
     /// `pressed` 里 1 表示按下。低 10 位从低到高是 A、B、Select、Start、右、左、上、下、R、L。
     pub fn set_keys(&mut self, pressed: u16) {
         self.keys.set_pressed(pressed);
