@@ -1262,6 +1262,132 @@ mod tests {
         let text = format!("{:08X} {:08X}", slow.0, slow.1);
         let error = parse_cheat(CheatFamily::ActionReplay, &text).unwrap_err();
         assert!(error.contains("减速"), "{error}");
+        let disable = encrypt_gameshark(PAR_SEEDS, 0xC820_0000, 1);
+        let text = format!("{:08X} {:08X}", disable.0, disable.1);
+        let error = parse_cheat(CheatFamily::ActionReplay, &text).unwrap_err();
+        assert!(error.contains("关掉"), "{error}");
+        let open = encrypt_gameshark(PAR_SEEDS, 0, 0x4000_0000);
+        let text = format!("{:08X} {:08X}", open.0, open.1);
+        let error = parse_cheat(CheatFamily::ActionReplay, &text).unwrap_err();
+        assert!(error.contains("没有开头"), "{error}");
+        let dangling = encrypt_gameshark(PAR_SEEDS, 0, 0x8020_0000);
+        let text = format!("{:08X} {:08X}", dangling.0, dangling.1);
+        let error = parse_cheat(CheatFamily::ActionReplay, &text).unwrap_err();
+        assert!(error.contains("少了下一行"), "{error}");
+    }
+
+    #[test]
+    fn action_replay_v3_signed_compare_differs_from_unsigned_and_blocks_nest() {
+        let program = ar(&[
+            (0x1C20_0000, 0),
+            (0x0020_0010, 0x0000_0011),
+            (0x2C20_0000, 0),
+            (0x0020_0011, 0x0000_0022),
+            (0x2420_0000, 0),
+            (0x0020_0012, 0x0000_0033),
+            (0x3820_0000, 0x0000_0001),
+            (0x0020_0013, 0x0000_0044),
+            (0x1020_0001, 0),
+            (0x0020_0014, 0x0000_0055),
+        ]);
+        let mut bus = Bus::new();
+        bus.write_u32(0x0200_0000, 0xFFFF_FFFF);
+        bus.write_u8(0x0200_0001, 0x0F);
+        program.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0010), 0x11);
+        assert_eq!(bus.read_u8(0x0200_0011), 0);
+        assert_eq!(bus.read_u8(0x0200_0012), 0);
+        assert_eq!(bus.read_u8(0x0200_0013), 0x44);
+        assert_eq!(bus.read_u8(0x0200_0014), 0x55);
+
+        let nested = ar(&[
+            (0x8820_0000, 1),
+            (0x0020_0020, 0x0000_00AA),
+            (0x8820_0001, 2),
+            (0x0020_0021, 0x0000_00BB),
+            (0, 0x4000_0000),
+            (0x0020_0022, 0x0000_00CC),
+            (0, 0x4000_0000),
+            (0x0020_0023, 0x0000_00DD),
+        ]);
+        let mut bus = Bus::new();
+        nested.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0020), 0);
+        assert_eq!(bus.read_u8(0x0200_0021), 0);
+        assert_eq!(bus.read_u8(0x0200_0022), 0);
+        assert_eq!(bus.read_u8(0x0200_0023), 0xDD);
+        bus.write_u8(0x0200_0000, 1);
+        nested.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0020), 0xAA);
+        assert_eq!(bus.read_u8(0x0200_0021), 0);
+        assert_eq!(bus.read_u8(0x0200_0022), 0xCC);
+        bus.write_u8(0x0200_0001, 2);
+        bus.write_u8(0x0200_0021, 0);
+        nested.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0021), 0xBB);
+
+        let empty_then = ar(&[
+            (0x8820_0000, 1),
+            (0, 0x6000_0000),
+            (0x0020_0030, 0x0000_0066),
+            (0, 0x4000_0000),
+        ]);
+        let mut bus = Bus::new();
+        empty_then.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0030), 0x66);
+        bus.write_u8(0x0200_0030, 0);
+        bus.write_u8(0x0200_0000, 1);
+        empty_then.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0030), 0);
+
+        let open_block = ar(&[(0x8820_0000, 1), (0x0020_0031, 0x0000_0055)]);
+        let mut bus = Bus::new();
+        open_block.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0031), 0);
+        bus.write_u8(0x0200_0000, 1);
+        open_block.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0031), 0x55);
+    }
+
+    #[test]
+    fn action_replay_v3_offsets_a_pointer_and_steps_a_fill() {
+        let program = ar(&[
+            (0x4020_00A0, 0x0000_04AB),
+            (0, 0x8220_0080),
+            (0x0000_1234, 0x0002_0001),
+            (0, 0x8020_0090),
+            (0x0000_0010, 0x0103_0001),
+        ]);
+        let mut bus = Bus::new();
+        bus.write_u32(0x0200_00A0, 0x0200_0100);
+        program.apply(&mut bus);
+        assert_eq!(bus.read_u8(0x0200_0104), 0xAB);
+        assert_eq!(bus.read_u8(0x0200_0100), 0);
+        assert_eq!(bus.read_u16(0x0200_0080), 0x1234);
+        assert_eq!(bus.read_u16(0x0200_0082), 0x1234);
+        assert_eq!(bus.read_u16(0x0200_0084), 0);
+        assert_eq!(bus.read_u8(0x0200_0090), 0x10);
+        assert_eq!(bus.read_u8(0x0200_0091), 0x11);
+        assert_eq!(bus.read_u8(0x0200_0092), 0x12);
+        assert_eq!(bus.read_u8(0x0200_0093), 0);
+    }
+
+    #[test]
+    fn action_replay_v3_patch_is_visible_through_the_rom_mirror() {
+        let program = ar(&[(0, 0x1A00_0080), (0x0000_BEEF, 0)]);
+        let mut bus = Bus::new();
+        program.apply(&mut bus);
+        assert_eq!(bus.read_u16(0x0A00_0100), 0xBEEF);
+        let encrypted = {
+            let (op1, op2) = encrypt_gameshark(PAR_SEEDS, 0x0020_0010, 0xAB);
+            format!("{op1:08X} {op2:08X}")
+        };
+        let as_v1 = parse_cheat(CheatFamily::GameShark, &encrypted).ok();
+        let mut bus = Bus::new();
+        if let Some(program) = as_v1 {
+            program.apply(&mut bus);
+        }
+        assert_eq!(bus.read_u8(0x0200_0010), 0);
     }
 
     fn ar(pairs: &[(u32, u32)]) -> CheatProgram {
