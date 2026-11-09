@@ -5,6 +5,7 @@ use crate::dma::Dma;
 use crate::gfxcache::{self, Gfx};
 use crate::icache::ICache;
 use crate::keypad::Keypad;
+use crate::sio::Sio;
 use crate::ppu::{
     latch_span, next_paint, scan_at, Affine, DirtyLines, Frame, Sample, CYCLES_PER_FRAME,
     CYCLES_PER_LINE, LINES_PER_FRAME, VISIBLE_CYCLES, VISIBLE_LINES,
@@ -64,6 +65,8 @@ pub struct Bus {
     timers: Timers,
     dma: Dma,
     keys: Keypad,
+    #[serde(default)]
+    sio: Sio,
     waits: Waits,
     /// 这条指令已经算过、还没加进 `cycles` 的拍。用来判断访问落在扫描线的哪一段。
     pending: u32,
@@ -112,6 +115,7 @@ impl Bus {
             timers: Timers::new(),
             dma: Dma::new(),
             keys: Keypad::new(),
+            sio: Sio::new(),
             waits: Waits::new(),
             pending: 0,
             in_clock: false,
@@ -595,12 +599,14 @@ impl Bus {
         let mut line = false;
         let mut hblank = false;
         let mut sound = false;
+        let mut sio = false;
         while let Some(kind) = self.scheduler.pop_due(now) {
             match kind {
                 EventKind::Timer(_) => timers = true,
                 EventKind::Line => line = true,
                 EventKind::HBlank => hblank = true,
                 EventKind::Sound => sound = true,
+                EventKind::Sio => sio = true,
             }
         }
         if timers {
@@ -616,6 +622,14 @@ impl Bus {
         if sound {
             self.on_sound();
         }
+        if sio {
+            self.on_sio();
+        }
+    }
+
+    fn on_sio(&mut self) {
+        let irq = self.sio.on_due(self.cycles);
+        self.raise_if(irq);
     }
 
     fn seed_scheduler(&mut self) {
@@ -1112,8 +1126,77 @@ impl Bus {
     }
 
     pub fn write_u16(&mut self, addr: u32, value: u16) {
+        let aligned = addr & !1;
+        if aligned == 0x0400_0128 || aligned == 0x0400_012A || aligned == 0x0400_0134 {
+            let off = (aligned as usize) & (IO - 1);
+            self.sio.write_byte(off, value as u8, self.cycles, false);
+            if let Some(when) = self
+                .sio
+                .write_byte(off + 1, (value >> 8) as u8, self.cycles, true)
+            {
+                self.scheduler.schedule_sio(when);
+            }
+            return;
+        }
         self.store_u8(addr, value as u8);
         self.store_u8(addr.wrapping_add(1), (value >> 8) as u8);
+    }
+
+    pub fn link_waiting(&self) -> bool {
+        self.sio.waiting_for_peer()
+    }
+
+    /// `Some(0)` 是主机，`Some(1)` 是第一台客人。`None` 是没插线。
+    pub fn set_link_player(&mut self, player: Option<u8>) {
+        let irq = self.sio.set_player(player);
+        self.raise_if(irq);
+    }
+
+    /// `peers` 是这根线上的台数，含自己，最多 4。
+    pub fn set_link_roster(&mut self, player: Option<u8>, peers: u8) {
+        let irq = self.sio.set_roster(player, peers);
+        self.raise_if(irq);
+    }
+
+    pub(crate) fn wireless_id(&self) -> u32 {
+        self.sio.wireless_id()
+    }
+
+    pub(crate) fn take_wireless_out(&mut self) -> Vec<crate::wireless::WirelessOut> {
+        self.sio.take_wireless_out()
+    }
+
+    pub(crate) fn apply_wireless(&mut self, event: crate::wireless::WirelessIn) {
+        self.sio.apply_wireless(event);
+    }
+
+    pub(crate) fn release_wireless(&mut self) {
+        let irq = self.sio.release_wireless(self.cycles);
+        self.raise_if(irq);
+    }
+
+    pub fn poll_link_send(&mut self) -> Option<u16> {
+        self.sio.take_send()
+    }
+
+    pub fn poll_link_need(&mut self) -> Option<u16> {
+        self.sio.take_need()
+    }
+
+    pub fn finish_link(&mut self, words: [u16; 4]) {
+        let irq = self.sio.supply(words, self.cycles);
+        self.raise_if(irq);
+    }
+
+    pub fn fail_link(&mut self) {
+        let irq = self.sio.fail();
+        self.raise_if(irq);
+    }
+
+    pub fn accept_remote_link(&mut self, words: [u16; 4]) {
+        if let Some(when) = self.sio.begin_remote(words, self.cycles) {
+            self.scheduler.schedule_sio(when);
+        }
     }
 
     pub fn read_u32(&self, addr: u32) -> u32 {
@@ -1134,6 +1217,8 @@ impl Bus {
             scan_at(self.cycles).line as u8
         } else if off == VCOUNT + 1 {
             0
+        } else if (0x120..0x12C).contains(&off) || (0x134..0x136).contains(&off) {
+            self.sio.read_byte(off)
         } else if (KEYINPUT..KEYINPUT + 4).contains(&off) {
             self.keys.read_byte(off - KEYINPUT)
         } else if (0x100..0x110).contains(&off) {
@@ -1166,6 +1251,12 @@ impl Bus {
             return;
         }
         if off == VCOUNT || off == VCOUNT + 1 {
+            return;
+        }
+        if (0x120..0x12C).contains(&off) || (0x134..0x136).contains(&off) {
+            if let Some(when) = self.sio.write_byte(off, value, self.cycles, true) {
+                self.scheduler.schedule_sio(when);
+            }
             return;
         }
         if (KEYINPUT..KEYINPUT + 4).contains(&off) {

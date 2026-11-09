@@ -8,6 +8,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use gameboy_ultima::link::{normalize_link_name, LinkHub, LinkSeat};
 use gameboy_ultima::{
     rgb555_to_888, step_quiet, AudioPlay, Bus, Registers, CYCLES_PER_FRAME, HEIGHT, WIDTH,
 };
@@ -69,6 +70,7 @@ actions!(
         StartFresh,
         ResetConsole,
         ShowControls,
+        ShowLink,
         ToggleMetalScreen,
         ToggleSharpenScreen,
         ToggleCpuScreen,
@@ -196,6 +198,10 @@ enum Command {
     ResumeState,
     StartFresh,
     Reset,
+    HostLink,
+    JoinLink(String),
+    StopLink,
+    SetLinkName(String),
     Error(String),
     Shutdown,
 }
@@ -246,6 +252,26 @@ struct Snapshot {
     rgba: Vec<u8>,
     library: Vec<LibraryEntry>,
     library_version: u64,
+    link_line: String,
+    link_hosts: Vec<(String, String)>,
+    link_error: Option<String>,
+    link_lan: String,
+    link_name: String,
+    link_in_room: bool,
+    link_seats: Vec<LinkSeat>,
+}
+
+enum LinkField {
+    Address,
+    Name,
+}
+
+struct LinkUi {
+    open: bool,
+    address: String,
+    name: String,
+    name_touched: bool,
+    field: LinkField,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -299,6 +325,7 @@ struct AppView {
     cover_images: HashMap<PathBuf, Option<Arc<RenderImage>>>,
     library_mode: Arc<AtomicBool>,
     controls: Arc<Mutex<ControlSettings>>,
+    link_ui: Arc<Mutex<LinkUi>>,
 }
 
 impl AppView {
@@ -313,6 +340,7 @@ impl AppView {
         turbo_held: Arc<AtomicBool>,
         library_mode: Arc<AtomicBool>,
         controls: Arc<Mutex<ControlSettings>>,
+        link_ui: Arc<Mutex<LinkUi>>,
         windows_alive: Arc<AtomicUsize>,
         picture_windows: Arc<Mutex<PictureWindows>>,
         chrome_dirty: Arc<AtomicBool>,
@@ -357,6 +385,7 @@ impl AppView {
             cover_images: HashMap::new(),
             library_mode,
             controls,
+            link_ui,
         }
     }
 
@@ -423,7 +452,160 @@ impl AppView {
         }
     }
 
+    fn link_open(&self) -> bool {
+        self.link_ui.lock().expect("link ui poisoned").open
+    }
+
+    fn close_link(&self, cx: &mut Context<Self>) {
+        self.link_ui.lock().expect("link ui poisoned").open = false;
+        self.keys.store(0, Ordering::Relaxed);
+        self.release_turbo();
+        cx.notify();
+    }
+
+    fn edit_link_field(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = normalize_key(&event.keystroke.key);
+        if key == "escape" {
+            self.close_link(cx);
+            return;
+        }
+        let editing_name = matches!(
+            self.link_ui.lock().expect("link ui poisoned").field,
+            LinkField::Name
+        );
+        if key == "v" && event.keystroke.modifiers.platform && !event.is_held {
+            if let Some(text) = clipboard_text() {
+                if editing_name {
+                    let keep_current = self
+                        .link_ui
+                        .lock()
+                        .expect("link ui poisoned")
+                        .name_touched;
+                    self.push_link_name(text.chars(), keep_current, cx);
+                } else {
+                    let mut link = self.link_ui.lock().expect("link ui poisoned");
+                    for ch in text.chars() {
+                        if link.address.len() >= 64 {
+                            break;
+                        }
+                        if ch.is_ascii_digit() || ch == '.' || ch == ':' {
+                            link.address.push(ch);
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if shortcut_chord(&event.keystroke.modifiers) {
+            return;
+        }
+        if key == "enter" {
+            if event.is_held || editing_name {
+                return;
+            }
+            let address = self
+                .link_ui
+                .lock()
+                .expect("link ui poisoned")
+                .address
+                .trim()
+                .to_string();
+            if !address.is_empty() {
+                let _ = self.commands.send(Command::JoinLink(address));
+            }
+            cx.notify();
+            return;
+        }
+        if key == "backspace" {
+            if editing_name {
+                let mut link = self.link_ui.lock().expect("link ui poisoned");
+                self.touch_link_name(&mut link);
+                if let Some((index, _)) = link.name.char_indices().next_back() {
+                    link.name.truncate(index);
+                }
+                let name = link.name.clone();
+                drop(link);
+                self.commit_link_name(&name);
+            } else {
+                self.link_ui.lock().expect("link ui poisoned").address.pop();
+            }
+            cx.notify();
+            return;
+        }
+        if event.is_held {
+            return;
+        }
+        if editing_name {
+            let Some(ch) = link_name_char(&key) else {
+                return;
+            };
+            self.push_link_name(std::iter::once(ch), true, cx);
+            cx.notify();
+            return;
+        }
+        let Some(ch) = key.chars().next() else {
+            return;
+        };
+        if key.chars().nth(1).is_none() && (ch.is_ascii_digit() || ch == '.' || ch == ':') {
+            let mut link = self.link_ui.lock().expect("link ui poisoned");
+            if link.address.len() < 64 {
+                link.address.push(ch);
+            }
+            cx.notify();
+        }
+    }
+
+    fn touch_link_name(&self, link: &mut LinkUi) {
+        if link.name_touched {
+            return;
+        }
+        link.name = self
+            .snapshot
+            .lock()
+            .expect("emulator snapshot poisoned")
+            .link_name
+            .clone();
+        link.name_touched = true;
+    }
+
+    fn push_link_name(
+        &self,
+        chars: impl Iterator<Item = char>,
+        keep_current: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut link = self.link_ui.lock().expect("link ui poisoned");
+        if keep_current {
+            self.touch_link_name(&mut link);
+        } else {
+            link.name_touched = true;
+            link.name.clear();
+        }
+        let mut next = link.name.clone();
+        for ch in chars {
+            if ch.is_control() {
+                continue;
+            }
+            next.push(ch);
+        }
+        link.name = normalize_link_name(&next);
+        let name = link.name.clone();
+        drop(link);
+        self.commit_link_name(&name);
+        cx.notify();
+    }
+
+    fn commit_link_name(&self, name: &str) {
+        persist_link_name(name);
+        let _ = self.commands.send(Command::SetLinkName(name.to_string()));
+    }
+
     fn handle_key_down(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.link_open() {
+            self.edit_link_field(event, cx);
+            return;
+        }
         if shortcut_chord(&event.keystroke.modifiers) {
             return;
         }
@@ -487,7 +669,7 @@ impl AppView {
         if map.hotkey_for_key(&event.keystroke.key) == Some(Hotkey::FastForward) {
             self.release_turbo();
         }
-        if open {
+        if open || self.link_open() {
             return;
         }
         self.set_key_bit(&event.keystroke.key, &map, false);
@@ -855,6 +1037,13 @@ impl Render for AppView {
             resume_prompt,
             boot_animation_started,
             title,
+            link_line,
+            link_hosts,
+            link_error,
+            link_lan,
+            link_name,
+            link_in_room,
+            link_seats,
         ) = {
             let snapshot = self.snapshot.lock().expect("emulator snapshot poisoned");
             (
@@ -866,7 +1055,29 @@ impl Render for AppView {
                 snapshot.resume_prompt,
                 snapshot.boot_animation_started,
                 snapshot.title.clone(),
+                snapshot.link_line.clone(),
+                snapshot.link_hosts.clone(),
+                snapshot.link_error.clone(),
+                snapshot.link_lan.clone(),
+                snapshot.link_name.clone(),
+                snapshot.link_in_room,
+                snapshot.link_seats.clone(),
             )
+        };
+        let (link_open, link_address, link_draft, link_touched, link_field) = {
+            let link = self.link_ui.lock().expect("link ui poisoned");
+            (
+                link.open,
+                link.address.clone(),
+                link.name.clone(),
+                link.name_touched,
+                matches!(link.field, LinkField::Name),
+            )
+        };
+        let shown_name = if link_touched {
+            link_draft
+        } else {
+            link_name.clone()
         };
         let resume_error = resume_prompt.then(|| error.clone()).flatten();
 
@@ -953,6 +1164,10 @@ impl Render for AppView {
                 .relative()
                 .child(letterboxed_screen(screen, screen_h))
                 .when(speed_now > 1, |game| game.child(speed_badge(speed_now)))
+                .when(link_in_room, |game| game.child(link_board(&link_seats)))
+                .when(!link_in_room && !link_line.is_empty(), |game| {
+                    game.child(link_chip(&link_line))
+                })
                 .when_some(error, |content, message| {
                     content.child(
                         div()
@@ -1075,6 +1290,20 @@ impl Render for AppView {
             .child(content)
             .when(!self.compare && controls_open, |app| {
                 app.child(controls_overlay(cx, &controls_map, controls_capturing))
+            })
+            .when(!self.compare && !controls_open && link_open, |app| {
+                app.child(link_overlay(
+                    cx,
+                    &link_address,
+                    &shown_name,
+                    link_field,
+                    &link_line,
+                    link_error.as_deref(),
+                    &link_lan,
+                    &link_hosts,
+                    link_in_room,
+                    &link_seats,
+                ))
             })
     }
 }
@@ -1359,8 +1588,38 @@ fn shortcut_chord(modifiers: &gpui::Modifiers) -> bool {
     modifiers.platform || modifiers.control || modifiers.alt
 }
 
+fn clipboard_text() -> Option<String> {
+    let output = std::process::Command::new("pbpaste").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
 fn controls_file_path() -> Result<PathBuf, String> {
     Ok(application_data_dir()?.join("controls.json"))
+}
+
+fn link_name_path() -> Result<PathBuf, String> {
+    Ok(application_data_dir()?.join("link-name.txt"))
+}
+
+fn load_link_name() -> String {
+    link_name_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| normalize_link_name(&text))
+        .unwrap_or_default()
+}
+
+fn persist_link_name(name: &str) {
+    let Ok(path) = link_name_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, name);
 }
 
 fn load_saved_controls() -> SavedControls {
@@ -1684,6 +1943,375 @@ fn key_field(
         )
 }
 
+fn link_chip(line: &str) -> impl IntoElement {
+    div()
+        .absolute()
+        .bottom(px(12.))
+        .left(px(12.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(4.))
+        .bg(rgb(PANEL_HI))
+        .text_color(rgb(ACCENT))
+        .text_sm()
+        .child(line.to_string())
+}
+
+fn link_board(seats: &[LinkSeat]) -> impl IntoElement {
+    let online = seats.iter().filter(|seat| !seat.name.is_empty()).count();
+    div()
+        .absolute()
+        .bottom(px(12.))
+        .left(px(12.))
+        .w(px(188.))
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .p(px(8.))
+        .rounded(px(6.))
+        .bg(rgb(PANEL_HI))
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .text_xs()
+                .text_color(rgb(ACCENT))
+                .child("联机")
+                .child(format!("在线 {online}/4")),
+        )
+        .children(seats.iter().map(|seat| {
+            let open = seat.name.is_empty();
+            div()
+                .flex()
+                .justify_between()
+                .text_xs()
+                .text_color(rgb(if open { MUTED } else { TEXT }))
+                .child(format!(
+                    "{}  {}",
+                    seat.number,
+                    if open {
+                        "空位".to_string()
+                    } else {
+                        short_link_name(&seat.name)
+                    }
+                ))
+                .child(if seat.mine {
+                    "你".to_string()
+                } else if open {
+                    String::new()
+                } else {
+                    "在线".to_string()
+                })
+        }))
+}
+
+fn link_overlay(
+    cx: &mut Context<AppView>,
+    address: &str,
+    name: &str,
+    editing_name: bool,
+    line: &str,
+    error: Option<&str>,
+    lan_ip: &str,
+    hosts: &[(String, String)],
+    in_room: bool,
+    seats: &[LinkSeat],
+) -> impl IntoElement {
+    let status = if line.is_empty() {
+        "未连接".to_string()
+    } else {
+        line.to_string()
+    };
+    let address_text = if address.is_empty() {
+        "输入 IP，或直接点下面的主机".to_string()
+    } else {
+        address.to_string()
+    };
+    let name_text = if name.is_empty() {
+        "点这里，留空就用电脑名".to_string()
+    } else {
+        name.to_string()
+    };
+    let room = if in_room && seats.len() == 4 {
+        seats.to_vec()
+    } else {
+        (1..=4)
+            .map(|number| LinkSeat {
+                number,
+                name: String::new(),
+                mine: false,
+            })
+            .collect()
+    };
+    let online = room.iter().filter(|seat| !seat.name.is_empty()).count();
+    let room_label = if in_room {
+        format!("房间 · 在线 {online}/4")
+    } else {
+        "房间 · 还没进入".to_string()
+    };
+    let found = if hosts.is_empty() {
+        div()
+            .text_sm()
+            .text_color(rgb(MUTED))
+            .child("同一 Wi-Fi 下，对方选「做主机」后会出现在这里。")
+            .into_any_element()
+    } else {
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .children(hosts.iter().enumerate().map(|(index, (name, addr))| {
+                let addr = addr.clone();
+                let label = format!("{name}  ·  {addr}");
+                div()
+                    .id(("link-found", index))
+                    .w_full()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .rounded(px(6.))
+                    .bg(rgb(BG))
+                    .text_color(rgb(TEXT))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x314044)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let _ = this.commands.send(Command::JoinLink(addr.clone()));
+                        cx.notify();
+                    }))
+                    .child(label)
+            }))
+            .into_any_element()
+    };
+    div()
+        .absolute()
+        .top(px(0.))
+        .right(px(0.))
+        .bottom(px(0.))
+        .left(px(0.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(0x050809))
+        .child(
+            div()
+                .id("link-panel")
+                .w(px(440.))
+                .max_h(px(640.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .p(px(18.))
+                .rounded(px(16.))
+                .bg(rgb(PANEL_HI))
+                .border_1()
+                .border_color(rgb(0x314044))
+                .child(div().text_lg().text_color(rgb(TEXT)).child("联机"))
+                .child(div().text_sm().text_color(rgb(ACCENT)).child(status))
+                .children(error.filter(|message| *message != line).map(|message| {
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xE08B76))
+                        .child(message.to_string())
+                }))
+                .child(div().text_sm().text_color(rgb(TEXT)).child("你的名字"))
+                .child(
+                    div()
+                        .id("link-name")
+                        .w_full()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(px(6.))
+                        .bg(rgb(BG))
+                        .border_1()
+                        .border_color(rgb(if editing_name { ACCENT } else { 0x314044 }))
+                        .text_color(rgb(if name.is_empty() { MUTED } else { TEXT }))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.link_ui.lock().expect("link ui poisoned").field = LinkField::Name;
+                            cx.notify();
+                        }))
+                        .child(name_text),
+                )
+                .child(div().text_sm().text_color(rgb(TEXT)).child(room_label))
+                .children(room.iter().map(|seat| link_seat_row(seat)))
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .id("link-host")
+                                .px(px(14.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(ACCENT))
+                                .text_color(rgb(BG))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let _ = this.commands.send(Command::HostLink);
+                                    cx.notify();
+                                }))
+                                .child("做主机"),
+                        )
+                        .child(
+                            div()
+                                .id("link-stop")
+                                .px(px(14.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(BG))
+                                .text_color(rgb(TEXT))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let _ = this.commands.send(Command::StopLink);
+                                    cx.notify();
+                                }))
+                                .child("断开"),
+                        ),
+                )
+                .child(div().text_sm().text_color(rgb(TEXT)).child("附近的主机"))
+                .child(found)
+                .child(div().text_sm().text_color(rgb(TEXT)).child("手动加入"))
+                .child(
+                    div()
+                        .id("link-address")
+                        .w_full()
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(px(6.))
+                        .bg(rgb(BG))
+                        .border_1()
+                        .border_color(rgb(if editing_name { 0x314044 } else { ACCENT }))
+                        .text_color(if address.is_empty() {
+                            rgb(MUTED)
+                        } else {
+                            rgb(TEXT)
+                        })
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.link_ui.lock().expect("link ui poisoned").field = LinkField::Address;
+                            cx.notify();
+                        }))
+                        .child(address_text),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .id("link-join")
+                                .px(px(14.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(ACCENT))
+                                .text_color(rgb(BG))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let address = this
+                                        .link_ui
+                                        .lock()
+                                        .expect("link ui poisoned")
+                                        .address
+                                        .trim()
+                                        .to_string();
+                                    if !address.is_empty() {
+                                        let _ = this.commands.send(Command::JoinLink(address));
+                                    }
+                                    cx.notify();
+                                }))
+                                .child("加入"),
+                        )
+                        .child(
+                            div()
+                                .id("link-done")
+                                .px(px(14.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(BG))
+                                .text_color(rgb(TEXT))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_link(cx);
+                                }))
+                                .child("完成"),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(format!(
+                            "本机 {lan_ip}:5576。点名字或地址再输入，Command-V 粘贴。同一张卡带，主机是 1 号机。Esc 只关闭面板。"
+                        )),
+                ),
+        )
+}
+
+fn link_seat_row(seat: &LinkSeat) -> impl IntoElement {
+    let open = seat.name.is_empty();
+    div()
+        .w_full()
+        .flex()
+        .justify_between()
+        .items_center()
+        .px(px(12.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .bg(rgb(BG))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .text_sm()
+                .text_color(rgb(if open { MUTED } else { TEXT }))
+                .child(format!("{}号机", seat.number))
+                .child(if open {
+                    "空位".to_string()
+                } else {
+                    seat.name.clone()
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(if seat.mine { ACCENT } else { MUTED }))
+                .child(if seat.mine {
+                    "你".to_string()
+                } else if open {
+                    String::new()
+                } else {
+                    "在线".to_string()
+                }),
+        )
+}
+
+fn short_link_name(name: &str) -> String {
+    let mut short = String::new();
+    for (index, ch) in name.chars().enumerate() {
+        if index == 10 {
+            short.push('…');
+            break;
+        }
+        short.push(ch);
+    }
+    short
+}
+
+fn link_name_char(key: &str) -> Option<char> {
+    match key {
+        "space" => Some(' '),
+        "minus" => Some('-'),
+        other if other.chars().count() == 1 => {
+            let ch = other.chars().next()?;
+            (!ch.is_control()).then_some(ch)
+        }
+        _ => None,
+    }
+}
+
 fn speed_badge(speed: u8) -> impl IntoElement {
     div()
         .absolute()
@@ -1754,6 +2382,92 @@ fn start_emulator(
     (snapshot, commands, keys, audio_volume, worker)
 }
 
+fn drive_link(link: &mut LinkHub, cart: &mut Option<ActiveCart>, snapshot: &Mutex<Snapshot>) {
+    if let Some(active) = cart.as_mut() {
+        link.service(&mut active.bus);
+    } else {
+        link.poll();
+    }
+    publish_link(snapshot, link);
+}
+
+fn publish_link(snapshot: &Mutex<Snapshot>, link: &LinkHub) {
+    let view = link.view();
+    let mut state = snapshot.lock().expect("emulator snapshot poisoned");
+    write_link_view(&mut state, &view);
+}
+
+fn write_link_view(state: &mut Snapshot, view: &gameboy_ultima::link::LinkView) {
+    state.link_line = view.line.clone();
+    state.link_hosts = view.hosts.clone();
+    state.link_error = view.error.clone();
+    state.link_lan = view.lan_ip.clone();
+    state.link_name = view.self_name.clone();
+    state.link_in_room = view.in_room;
+    state.link_seats = view.seats.clone();
+}
+
+fn take_link_command(
+    command: Command,
+    link: &mut LinkHub,
+    cart: &mut Option<ActiveCart>,
+    snapshot: &Mutex<Snapshot>,
+) -> Option<Command> {
+    let replaces_cart = matches!(
+        command,
+        Command::Load(_)
+            | Command::Reset
+            | Command::StartFresh
+            | Command::LoadStateSlot(_)
+            | Command::QuickLoadState
+            | Command::ResumeState
+    );
+    if replaces_cart {
+        link.stop();
+        if let Some(active) = cart.as_mut() {
+            active.bus.set_link_player(None);
+        }
+    }
+    match command {
+        Command::HostLink => {
+            match cart.as_ref() {
+                Some(active) => {
+                    let rom_id = active.rom_id.clone();
+                    let _ = link.host(&rom_id);
+                }
+                None => link.note("先打开一张卡带，再做主机"),
+            }
+            publish_link(snapshot, link);
+            None
+        }
+        Command::JoinLink(address) => {
+            match cart.as_ref() {
+                Some(active) => {
+                    let rom_id = active.rom_id.clone();
+                    let _ = link.join(&address, &rom_id);
+                }
+                None => link.note("先打开同一张卡带，再加入"),
+            }
+            publish_link(snapshot, link);
+            None
+        }
+        Command::StopLink => {
+            link.stop();
+            if let Some(active) = cart.as_mut() {
+                active.bus.set_link_player(None);
+            }
+            publish_link(snapshot, link);
+            None
+        }
+        Command::SetLinkName(name) => {
+            link.set_name(&name);
+            publish_link(snapshot, link);
+            None
+        }
+        other => Some(other),
+    }
+}
+
 fn emulator_worker(
     receiver: mpsc::Receiver<Command>,
     snapshot: Arc<Mutex<Snapshot>>,
@@ -1773,35 +2487,45 @@ fn emulator_worker(
     let frame_interval = Duration::from_secs_f64(CYCLES_PER_FRAME as f64 / 16_777_216.0);
     let mut next_frame_deadline = Instant::now();
     let mut pads = open_gamepads();
+    let mut link = LinkHub::new();
+    let mut link_steps = 0u32;
 
     'worker: loop {
         let pad = poll_gamepad(&mut pads);
         if cart.is_none() || paused {
+            drive_link(&mut link, &mut cart, &snapshot);
             match receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(command) => match apply_command(
-                    command,
-                    &mut cart,
-                    &mut audio,
-                    &mut paused,
-                    &mut bios_hle,
-                    &mut frame_number,
-                    CommandContext {
-                        snapshot: &snapshot,
-                        library_path: library_path.as_deref(),
-                        audio_volume: &audio_volume,
-                        screenshot_frames_left: &mut screenshot_frames_left,
-                    },
-                ) {
-                    CommandResult::Continue => {}
-                    CommandResult::RestartFrame => {
-                        next_frame_deadline = Instant::now();
-                        continue;
+                Ok(command) => {
+                    if let Some(command) =
+                        take_link_command(command, &mut link, &mut cart, &snapshot)
+                    {
+                        match apply_command(
+                            command,
+                            &mut cart,
+                            &mut audio,
+                            &mut paused,
+                            &mut bios_hle,
+                            &mut frame_number,
+                            CommandContext {
+                                snapshot: &snapshot,
+                                library_path: library_path.as_deref(),
+                                audio_volume: &audio_volume,
+                                screenshot_frames_left: &mut screenshot_frames_left,
+                            },
+                        ) {
+                            CommandResult::Continue => {}
+                            CommandResult::RestartFrame => {
+                                next_frame_deadline = Instant::now();
+                                continue;
+                            }
+                            CommandResult::Shutdown => break,
+                        }
                     }
-                    CommandResult::Shutdown => break,
-                },
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+            drive_link(&mut link, &mut cart, &snapshot);
             continue;
         }
 
@@ -1826,7 +2550,13 @@ fn emulator_worker(
             .is_some_and(|active| active.bus.cycles() < frame_end)
         {
             match receiver.try_recv() {
-                Ok(command) => match apply_command(
+                Ok(command) => {
+                    let Some(command) =
+                        take_link_command(command, &mut link, &mut cart, &snapshot)
+                    else {
+                        continue;
+                    };
+                    match apply_command(
                     command,
                     &mut cart,
                     &mut audio,
@@ -1846,7 +2576,8 @@ fn emulator_worker(
                         continue 'worker;
                     }
                     CommandResult::Shutdown => break 'worker,
-                },
+                }
+                }
                 Err(mpsc::TryRecvError::Disconnected) => break 'worker,
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -1863,6 +2594,17 @@ fn emulator_worker(
                 state.status = "ERROR".into();
                 state.error = Some(error);
                 continue 'worker;
+            }
+            link_steps += 1;
+            let link_due = link_steps >= 2_000
+                || cart
+                    .as_ref()
+                    .is_some_and(|active| active.bus.link_waiting());
+            if link_due {
+                link_steps = 0;
+                if let Some(active) = cart.as_mut() {
+                    link.service(&mut active.bus);
+                }
             }
         }
 
@@ -1889,6 +2631,10 @@ fn emulator_worker(
                 screenshot_frames_left = Some(left);
             }
         }
+        if let Some(active) = cart.as_mut() {
+            link.service(&mut active.bus);
+        }
+        let link_view = link.view();
         let mut state = snapshot.lock().expect("emulator snapshot poisoned");
         let active = cart.as_ref().expect("running cart exists");
         state.title = active.title.clone();
@@ -1897,6 +2643,7 @@ fn emulator_worker(
         state.frame_number = frame_number;
         state.image_version += 1;
         state.rgba = rgba;
+        write_link_view(&mut state, &link_view);
         drop(state);
 
         let pace = frame_pace(frame_interval, speed);
@@ -2253,6 +3000,9 @@ fn apply_command(
         }
         Command::Error(error) => {
             set_error(snapshot, error);
+            CommandResult::Continue
+        }
+        Command::HostLink | Command::JoinLink(_) | Command::StopLink | Command::SetLinkName(_) => {
             CommandResult::Continue
         }
         Command::Shutdown => CommandResult::Shutdown,
@@ -2742,6 +3492,7 @@ fn app_menus(open: &[PictureMode], speed: u8, turbo: u8) -> Vec<Menu> {
                 speed_choice_menu("速度", speed, true),
                 speed_choice_menu("按住加速", turbo, false),
                 MenuItem::action("键位设置…", ShowControls),
+                MenuItem::action("联机…", ShowLink),
                 MenuItem::action("切换 BIOS HLE", ToggleBiosHle),
                 MenuItem::separator(),
                 MenuItem::action("声音：音量 +10%", VolumeUp),
@@ -2923,6 +3674,7 @@ struct WindowLaunch {
     turbo_held: Arc<AtomicBool>,
     library_mode: Arc<AtomicBool>,
     controls: Arc<Mutex<ControlSettings>>,
+    link_ui: Arc<Mutex<LinkUi>>,
     windows_alive: Arc<AtomicUsize>,
     picture_windows: Arc<Mutex<PictureWindows>>,
     chrome_dirty: Arc<AtomicBool>,
@@ -3195,6 +3947,7 @@ fn open_game_window(
                     Arc::clone(&launch.turbo_held),
                     launch.library_mode,
                     launch.controls,
+                    launch.link_ui,
                     launch.windows_alive,
                     launch.picture_windows,
                     launch.chrome_dirty,
@@ -3465,6 +4218,17 @@ fn main() {
         speed: saved.speed,
         turbo: saved.turbo,
     }));
+    let saved_link_name = load_link_name();
+    if !saved_link_name.is_empty() {
+        let _ = commands.send(Command::SetLinkName(saved_link_name.clone()));
+    }
+    let link_ui = Arc::new(Mutex::new(LinkUi {
+        open: false,
+        address: String::new(),
+        name: saved_link_name.clone(),
+        name_touched: !saved_link_name.is_empty(),
+        field: LinkField::Address,
+    }));
     let launch = WindowLaunch {
         snapshot: Arc::clone(&snapshot),
         commands: commands.clone(),
@@ -3474,6 +4238,7 @@ fn main() {
         turbo_held: Arc::clone(&turbo_held),
         library_mode: Arc::clone(&library_mode),
         controls: Arc::clone(&controls),
+        link_ui: Arc::clone(&link_ui),
         windows_alive: Arc::new(AtomicUsize::new(0)),
         picture_windows: Arc::new(Mutex::new(PictureWindows {
             next_token: 0,
@@ -3600,13 +4365,29 @@ fn main() {
         let show_controls = Arc::clone(&controls);
         let show_keys = Arc::clone(&keys);
         let show_turbo = Arc::clone(&turbo_held);
+        let show_link = Arc::clone(&link_ui);
         cx.on_action(move |_: &ShowControls, cx| {
             let mut settings = show_controls.lock().expect("control settings poisoned");
             settings.open = true;
             settings.capturing = None;
             drop(settings);
+            show_link.lock().expect("link ui poisoned").open = false;
             show_keys.store(0, Ordering::Relaxed);
             show_turbo.store(false, Ordering::Relaxed);
+            cx.refresh_windows();
+        });
+        let open_link = Arc::clone(&link_ui);
+        let open_controls = Arc::clone(&controls);
+        let open_keys = Arc::clone(&keys);
+        let open_turbo = Arc::clone(&turbo_held);
+        cx.on_action(move |_: &ShowLink, cx| {
+            let mut settings = open_controls.lock().expect("control settings poisoned");
+            settings.open = false;
+            settings.capturing = None;
+            drop(settings);
+            open_link.lock().expect("link ui poisoned").open = true;
+            open_keys.store(0, Ordering::Relaxed);
+            open_turbo.store(false, Ordering::Relaxed);
             cx.refresh_windows();
         });
         let bios_commands = menu_commands.clone();
@@ -3664,6 +4445,12 @@ fn main() {
             volume_mute.store(if volume == 0 { 70 } else { 0 }, Ordering::Relaxed);
         });
         cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.activate(true);
     });
     let _ = commands.send(Command::Shutdown);

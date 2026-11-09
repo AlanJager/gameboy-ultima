@@ -22,5 +22,7 @@
 	<string>public.app-category.games</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>在同一 Wi-Fi 里寻找另一台 ULTIMA，并用联机线一起玩。</string>
 </dict>
 </plist>

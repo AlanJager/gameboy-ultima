@@ -20,6 +20,11 @@ mod registers;
 mod ring;
 mod sched;
 mod serde_array;
+pub mod link;
+#[cfg(test)]
+mod link_rom;
+mod sio;
+mod wireless;
 mod sound;
 mod thumb;
 mod timer;

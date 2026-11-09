@@ -16,6 +16,8 @@ pub(crate) enum EventKind {
     /// 一行走到第 960 拍。
     HBlank,
     Sound,
+    /// 联机口这次传输到点。
+    Sio,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -51,6 +53,8 @@ pub(crate) struct Scheduler {
     line_gen: u32,
     hblank_gen: u32,
     sound_gen: u32,
+    #[serde(default)]
+    sio_gen: u32,
     /// 下一次该醒的拍。热路径只比较这个数。排进更早的事、或弹出时才改。
     deadline: u64,
 }
@@ -64,6 +68,7 @@ impl Scheduler {
             line_gen: 0,
             hblank_gen: 0,
             sound_gen: 0,
+            sio_gen: 0,
             deadline: u64::MAX,
         }
     }
@@ -123,6 +128,11 @@ impl Scheduler {
         self.push(when, 6, self.sound_gen, EventKind::Sound);
     }
 
+    pub(crate) fn schedule_sio(&mut self, when: u64) {
+        self.sio_gen = self.sio_gen.wrapping_add(1);
+        self.push(when, 7, self.sio_gen, EventKind::Sio);
+    }
+
     fn bump_timer(&mut self, index: u8) -> u32 {
         let slot = &mut self.timer_gen[index as usize];
         *slot = slot.wrapping_add(1);
@@ -158,6 +168,7 @@ impl Scheduler {
             EventKind::Line => self.line_gen,
             EventKind::HBlank => self.hblank_gen,
             EventKind::Sound => self.sound_gen,
+            EventKind::Sio => self.sio_gen,
         };
         wake.generation == generation
     }
