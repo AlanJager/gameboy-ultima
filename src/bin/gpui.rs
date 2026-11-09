@@ -77,6 +77,8 @@ actions!(
         ToggleSharpenScreen,
         ToggleCpuScreen,
         ToggleLinearScreen,
+        ToggleLcdGhost,
+        ToggleColorCorrect,
         CompareScreens,
         Quit
     ]
@@ -259,6 +261,8 @@ struct ControlSettings {
     map: KeyMap,
     speed: u8,
     turbo: u8,
+    lcd_ghost: bool,
+    color_correct: bool,
 }
 
 impl ControlSettings {
@@ -286,6 +290,8 @@ struct Snapshot {
     rom_id: String,
     prefs_token: u64,
     picture_id: String,
+    lcd_ghost: bool,
+    color_correct: bool,
     notice: String,
     frame_number: u64,
     image_version: u64,
@@ -377,6 +383,8 @@ struct AppView {
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
     rewind_held: Arc<AtomicBool>,
+    lcd_ghost: Arc<AtomicBool>,
+    color_correct: Arc<AtomicBool>,
     focus_handle: FocusHandle,
     image_version: u64,
     applied_prefs: u64,
@@ -413,6 +421,8 @@ impl AppView {
         turbo_ratio: Arc<AtomicU8>,
         turbo_held: Arc<AtomicBool>,
         rewind_held: Arc<AtomicBool>,
+        lcd_ghost: Arc<AtomicBool>,
+        color_correct: Arc<AtomicBool>,
         library_mode: Arc<AtomicBool>,
         controls: Arc<Mutex<ControlSettings>>,
         link_ui: Arc<Mutex<LinkUi>>,
@@ -442,6 +452,8 @@ impl AppView {
             turbo_ratio,
             turbo_held,
             rewind_held,
+            lcd_ghost,
+            color_correct,
             focus_handle,
             image_version: 0,
             applied_prefs: 0,
@@ -533,7 +545,15 @@ impl AppView {
         let Some(prefs) = read_cart_prefs(rom_id) else {
             let global = load_saved_controls();
             let shell = read_shell_prefs();
-            self.install_runtime(&global, shell.bios_hle, &shell.picture, window, cx);
+            self.install_runtime(
+                &global,
+                shell.bios_hle,
+                &shell.picture,
+                shell.lcd_ghost,
+                shell.color_correct,
+                window,
+                cx,
+            );
             return;
         };
         let saved = SavedControls {
@@ -541,7 +561,15 @@ impl AppView {
             speed: prefs.speed,
             turbo: prefs.turbo,
         };
-        self.install_runtime(&saved, prefs.bios_hle, &prefs.picture, window, cx);
+        self.install_runtime(
+            &saved,
+            prefs.bios_hle,
+            &prefs.picture,
+            prefs.lcd_ghost,
+            prefs.color_correct,
+            window,
+            cx,
+        );
     }
 
     fn install_runtime(
@@ -549,6 +577,8 @@ impl AppView {
         saved: &SavedControls,
         bios_hle: bool,
         picture: &str,
+        lcd_ghost: bool,
+        color_correct: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -557,9 +587,18 @@ impl AppView {
             settings.map = saved.map.clone();
             settings.speed = saved.speed;
             settings.turbo = saved.turbo;
+            settings.lcd_ghost = lcd_ghost;
+            settings.color_correct = color_correct;
         }
         self.locked_speed.store(saved.speed, Ordering::Relaxed);
         self.turbo_ratio.store(saved.turbo, Ordering::Relaxed);
+        self.lcd_ghost.store(lcd_ghost, Ordering::Relaxed);
+        self.color_correct.store(color_correct, Ordering::Relaxed);
+        {
+            let mut state = self.snapshot.lock().expect("emulator snapshot poisoned");
+            state.lcd_ghost = lcd_ghost;
+            state.color_correct = color_correct;
+        }
         if !self.compare {
             if let Some(mode) = picture_from_id(picture) {
                 self.snapshot.lock().expect("emulator snapshot poisoned").picture_id =
@@ -2812,6 +2851,8 @@ fn start_emulator(
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
     rewind_held: Arc<AtomicBool>,
+    lcd_ghost: Arc<AtomicBool>,
+    color_correct: Arc<AtomicBool>,
 ) -> (
     Arc<Mutex<Snapshot>>,
     mpsc::Sender<Command>,
@@ -2827,9 +2868,12 @@ fn start_emulator(
         Err(error) => (Vec::new(), None, Some(error)),
     };
     let (commands, receiver) = mpsc::channel();
+    let shell = read_shell_prefs();
     let snapshot = Arc::new(Mutex::new(Snapshot {
         status: "READY".into(),
-        bios_hle: read_shell_prefs().bios_hle,
+        bios_hle: shell.bios_hle,
+        lcd_ghost: shell.lcd_ghost,
+        color_correct: shell.color_correct,
         error: library_error.clone(),
         library_error,
         library,
@@ -2846,6 +2890,8 @@ fn start_emulator(
     let worker_turbo_ratio = Arc::clone(&turbo_ratio);
     let worker_turbo_held = Arc::clone(&turbo_held);
     let worker_rewind_held = Arc::clone(&rewind_held);
+    let worker_lcd_ghost = Arc::clone(&lcd_ghost);
+    let worker_color_correct = Arc::clone(&color_correct);
     let worker = thread::Builder::new()
         .name("ultima-emulator".into())
         .stack_size(8 * 1024 * 1024)
@@ -2860,6 +2906,8 @@ fn start_emulator(
                 worker_turbo_ratio,
                 worker_turbo_held,
                 worker_rewind_held,
+                worker_lcd_ghost,
+                worker_color_correct,
             )
         })
         .expect("start emulator worker");
@@ -3131,12 +3179,16 @@ struct CartPrefs {
     turbo: u8,
     bios_hle: bool,
     picture: String,
+    lcd_ghost: bool,
+    color_correct: bool,
     map: KeyMap,
 }
 
 struct ShellPrefs {
     bios_hle: bool,
     picture: String,
+    lcd_ghost: bool,
+    color_correct: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -3147,6 +3199,10 @@ struct CartPrefsFile {
     bios_hle: bool,
     #[serde(default)]
     picture: String,
+    #[serde(default)]
+    lcd_ghost: bool,
+    #[serde(default)]
+    color_correct: bool,
     bindings: HashMap<String, String>,
 }
 
@@ -3157,6 +3213,10 @@ struct ShellFile {
     bios_hle: bool,
     #[serde(default)]
     picture: String,
+    #[serde(default)]
+    lcd_ghost: bool,
+    #[serde(default)]
+    color_correct: bool,
 }
 
 fn shell_bios_default() -> bool {
@@ -3187,6 +3247,8 @@ fn read_cart_prefs_file(path: &Path) -> Option<CartPrefs> {
         turbo: normalize_turbo(file.turbo),
         bios_hle: file.bios_hle,
         picture: file.picture,
+        lcd_ghost: file.lcd_ghost,
+        color_correct: file.color_correct,
         map: map_from_bindings(&file.bindings),
     })
 }
@@ -3202,6 +3264,8 @@ fn write_cart_prefs_file(path: &Path, prefs: &CartPrefs) -> Result<(), String> {
         turbo: normalize_turbo(prefs.turbo),
         bios_hle: prefs.bios_hle,
         picture: prefs.picture.clone(),
+        lcd_ghost: prefs.lcd_ghost,
+        color_correct: prefs.color_correct,
         bindings: bindings_from_map(&prefs.map),
     };
     let bytes = serde_json::to_vec_pretty(&file)
@@ -3214,38 +3278,37 @@ fn write_cart_prefs(rom_id: &str, prefs: &CartPrefs) -> Result<(), String> {
     write_cart_prefs_file(&cart_prefs_path(rom_id)?, prefs)
 }
 
+fn shell_defaults() -> ShellPrefs {
+    ShellPrefs {
+        bios_hle: true,
+        picture: String::new(),
+        lcd_ghost: false,
+        color_correct: false,
+    }
+}
+
 fn read_shell_prefs() -> ShellPrefs {
     let Ok(path) = shell_prefs_path() else {
-        return ShellPrefs {
-            bios_hle: true,
-            picture: String::new(),
-        };
+        return shell_defaults();
     };
     let Ok(bytes) = std::fs::read(&path) else {
-        return ShellPrefs {
-            bios_hle: true,
-            picture: String::new(),
-        };
+        return shell_defaults();
     };
     let Ok(file) = serde_json::from_slice::<ShellFile>(&bytes) else {
-        return ShellPrefs {
-            bios_hle: true,
-            picture: String::new(),
-        };
+        return shell_defaults();
     };
     if file.version != 1 {
-        return ShellPrefs {
-            bios_hle: true,
-            picture: String::new(),
-        };
+        return shell_defaults();
     }
     ShellPrefs {
         bios_hle: file.bios_hle,
         picture: file.picture,
+        lcd_ghost: file.lcd_ghost,
+        color_correct: file.color_correct,
     }
 }
 
-fn write_shell_prefs(bios_hle: bool, picture: &str) -> Result<(), String> {
+fn write_shell_prefs(prefs: &ShellPrefs) -> Result<(), String> {
     let path = shell_prefs_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -3253,8 +3316,10 @@ fn write_shell_prefs(bios_hle: bool, picture: &str) -> Result<(), String> {
     }
     let file = ShellFile {
         version: 1,
-        bios_hle,
-        picture: picture.to_string(),
+        bios_hle: prefs.bios_hle,
+        picture: prefs.picture.clone(),
+        lcd_ghost: prefs.lcd_ghost,
+        color_correct: prefs.color_correct,
     };
     let bytes = serde_json::to_vec_pretty(&file)
         .map_err(|error| format!("整理界面设置失败：{error}"))?;
@@ -3263,11 +3328,17 @@ fn write_shell_prefs(bios_hle: bool, picture: &str) -> Result<(), String> {
 }
 
 fn persist_open_cart(snapshot: &Mutex<Snapshot>, saved: &SavedControls) -> Result<(), String> {
-    let (rom_id, bios, picture) = {
+    let (rom_id, bios, picture, lcd_ghost, color_correct) = {
         let state = snapshot.lock().expect("emulator snapshot poisoned");
-        (state.rom_id.clone(), state.bios_hle, state.picture_id.clone())
+        (
+            state.rom_id.clone(),
+            state.bios_hle,
+            state.picture_id.clone(),
+            state.lcd_ghost,
+            state.color_correct,
+        )
     };
-    persist_runtime(&rom_id, saved, bios, &picture)
+    persist_runtime(&rom_id, saved, bios, &picture, lcd_ghost, color_correct)
 }
 
 fn persist_runtime(
@@ -3275,10 +3346,17 @@ fn persist_runtime(
     saved: &SavedControls,
     bios_hle: bool,
     picture: &str,
+    lcd_ghost: bool,
+    color_correct: bool,
 ) -> Result<(), String> {
     if rom_id.is_empty() {
         write_controls(&controls_file_path()?, saved)?;
-        write_shell_prefs(bios_hle, picture)?;
+        write_shell_prefs(&ShellPrefs {
+            bios_hle,
+            picture: picture.to_string(),
+            lcd_ghost,
+            color_correct,
+        })?;
         return Ok(());
     }
     write_cart_prefs(
@@ -3288,6 +3366,8 @@ fn persist_runtime(
             turbo: saved.turbo,
             bios_hle,
             picture: picture.to_string(),
+            lcd_ghost,
+            color_correct,
             map: saved.map.clone(),
         },
     )
@@ -3299,6 +3379,8 @@ fn adopt_cart_runtime(
     bios_hle: &mut bool,
     locked_speed: &AtomicU8,
     turbo_ratio: &AtomicU8,
+    lcd_ghost: &AtomicBool,
+    color_correct: &AtomicBool,
     snapshot: &Mutex<Snapshot>,
 ) {
     let shell = read_shell_prefs();
@@ -3307,13 +3389,22 @@ fn adopt_cart_runtime(
     let bios = prefs.as_ref().map(|item| item.bios_hle).unwrap_or(shell.bios_hle);
     let speed = prefs.as_ref().map(|item| item.speed).unwrap_or(global.speed);
     let turbo = prefs.as_ref().map(|item| item.turbo).unwrap_or(global.turbo);
+    let ghost = prefs.as_ref().map(|item| item.lcd_ghost).unwrap_or(shell.lcd_ghost);
+    let color = prefs
+        .as_ref()
+        .map(|item| item.color_correct)
+        .unwrap_or(shell.color_correct);
     *bios_hle = bios;
     cart.bus.set_bios_hle(bios);
     locked_speed.store(speed, Ordering::Relaxed);
     turbo_ratio.store(turbo, Ordering::Relaxed);
+    lcd_ghost.store(ghost, Ordering::Relaxed);
+    color_correct.store(color, Ordering::Relaxed);
     let mut state = snapshot.lock().expect("emulator snapshot poisoned");
     state.rom_id = rom_id.to_string();
     state.bios_hle = bios;
+    state.lcd_ghost = ghost;
+    state.color_correct = color;
     state.prefs_token = state.prefs_token.wrapping_add(1);
 }
 
@@ -3405,6 +3496,8 @@ fn emulator_worker(
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
     rewind_held: Arc<AtomicBool>,
+    lcd_ghost: Arc<AtomicBool>,
+    color_correct: Arc<AtomicBool>,
 ) {
     let mut cart: Option<ActiveCart> = None;
     let mut audio: Option<AudioPlay> = None;
@@ -3420,6 +3513,7 @@ fn emulator_worker(
     let mut rewind = Rewind::default();
     let mut cheats: Vec<LiveCheat> = Vec::new();
     let mut cheat_rom = String::new();
+    let mut lcd_held: Option<Vec<u8>> = None;
 
     'worker: loop {
         let pad = poll_gamepad(&mut pads);
@@ -3436,6 +3530,8 @@ fn emulator_worker(
                         &mut bios_hle,
                         &locked_speed,
                         &turbo_ratio,
+                        &lcd_ghost,
+                        &color_correct,
                         &snapshot,
                     );
                 }
@@ -3466,6 +3562,9 @@ fn emulator_worker(
                                 library_path: library_path.as_deref(),
                                 audio_volume: &audio_volume,
                                 screenshot_frames_left: &mut screenshot_frames_left,
+                                lcd_held: &mut lcd_held,
+                                lcd_ghost: &lcd_ghost,
+                                color_correct: &color_correct,
                             },
                         ) {
                             CommandResult::Continue => {}
@@ -3516,6 +3615,9 @@ fn emulator_worker(
                                 library_path: library_path.as_deref(),
                                 audio_volume: &audio_volume,
                                 screenshot_frames_left: &mut screenshot_frames_left,
+                                lcd_held: &mut lcd_held,
+                                lcd_ghost: &lcd_ghost,
+                                color_correct: &color_correct,
                             },
                         ) {
                             CommandResult::Continue => {}
@@ -3581,6 +3683,9 @@ fn emulator_worker(
                         library_path: library_path.as_deref(),
                         audio_volume: &audio_volume,
                         screenshot_frames_left: &mut screenshot_frames_left,
+                        lcd_held: &mut lcd_held,
+                        lcd_ghost: &lcd_ghost,
+                        color_correct: &color_correct,
                     },
                 ) {
                     CommandResult::Continue => {}
@@ -3650,6 +3755,12 @@ fn emulator_worker(
                 screenshot_frames_left = Some(left);
             }
         }
+        let shown = display_frame(
+            rgba,
+            color_correct.load(Ordering::Relaxed),
+            !rewinding && lcd_ghost.load(Ordering::Relaxed),
+            &mut lcd_held,
+        );
         if let Some(active) = cart.as_mut() {
             link.service(&mut active.bus);
         }
@@ -3661,7 +3772,7 @@ fn emulator_worker(
         state.status = if paused { "PAUSED" } else { "RUNNING" }.into();
         state.frame_number = frame_number;
         state.image_version += 1;
-        state.rgba = rgba;
+        state.rgba = shown;
         write_link_view(&mut state, &link_view);
         drop(state);
 
@@ -3700,6 +3811,9 @@ struct CommandContext<'a> {
     library_path: Option<&'a Path>,
     audio_volume: &'a Arc<AtomicU8>,
     screenshot_frames_left: &'a mut Option<u32>,
+    lcd_held: &'a mut Option<Vec<u8>>,
+    lcd_ghost: &'a AtomicBool,
+    color_correct: &'a AtomicBool,
 }
 
 fn apply_command(
@@ -3716,7 +3830,13 @@ fn apply_command(
         library_path,
         audio_volume,
         screenshot_frames_left,
+        lcd_held,
+        lcd_ghost,
+        color_correct,
     } = context;
+    if drops_rewind(&command) {
+        lcd_held.take();
+    }
     match command {
         Command::Load(path) => match load_cart(path) {
             Ok(next) => {
@@ -4016,7 +4136,12 @@ fn apply_command(
                     };
                     state.frame_number = *frame_number;
                     state.image_version += 1;
-                    state.rgba = frame_to_rgba(active.bus.frame());
+                    state.rgba = display_frame(
+                        frame_to_rgba(active.bus.frame()),
+                        color_correct.load(Ordering::Relaxed),
+                        lcd_ghost.load(Ordering::Relaxed),
+                        lcd_held,
+                    );
                     return CommandResult::RestartFrame;
                 }
                 Err(error) => set_error(snapshot, error),
@@ -4453,6 +4578,60 @@ fn frame_to_rgba(frame: &gameboy_ultima::Frame) -> Vec<u8> {
     rgba
 }
 
+/// Pokefan531's public-domain GBA LCD matrix at its default settings.
+/// Gamma in is 3.2, the panel is scaled by 0.94, then gamma out is 2.2.
+fn correct_gba_lcd_pixel(r: u8, g: u8, b: u8) -> [u8; 3] {
+    let r = (r as f32 / 255.0).powf(3.2) * 0.94;
+    let g = (g as f32 / 255.0).powf(3.2) * 0.94;
+    let b = (b as f32 / 255.0).powf(3.2) * 0.94;
+    let red = (0.82 * r + 0.24 * g - 0.06 * b).clamp(0.0, 1.0);
+    let green = (0.125 * r + 0.665 * g + 0.21 * b).clamp(0.0, 1.0);
+    let blue = (0.195 * r + 0.075 * g + 0.73 * b).clamp(0.0, 1.0);
+    let byte = |channel: f32| (channel.powf(1.0 / 2.2) * 255.0).round() as u8;
+    [byte(red), byte(green), byte(blue)]
+}
+
+fn correct_gba_lcd(rgba: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len());
+    for pixel in rgba.chunks_exact(4) {
+        let [red, green, blue] = correct_gba_lcd_pixel(pixel[0], pixel[1], pixel[2]);
+        out.extend_from_slice(&[red, green, blue, 0xFF]);
+    }
+    out
+}
+
+fn mix_half(current: &[u8], previous: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(current.len());
+    for (now, then) in current.chunks_exact(4).zip(previous.chunks_exact(4)) {
+        out.extend_from_slice(&[
+            ((now[0] as u16 + then[0] as u16) / 2) as u8,
+            ((now[1] as u16 + then[1] as u16) / 2) as u8,
+            ((now[2] as u16 + then[2] as u16) / 2) as u8,
+            0xFF,
+        ]);
+    }
+    out
+}
+
+fn display_frame(
+    raw: Vec<u8>,
+    color: bool,
+    ghosting: bool,
+    held: &mut Option<Vec<u8>>,
+) -> Vec<u8> {
+    let current = if color { correct_gba_lcd(&raw) } else { raw };
+    if !ghosting {
+        held.take();
+        return current;
+    }
+    let mixed = match held.as_deref() {
+        Some(previous) if previous.len() == current.len() => mix_half(&current, previous),
+        _ => current.clone(),
+    };
+    *held = Some(current);
+    mixed
+}
+
 fn picture_menu_item(mode: PictureMode, open: bool) -> MenuItem {
     let name = picture_option_label(mode.title(), open);
     match mode {
@@ -4482,7 +4661,13 @@ fn speed_choice_menu(name: &'static str, selected: u8, locked: bool) -> MenuItem
     })
 }
 
-fn app_menus(open: &[PictureMode], speed: u8, turbo: u8) -> Vec<Menu> {
+fn app_menus(
+    open: &[PictureMode],
+    speed: u8,
+    turbo: u8,
+    lcd_ghost: bool,
+    color_correct: bool,
+) -> Vec<Menu> {
     let mut compare_items: Vec<MenuItem> = picture_modes()
         .into_iter()
         .map(|mode| picture_menu_item(mode, open.contains(&mode)))
@@ -4545,6 +4730,15 @@ fn app_menus(open: &[PictureMode], speed: u8, turbo: u8) -> Vec<Menu> {
             items: vec![
                 MenuItem::action("显示游戏画面", ShowGame),
                 MenuItem::action("显示图库", ShowLibrary),
+                MenuItem::separator(),
+                MenuItem::action(
+                    picture_option_label("液晶余辉", lcd_ghost),
+                    ToggleLcdGhost,
+                ),
+                MenuItem::action(
+                    picture_option_label("色彩校正", color_correct),
+                    ToggleColorCorrect,
+                ),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu {
                     name: "对比画面".into(),
@@ -4713,6 +4907,8 @@ struct WindowLaunch {
     turbo_ratio: Arc<AtomicU8>,
     turbo_held: Arc<AtomicBool>,
     rewind_held: Arc<AtomicBool>,
+    lcd_ghost: Arc<AtomicBool>,
+    color_correct: Arc<AtomicBool>,
     library_mode: Arc<AtomicBool>,
     controls: Arc<Mutex<ControlSettings>>,
     link_ui: Arc<Mutex<LinkUi>>,
@@ -4988,6 +5184,8 @@ fn open_game_window(
                     Arc::clone(&launch.turbo_ratio),
                     Arc::clone(&launch.turbo_held),
                     Arc::clone(&launch.rewind_held),
+                    Arc::clone(&launch.lcd_ghost),
+                    Arc::clone(&launch.color_correct),
                     launch.library_mode,
                     launch.controls,
                     launch.link_ui,
@@ -5131,11 +5329,51 @@ fn refresh_picture_chrome(
         });
     }
     let open = live.iter().map(|(mode, _)| *mode).collect::<Vec<_>>();
-    let (speed, turbo) = {
+    let (speed, turbo, lcd_ghost, color_correct) = {
         let settings = controls.lock().expect("control settings poisoned");
-        (settings.speed, settings.turbo)
+        (
+            settings.speed,
+            settings.turbo,
+            settings.lcd_ghost,
+            settings.color_correct,
+        )
     };
-    cx.set_menus(app_menus(&open, speed, turbo));
+    cx.set_menus(app_menus(&open, speed, turbo, lcd_ghost, color_correct));
+}
+
+fn toggle_screen_option(cx: &mut App, launch: &WindowLaunch, ghost: bool) {
+    let (rom_id, bios, picture, mut lcd_ghost, mut color_correct) = {
+        let state = launch.snapshot.lock().expect("emulator snapshot poisoned");
+        (
+            state.rom_id.clone(),
+            state.bios_hle,
+            state.picture_id.clone(),
+            state.lcd_ghost,
+            state.color_correct,
+        )
+    };
+    if ghost {
+        lcd_ghost = !lcd_ghost;
+    } else {
+        color_correct = !color_correct;
+    }
+    {
+        let mut state = launch.snapshot.lock().expect("emulator snapshot poisoned");
+        state.lcd_ghost = lcd_ghost;
+        state.color_correct = color_correct;
+    }
+    {
+        let mut settings = launch.controls.lock().expect("control settings poisoned");
+        settings.lcd_ghost = lcd_ghost;
+        settings.color_correct = color_correct;
+    }
+    launch.lcd_ghost.store(lcd_ghost, Ordering::Relaxed);
+    launch.color_correct.store(color_correct, Ordering::Relaxed);
+    let saved = launch.controls.lock().expect("control settings poisoned").saved();
+    if let Err(error) = persist_runtime(&rom_id, &saved, bios, &picture, lcd_ghost, color_correct) {
+        let _ = launch.commands.send(Command::Error(error));
+    }
+    refresh_picture_chrome(cx, &launch.picture_windows, &launch.controls);
 }
 
 fn toggle_picture(cx: &mut App, mode: PictureMode, launch: &WindowLaunch) {
@@ -5243,15 +5481,20 @@ fn open_screen_comparison(cx: &mut App, launch: &WindowLaunch) {
 
 fn main() {
     let saved = load_saved_controls();
+    let shell = read_shell_prefs();
     let locked_speed = Arc::new(AtomicU8::new(saved.speed));
     let turbo_ratio = Arc::new(AtomicU8::new(saved.turbo));
     let turbo_held = Arc::new(AtomicBool::new(false));
     let rewind_held = Arc::new(AtomicBool::new(false));
+    let lcd_ghost = Arc::new(AtomicBool::new(shell.lcd_ghost));
+    let color_correct = Arc::new(AtomicBool::new(shell.color_correct));
     let (snapshot, commands, keys, audio_volume, worker) = start_emulator(
         Arc::clone(&locked_speed),
         Arc::clone(&turbo_ratio),
         Arc::clone(&turbo_held),
         Arc::clone(&rewind_held),
+        Arc::clone(&lcd_ghost),
+        Arc::clone(&color_correct),
     );
     let (launch_rom, compare_on_launch) = launch_arguments();
     if let Some(path) = &launch_rom {
@@ -5264,6 +5507,8 @@ fn main() {
         map: saved.map,
         speed: saved.speed,
         turbo: saved.turbo,
+        lcd_ghost: shell.lcd_ghost,
+        color_correct: shell.color_correct,
     }));
     let saved_link_name = load_link_name();
     if !saved_link_name.is_empty() {
@@ -5291,6 +5536,8 @@ fn main() {
         turbo_ratio,
         turbo_held: Arc::clone(&turbo_held),
         rewind_held: Arc::clone(&rewind_held),
+        lcd_ghost: Arc::clone(&lcd_ghost),
+        color_correct: Arc::clone(&color_correct),
         library_mode: Arc::clone(&library_mode),
         controls: Arc::clone(&controls),
         link_ui: Arc::clone(&link_ui),
@@ -5370,16 +5617,35 @@ fn main() {
         cx.on_action(move |_: &ToggleLinearScreen, cx| {
             toggle_picture(cx, PictureMode::Linear, &launch_linear);
         });
+        let launch_ghost = launch.clone();
+        cx.on_action(move |_: &ToggleLcdGhost, cx| {
+            toggle_screen_option(cx, &launch_ghost, true);
+        });
+        let launch_color = launch.clone();
+        cx.on_action(move |_: &ToggleColorCorrect, cx| {
+            toggle_screen_option(cx, &launch_color, false);
+        });
         let launch_all = launch.clone();
         cx.on_action(move |_: &CompareScreens, cx| {
             open_screen_comparison(cx, &launch_all);
         });
         if !compare_on_launch {
-            let (speed, turbo) = {
+            let (speed, turbo, lcd_ghost, color_correct) = {
                 let settings = launch.controls.lock().expect("control settings poisoned");
-                (settings.speed, settings.turbo)
+                (
+                    settings.speed,
+                    settings.turbo,
+                    settings.lcd_ghost,
+                    settings.color_correct,
+                )
             };
-            cx.set_menus(app_menus(&[main_mode], speed, turbo));
+            cx.set_menus(app_menus(
+                &[main_mode],
+                speed,
+                turbo,
+                lcd_ghost,
+                color_correct,
+            ));
         }
         let speed_launch = launch.clone();
         cx.on_action(move |action: &SetLockedSpeed, cx| {
@@ -5481,13 +5747,21 @@ fn main() {
         let bios_snapshot = Arc::clone(&snapshot);
         let bios_controls = Arc::clone(&controls);
         cx.on_action(move |_: &ToggleBiosHle, cx| {
-            let (rom_id, bios, picture) = {
+            let (rom_id, bios, picture, lcd_ghost, color_correct) = {
                 let state = bios_snapshot.lock().expect("emulator snapshot poisoned");
-                (state.rom_id.clone(), state.bios_hle, state.picture_id.clone())
+                (
+                    state.rom_id.clone(),
+                    state.bios_hle,
+                    state.picture_id.clone(),
+                    state.lcd_ghost,
+                    state.color_correct,
+                )
             };
             let saved = bios_controls.lock().expect("control settings poisoned").saved();
             let next = !bios;
-            if let Err(error) = persist_runtime(&rom_id, &saved, next, &picture) {
+            if let Err(error) =
+                persist_runtime(&rom_id, &saved, next, &picture, lcd_ghost, color_correct)
+            {
                 let _ = bios_commands.send(Command::Error(error));
             }
             let _ = bios_commands.send(Command::SetBios(next));
@@ -5583,6 +5857,8 @@ mod tests {
                 turbo: 8,
                 bios_hle: false,
                 picture: "not-a-filter".into(),
+                lcd_ghost: false,
+                color_correct: false,
                 map: map.clone(),
             },
         )
@@ -5609,7 +5885,45 @@ mod tests {
         let partial = read_cart_prefs_file(&path).expect("prefs without rewind");
         assert_eq!(partial.map.hotkey(Hotkey::Rewind), "f6");
         assert_eq!(partial.map.key(PadButton::A), "k");
+        std::fs::write(
+            dir.join("bare.json"),
+            br#"{"version":1,"speed":1,"turbo":4,"bios_hle":true,"bindings":{}}"#,
+        )
+        .unwrap();
+        let bare = read_cart_prefs_file(&dir.join("bare.json")).expect("old prefs");
+        assert!(!bare.lcd_ghost);
+        assert!(!bare.color_correct);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gba_color_matches_the_public_domain_lcd_matrix() {
+        assert_eq!(correct_gba_lcd_pixel(255, 0, 0), [227, 96, 118]);
+        assert_eq!(correct_gba_lcd_pixel(255, 255, 255), [248, 248, 248]);
+        assert_eq!(correct_gba_lcd_pixel(0, 0, 0), [0, 0, 0]);
+        let mut held = None;
+        let raw = vec![255, 0, 0, 255];
+        let shown = display_frame(raw.clone(), true, false, &mut held);
+        assert_eq!(shown, vec![227, 96, 118, 255]);
+        assert!(held.is_none());
+        let again = display_frame(raw, false, false, &mut held);
+        assert_eq!(again, vec![255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn lcd_ghost_mixes_half_with_the_previous_frame_and_keeps_a_still_picture() {
+        let mut held = None;
+        let black = vec![0, 0, 0, 255];
+        let white = vec![255, 255, 255, 255];
+        assert_eq!(display_frame(black.clone(), false, true, &mut held), black);
+        assert_eq!(
+            display_frame(white.clone(), false, true, &mut held),
+            vec![127, 127, 127, 255]
+        );
+        assert_eq!(display_frame(white.clone(), false, true, &mut held), white);
+        assert_eq!(display_frame(white.clone(), false, false, &mut held), white);
+        assert!(held.is_none());
+        assert_eq!(display_frame(white, false, true, &mut held), vec![255, 255, 255, 255]);
     }
 
     #[test]
