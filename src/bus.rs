@@ -1387,6 +1387,18 @@ impl Bus {
         self.raise_if(irq);
     }
 
+    pub fn load_ereader_card(&mut self, bytes: &[u8]) -> Result<String, String> {
+        self.sio.load_ereader(bytes)
+    }
+
+    pub fn clear_ereader_card(&mut self) {
+        self.sio.clear_ereader();
+    }
+
+    pub fn ereader_loaded(&self) -> bool {
+        self.sio.ereader_loaded()
+    }
+
     pub(crate) fn wireless_id(&self) -> u32 {
         self.sio.wireless_id()
     }

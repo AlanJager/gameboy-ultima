@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use gameboy_ultima::link::{normalize_link_name, LinkHub, LinkSeat, LINK_ROOM};
 use gameboy_ultima::{
-    audio_pace, parse_cheat, rgb555_to_888, step_quiet, AudioPlay, Bus, CheatFamily, CheatProgram,
-    Registers, CYCLES_PER_FRAME, DEFAULT_SOLAR, HEIGHT, WIDTH,
+    audio_pace, ereader_label, parse_cheat, rgb555_to_888, step_quiet, AudioPlay, Bus, CheatFamily,
+    CheatProgram, Registers, CYCLES_PER_FRAME, DEFAULT_SOLAR, HEIGHT, WIDTH,
 };
 #[path = "controls.rs"]
 mod controls;
@@ -73,6 +73,8 @@ actions!(
         ShowControls,
         ShowLink,
         ShowCheats,
+        LoadEReaderCard,
+        ClearEReaderCard,
         ToggleMetalScreen,
         ToggleSharpenScreen,
         ToggleCpuScreen,
@@ -235,6 +237,8 @@ enum Command {
     JoinLink(String),
     StopLink,
     SetLinkName(String),
+    LoadEReader(Vec<u8>),
+    ClearEReader,
     SetBios(bool),
     AddCheat {
         name: String,
@@ -332,6 +336,7 @@ struct Snapshot {
     library: Vec<LibraryEntry>,
     library_version: u64,
     link_line: String,
+    ereader_line: String,
     link_hosts: Vec<(String, String)>,
     link_error: Option<String>,
     link_lan: String,
@@ -1414,6 +1419,7 @@ impl Render for AppView {
             boot_animation_started,
             title,
             link_line,
+            ereader_line,
             link_hosts,
             link_error,
             link_lan,
@@ -1437,6 +1443,7 @@ impl Render for AppView {
                 snapshot.boot_animation_started,
                 snapshot.title.clone(),
                 snapshot.link_line.clone(),
+                snapshot.ereader_line.clone(),
                 snapshot.link_hosts.clone(),
                 snapshot.link_error.clone(),
                 snapshot.link_lan.clone(),
@@ -1562,6 +1569,9 @@ impl Render for AppView {
                 .when(link_in_room, |game| game.child(link_board(&link_seats)))
                 .when(!link_in_room && !link_line.is_empty(), |game| {
                     game.child(link_chip(&link_line))
+                })
+                .when(!ereader_line.is_empty(), |game| {
+                    game.child(ereader_chip(&ereader_line))
                 })
                 .when(solar_cart && !self.compare, |game| {
                     game.child(solar_meter(
@@ -1712,6 +1722,7 @@ impl Render for AppView {
                     &shown_name,
                     link_field,
                     &link_line,
+                    &ereader_line,
                     link_error.as_deref(),
                     &link_lan,
                     &link_hosts,
@@ -2424,6 +2435,20 @@ fn solar_meter(level: u8, cx: &mut Context<AppView>) -> impl IntoElement {
         )
 }
 
+fn ereader_chip(line: &str) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(12.))
+        .left(px(12.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(4.))
+        .bg(rgb(PANEL_HI))
+        .text_color(rgb(ACCENT))
+        .text_sm()
+        .child(line.to_string())
+}
+
 fn link_chip(line: &str) -> impl IntoElement {
     div()
         .absolute()
@@ -2727,6 +2752,7 @@ fn link_overlay(
     name: &str,
     editing_name: bool,
     line: &str,
+    card_line: &str,
     error: Option<&str>,
     lan_ip: &str,
     hosts: &[(String, String)],
@@ -2824,6 +2850,14 @@ fn link_overlay(
                 .border_color(rgb(0x314044))
                 .child(div().text_lg().text_color(rgb(TEXT)).child("联机"))
                 .child(div().text_sm().text_color(rgb(ACCENT)).child(status))
+                .when(!card_line.is_empty(), |panel| {
+                    panel.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(ACCENT))
+                            .child(card_line.to_string()),
+                    )
+                })
                 .children(error.filter(|message| *message != line).map(|message| {
                     div()
                         .text_sm()
@@ -3183,6 +3217,50 @@ fn drive_link(link: &mut LinkHub, cart: &mut Option<ActiveCart>, snapshot: &Mute
     publish_link(snapshot, link);
 }
 
+fn sync_ereader(cart: &mut Option<ActiveCart>, held: &mut Option<Vec<u8>>, snapshot: &Mutex<Snapshot>) {
+    let needs_load = held.is_some()
+        && cart
+            .as_ref()
+            .is_some_and(|active| !active.bus.ereader_loaded());
+    if needs_load {
+        let Some(bytes) = held.clone() else {
+            return;
+        };
+        let Some(active) = cart.as_mut() else {
+            return;
+        };
+        match active.bus.load_ereader_card(&bytes) {
+            Ok(line) => publish_ereader(snapshot, line),
+            Err(error) => {
+                *held = None;
+                snapshot
+                    .lock()
+                    .expect("emulator snapshot poisoned")
+                    .ereader_line
+                    .clear();
+                set_error(snapshot, error);
+            }
+        }
+        return;
+    }
+    if held.is_none() && cart.as_ref().is_some_and(|active| active.bus.ereader_loaded()) {
+        if let Some(active) = cart.as_mut() {
+            active.bus.clear_ereader_card();
+        }
+        snapshot
+            .lock()
+            .expect("emulator snapshot poisoned")
+            .ereader_line
+            .clear();
+    }
+}
+
+fn publish_ereader(snapshot: &Mutex<Snapshot>, line: String) {
+    let mut state = snapshot.lock().expect("emulator snapshot poisoned");
+    state.ereader_line = line;
+    state.error = state.library_error.clone();
+}
+
 fn publish_link(snapshot: &Mutex<Snapshot>, link: &LinkHub) {
     let view = link.view();
     let mut state = snapshot.lock().expect("emulator snapshot poisoned");
@@ -3215,6 +3293,7 @@ fn take_link_command(
     cart: &mut Option<ActiveCart>,
     snapshot: &Mutex<Snapshot>,
     cheats: &mut Vec<LiveCheat>,
+    ereader: &mut Option<Vec<u8>>,
 ) -> Option<Command> {
     let replaces_cart = matches!(
         command,
@@ -3281,6 +3360,38 @@ fn take_link_command(
         Command::SetLinkName(name) => {
             link.set_name(&name);
             publish_link(snapshot, link);
+            None
+        }
+        Command::LoadEReader(bytes) => {
+            match ereader_label(&bytes) {
+                Ok(line) => {
+                    if let Some(active) = cart.as_mut() {
+                        match active.bus.load_ereader_card(&bytes) {
+                            Ok(line) => {
+                                *ereader = Some(bytes);
+                                publish_ereader(snapshot, line);
+                            }
+                            Err(error) => set_error(snapshot, error),
+                        }
+                    } else {
+                        *ereader = Some(bytes);
+                        publish_ereader(snapshot, line);
+                    }
+                }
+                Err(error) => set_error(snapshot, error),
+            }
+            None
+        }
+        Command::ClearEReader => {
+            *ereader = None;
+            if let Some(active) = cart.as_mut() {
+                active.bus.clear_ereader_card();
+            }
+            snapshot
+                .lock()
+                .expect("emulator snapshot poisoned")
+                .ereader_line
+                .clear();
             None
         }
         Command::AddCheat {
@@ -3850,6 +3961,7 @@ fn emulator_worker(
     let mut link_steps = 0u32;
     let mut rewind = Rewind::default();
     let mut cheats: Vec<LiveCheat> = Vec::new();
+    let mut ereader_card: Option<Vec<u8>> = None;
     let mut cheat_rom = String::new();
     let mut lcd_held: Option<Vec<u8>> = None;
     let mut shake_phase = 0u32;
@@ -3883,6 +3995,7 @@ fn emulator_worker(
             cheats = load_cheats(&cheat_rom);
             publish_cheats(&snapshot, &cheats, None);
         }
+        sync_ereader(&mut cart, &mut ereader_card, &snapshot);
         if cart.is_none() || paused {
             drive_link(&mut link, &mut cart, &snapshot);
             match receiver.recv_timeout(Duration::from_millis(100)) {
@@ -3891,7 +4004,14 @@ fn emulator_worker(
                         rewind.clear();
                     }
                     if let Some(command) =
-                        take_link_command(command, &mut link, &mut cart, &snapshot, &mut cheats)
+                        take_link_command(
+                            command,
+                            &mut link,
+                            &mut cart,
+                            &snapshot,
+                            &mut cheats,
+                            &mut ereader_card,
+                        )
                     {
                         match apply_command(
                             command,
@@ -3944,7 +4064,14 @@ fn emulator_worker(
                         rewind.clear();
                     }
                     if let Some(command) =
-                        take_link_command(command, &mut link, &mut cart, &snapshot, &mut cheats)
+                        take_link_command(
+                            command,
+                            &mut link,
+                            &mut cart,
+                            &snapshot,
+                            &mut cheats,
+                            &mut ereader_card,
+                        )
                     {
                         match apply_command(
                             command,
@@ -3983,6 +4110,7 @@ fn emulator_worker(
                 active.regs = slot.regs;
                 active.bus.rewind_restore(slot.bus);
                 frame_number = slot.frame_number;
+                sync_ereader(&mut cart, &mut ereader_card, &snapshot);
             }
         } else {
             rewind.released();
@@ -4010,7 +4138,14 @@ fn emulator_worker(
                         rewind.clear();
                     }
                     let Some(command) =
-                        take_link_command(command, &mut link, &mut cart, &snapshot, &mut cheats)
+                        take_link_command(
+                            command,
+                            &mut link,
+                            &mut cart,
+                            &snapshot,
+                            &mut cheats,
+                            &mut ereader_card,
+                        )
                     else {
                         continue;
                     };
@@ -4519,11 +4654,12 @@ fn apply_command(
         Command::AddCheat { .. } | Command::ToggleCheat(_) | Command::RemoveCheat(_) => {
             CommandResult::Continue
         }
+        Command::LoadEReader(_) | Command::ClearEReader => CommandResult::Continue,
         Command::Shutdown => CommandResult::Shutdown,
     }
 }
 
-fn set_error(snapshot: &Arc<Mutex<Snapshot>>, error: String) {
+fn set_error(snapshot: &Mutex<Snapshot>, error: String) {
     let mut state = snapshot.lock().expect("emulator snapshot poisoned");
     if !state.running {
         state.status = "ERROR".into();
@@ -5116,6 +5252,8 @@ fn app_menus(
                 MenuItem::action("键位设置…", ShowControls),
                 MenuItem::action("金手指…", ShowCheats),
                 MenuItem::action("联机…", ShowLink),
+                MenuItem::action("载入 e-Reader 卡…", LoadEReaderCard),
+                MenuItem::action("卸下 e-Reader 卡", ClearEReaderCard),
                 MenuItem::action("切换 BIOS HLE", ToggleBiosHle),
                 MenuItem::separator(),
                 MenuItem::action("声音：音量 +10%", VolumeUp),
@@ -5206,6 +5344,63 @@ fn prompt_rom_from_menu(
             Ok(Ok(Some(paths))) => {
                 if let Some(path) = paths.into_iter().next() {
                     accept_chosen_rom(commands, library_mode, path);
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                let _ = commands.send(Command::Error(format!("打开文件选择器失败：{error}")));
+            }
+            Err(error) => {
+                let _ = commands.send(Command::Error(format!("文件选择已取消：{error}")));
+            }
+        })
+        .detach();
+    }
+}
+
+fn send_ereader_file(commands: mpsc::Sender<Command>, path: PathBuf) {
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let _ = commands.send(Command::LoadEReader(bytes));
+        }
+        Err(error) => {
+            let _ = commands.send(Command::Error(format!("读不到这张卡：{error}")));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn pick_ereader_card() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .add_filter("e-Reader 卡", &["bin"])
+        .set_title("选择已经解开的 e-Reader 卡")
+        .pick_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+fn choose_ereader_from_menu(cx: &mut App, commands: mpsc::Sender<Command>) {
+    #[cfg(target_os = "macos")]
+    {
+        cx.spawn(async move |_| {
+            if let Some(path) = pick_ereader_card().await {
+                send_ereader_file(commands, path);
+            }
+        })
+        .detach();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择已经解开的 e-Reader 卡".into()),
+        });
+        cx.spawn(async move |_| match receiver.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    send_ereader_file(commands, path);
                 }
             }
             Ok(Ok(None)) => {}
@@ -6189,6 +6384,14 @@ fn main() {
         let cheat_keys = Arc::clone(&keys);
         let cheat_turbo = Arc::clone(&turbo_held);
         let cheat_rewind = Arc::clone(&rewind_held);
+        let ereader_commands = menu_commands.clone();
+        cx.on_action(move |_: &LoadEReaderCard, cx| {
+            choose_ereader_from_menu(cx, ereader_commands.clone());
+        });
+        let clear_ereader = menu_commands.clone();
+        cx.on_action(move |_: &ClearEReaderCard, _| {
+            let _ = clear_ereader.send(Command::ClearEReader);
+        });
         cx.on_action(move |_: &ShowCheats, cx| {
             let mut settings = cheat_controls.lock().expect("control settings poisoned");
             settings.open = false;

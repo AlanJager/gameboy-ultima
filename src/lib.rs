@@ -13,6 +13,7 @@ pub mod decode;
 mod disasm;
 mod dma;
 mod dynarec;
+mod ereader;
 mod gfxcache;
 mod gyro;
 mod icache;
@@ -43,6 +44,7 @@ mod timer;
 mod wait;
 
 pub use bus::Bus;
+pub use ereader::ereader_label;
 pub use cheats::{parse_cheat, CheatFamily, CheatProgram};
 pub use cpu::{run_until_self_branch, step, step_quiet, Stepped};
 pub use disasm::{disassemble, Disassembly};

@@ -2,6 +2,7 @@
 //!
 //! 没插线时到点自己结束，空位是 `0xFFFF`，忙位会清掉。插着线时，主机等到对方的字再结束。
 //! 客人自己不拉开始位，等主机把四个字送回来。
+//! 载入了 e-Reader 卡、又没插线时，2 号位按 Advance 4 的步骤把卡送出去。
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,9 @@ pub(crate) struct Sio {
     stalled: bool,
     send_generation: u32,
     published_generation: u32,
+    /// 载入的 e-Reader 卡。回退会带着它走，即时存档不记。
+    #[serde(skip, default)]
+    ereader: crate::ereader::EReader,
 }
 
 impl Sio {
@@ -58,7 +62,20 @@ impl Sio {
             stalled: false,
             send_generation: 0,
             published_generation: 0,
+            ereader: crate::ereader::EReader::default(),
         }
+    }
+
+    pub(crate) fn load_ereader(&mut self, bytes: &[u8]) -> Result<String, String> {
+        self.ereader.load(bytes)
+    }
+
+    pub(crate) fn clear_ereader(&mut self) {
+        self.ereader.clear();
+    }
+
+    pub(crate) fn ereader_loaded(&self) -> bool {
+        self.ereader.loaded()
     }
 
     pub(crate) fn waiting_for_peer(&self) -> bool {
@@ -297,9 +314,14 @@ impl Sio {
         }
     }
 
-    fn local_words(&self) -> [u16; 4] {
+    fn local_words(&mut self) -> [u16; 4] {
         let mut words = [0xFFFF; 4];
         words[0] = self.send;
+        if self.multi() && self.player.is_none() {
+            if let Some(word) = self.ereader.answer(self.send) {
+                words[1] = word;
+            }
+        }
         words
     }
 
@@ -311,7 +333,8 @@ impl Sio {
             if id != 0 {
                 cnt |= CNT_SI;
             }
-            if self.player.is_some() && self.connected_players() >= 2 {
+            let cable = self.player.is_some() && self.connected_players() >= 2;
+            if cable || self.ereader_on_cable() {
                 cnt |= CNT_SD;
             }
         } else if self.cnt & CNT_LENGTH != 0 {
@@ -351,12 +374,16 @@ impl Sio {
 
     fn connected_players(&self) -> u8 {
         if self.player.is_none() {
-            1
+            if self.ereader.loaded() { 2 } else { 1 }
         } else if self.peers == 0 {
             2
         } else {
             self.peers.clamp(1, 4)
         }
+    }
+
+    fn ereader_on_cable(&self) -> bool {
+        self.player.is_none() && self.ereader.loaded()
     }
 
     fn bump_send(&mut self) {
