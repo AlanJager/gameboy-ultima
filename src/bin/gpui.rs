@@ -261,6 +261,7 @@ impl Hotkey {
             Self::Rewind => None,
             Self::GyroLeft | Self::GyroRight => None,
             Self::TiltLeft | Self::TiltRight | Self::TiltUp | Self::TiltDown => None,
+            Self::System => None,
         }
     }
 }
@@ -2313,6 +2314,7 @@ fn function_bindings(
         .child(named_hotkey(cx, map, capturing, Hotkey::QuickLoad))
         .child(named_hotkey(cx, map, capturing, Hotkey::FastForward))
         .child(named_hotkey(cx, map, capturing, Hotkey::Rewind))
+        .child(named_hotkey(cx, map, capturing, Hotkey::System))
         .child(named_hotkey(cx, map, capturing, Hotkey::GyroLeft))
         .child(named_hotkey(cx, map, capturing, Hotkey::GyroRight))
         .child(named_hotkey(cx, map, capturing, Hotkey::TiltLeft))

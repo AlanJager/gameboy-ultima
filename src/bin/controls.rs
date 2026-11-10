@@ -131,10 +131,11 @@ pub(crate) enum Hotkey {
     TiltRight,
     TiltUp,
     TiltDown,
+    System,
 }
 
 impl Hotkey {
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::QuickSave,
         Self::QuickLoad,
         Self::FastForward,
@@ -145,6 +146,7 @@ impl Hotkey {
         Self::TiltRight,
         Self::TiltUp,
         Self::TiltDown,
+        Self::System,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -159,6 +161,7 @@ impl Hotkey {
             Self::TiltRight => 7,
             Self::TiltUp => 8,
             Self::TiltDown => 9,
+            Self::System => 10,
         }
     }
 
@@ -174,6 +177,7 @@ impl Hotkey {
             Self::TiltRight => "倾斜向右",
             Self::TiltUp => "倾斜向上",
             Self::TiltDown => "倾斜向下",
+            Self::System => "系统",
         }
     }
 
@@ -189,6 +193,7 @@ impl Hotkey {
             Self::TiltRight => "tilt_right",
             Self::TiltUp => "tilt_up",
             Self::TiltDown => "tilt_down",
+            Self::System => "system",
         }
     }
 
@@ -204,6 +209,7 @@ impl Hotkey {
             Self::TiltRight => "hotkey-tilt-right",
             Self::TiltUp => "hotkey-tilt-up",
             Self::TiltDown => "hotkey-tilt-down",
+            Self::System => "hotkey-system",
         }
     }
 }
@@ -233,7 +239,7 @@ impl BindingTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KeyMap {
     keys: [String; 11],
-    hotkeys: [String; 10],
+    hotkeys: [String; 11],
 }
 
 impl Default for KeyMap {
@@ -263,6 +269,7 @@ impl Default for KeyMap {
                 ".".into(),
                 ";".into(),
                 "'".into(),
+                "f7".into(),
             ],
         }
     }
@@ -666,6 +673,8 @@ pub(crate) fn write_controls(path: &Path, saved: &SavedControls) -> Result<(), S
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -939,5 +948,14 @@ mod tests {
         let error = read_controls(&future).unwrap_err();
         assert!(error.contains("不支持的键位版本：2"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_keymap_without_system_still_uses_f7() {
+        let map = map_from_bindings(&HashMap::from([("rewind".to_string(), "f6".to_string())]));
+        assert_eq!(map.hotkey(Hotkey::System), "f7");
+        assert_eq!(map.hotkey(Hotkey::Rewind), "f6");
+        assert_eq!(map.hotkey(Hotkey::FastForward), "tab");
+        assert_eq!(KeyMap::default().hotkey(Hotkey::System), "f7");
     }
 }
