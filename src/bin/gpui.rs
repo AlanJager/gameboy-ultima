@@ -1582,14 +1582,13 @@ impl Render for AppView {
         } else {
             link_name.clone()
         };
-        let (cheat_name, cheat_code, cheat_gameshark, cheat_action_replay, cheat_editing_name) = {
+        let (cheat_name, cheat_code, cheat_gameshark, cheat_action_replay) = {
             let cheat = self.cheat_ui.lock().expect("cheat ui poisoned");
             (
                 cheat.name.clone(),
                 cheat.code.clone(),
                 cheat.gameshark,
                 cheat.action_replay,
-                matches!(cheat.field, CheatField::Name),
             )
         };
         let locked_speed = self.locked_speed.load(Ordering::Relaxed);
@@ -1680,7 +1679,7 @@ impl Render for AppView {
                 rumble_shake,
                 &link_address,
                 &shown_name,
-                link_field,
+                self.system_field,
                 &link_line,
                 &ereader_line,
                 link_error.as_deref(),
@@ -1692,7 +1691,6 @@ impl Render for AppView {
                 &cheat_code,
                 cheat_gameshark,
                 cheat_action_replay,
-                cheat_editing_name,
                 &cheats,
                 cheat_error.as_deref(),
             )
@@ -2674,7 +2672,7 @@ fn cheat_overlay(
             code,
             gameshark,
             action_replay,
-            editing_name,
+            Some(editing_name),
             cheats,
             error,
         ))
@@ -2686,7 +2684,7 @@ fn cheat_panel(
     code: &str,
     gameshark: bool,
     action_replay: bool,
-    editing_name: bool,
+    editing_name: Option<bool>,
     cheats: &[CheatView],
     error: Option<&str>,
 ) -> impl IntoElement {
@@ -2737,7 +2735,7 @@ fn cheat_panel(
                         .rounded(px(6.))
                         .bg(rgb(BG))
                         .border_1()
-                        .border_color(rgb(if editing_name { ACCENT } else { 0x314044 }))
+                        .border_color(rgb(if editing_name == Some(true) { ACCENT } else { 0x314044 }))
                         .text_color(rgb(if name.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2757,7 +2755,11 @@ fn cheat_panel(
                         .rounded(px(6.))
                         .bg(rgb(BG))
                         .border_1()
-                        .border_color(rgb(if editing_name { 0x314044 } else { ACCENT }))
+                        .border_color(rgb(if editing_name == Some(false) {
+                            ACCENT
+                        } else {
+                            0x314044
+                        }))
                         .text_color(rgb(if code.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2938,7 +2940,7 @@ fn link_overlay(
             cx,
             address,
             name,
-            editing_name,
+            Some(editing_name),
             line,
             card_line,
             error,
@@ -2953,7 +2955,7 @@ fn link_panel(
     cx: &mut Context<AppView>,
     address: &str,
     name: &str,
-    editing_name: bool,
+    editing_name: Option<bool>,
     line: &str,
     card_line: &str,
     error: Option<&str>,
@@ -3066,7 +3068,7 @@ fn link_panel(
                         .rounded(px(6.))
                         .bg(rgb(BG))
                         .border_1()
-                        .border_color(rgb(if editing_name { ACCENT } else { 0x314044 }))
+                        .border_color(rgb(if editing_name == Some(true) { ACCENT } else { 0x314044 }))
                         .text_color(rgb(if name.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -3162,7 +3164,11 @@ fn link_panel(
                         .rounded(px(6.))
                         .bg(rgb(BG))
                         .border_1()
-                        .border_color(rgb(if editing_name { 0x314044 } else { ACCENT }))
+                        .border_color(rgb(if editing_name == Some(false) {
+                            ACCENT
+                        } else {
+                            0x314044
+                        }))
                         .text_color(if address.is_empty() {
                             rgb(MUTED)
                         } else {
@@ -6567,6 +6573,7 @@ fn main() {
             KeyBinding::new("cmd-s", SaveSlot1, None),
             KeyBinding::new("space", TogglePause, None),
         ]);
+        cx.bind_keys([system_typing_binding()]);
         let open_commands = menu_commands.clone();
         let open_library_mode = Arc::clone(&library_mode);
         cx.on_action(move |_: &OpenRom, cx| {

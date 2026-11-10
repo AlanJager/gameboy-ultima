@@ -64,6 +64,26 @@ pub(crate) fn system_stops_link(_input: SystemInput) -> bool {
     false
 }
 
+pub(crate) fn system_link_highlight(field: SystemField) -> Option<bool> {
+    match field {
+        SystemField::LinkName => Some(true),
+        SystemField::LinkAddress => Some(false),
+        SystemField::None | SystemField::CheatName | SystemField::CheatCode => None,
+    }
+}
+
+pub(crate) fn system_cheat_highlight(field: SystemField) -> Option<bool> {
+    match field {
+        SystemField::CheatName => Some(true),
+        SystemField::CheatCode => Some(false),
+        SystemField::None | SystemField::LinkName | SystemField::LinkAddress => None,
+    }
+}
+
+pub(crate) fn system_typing_binding() -> gpui::KeyBinding {
+    gpui::KeyBinding::new("space", gpui::NoAction, Some("SystemTyping"))
+}
+
 pub(crate) fn pause_key_while_open(open: bool) -> Option<SystemInput> {
     if open {
         Some(SystemInput::Resume)
@@ -81,7 +101,7 @@ pub(crate) fn system_page(
     rumble_shake: bool,
     address: &str,
     name: &str,
-    editing_name: bool,
+    field: SystemField,
     line: &str,
     card_line: &str,
     link_error: Option<&str>,
@@ -93,12 +113,14 @@ pub(crate) fn system_page(
     cheat_code: &str,
     gameshark: bool,
     action_replay: bool,
-    editing_cheat_name: bool,
     cheats: &[CheatView],
     cheat_error: Option<&str>,
 ) -> impl IntoElement {
     div()
         .id("system-page")
+        .when(field != SystemField::None, |page| {
+            page.key_context("SystemTyping")
+        })
         .size_full()
         .overflow_y_scroll()
         .flex()
@@ -170,7 +192,7 @@ pub(crate) fn system_page(
             cx,
             address,
             name,
-            editing_name,
+            system_link_highlight(field),
             line,
             card_line,
             link_error,
@@ -185,7 +207,7 @@ pub(crate) fn system_page(
             cheat_code,
             gameshark,
             action_replay,
-            editing_cheat_name,
+            system_cheat_highlight(field),
             cheats,
             cheat_error,
         ))
@@ -286,5 +308,38 @@ mod tests {
             system_key(SystemField::LinkName, "f9", "f9"),
             SystemKey::Ignore
         );
+    }
+
+    #[test]
+    fn a_focused_system_field_types_space_instead_of_resuming() {
+        let keymap = gpui::Keymap::new(vec![
+            gpui::KeyBinding::new("space", super::super::TogglePause, None),
+            system_typing_binding(),
+        ]);
+        let space = [gpui::Keystroke::parse("space").unwrap()];
+        let typing = [gpui::KeyContext::parse("SystemTyping").unwrap()];
+        let idle = [gpui::KeyContext::parse("System").unwrap()];
+        let (typing_hit, _) = keymap.bindings_for_input(&space, &typing);
+        let (idle_hit, _) = keymap.bindings_for_input(&space, &idle);
+        assert!(typing_hit.is_empty());
+        assert_eq!(idle_hit.len(), 1);
+        assert_eq!(
+            system_key(SystemField::CheatCode, "space", "f7"),
+            SystemKey::Edit
+        );
+        assert_eq!(system_key(SystemField::LinkName, "space", "f7"), SystemKey::Edit);
+        assert_eq!(system_key(SystemField::None, "space", "f7"), SystemKey::Ignore);
+    }
+
+    #[test]
+    fn system_highlight_follows_the_focused_field_only() {
+        assert_eq!(system_link_highlight(SystemField::None), None);
+        assert_eq!(system_link_highlight(SystemField::LinkName), Some(true));
+        assert_eq!(system_link_highlight(SystemField::LinkAddress), Some(false));
+        assert_eq!(system_link_highlight(SystemField::CheatName), None);
+        assert_eq!(system_cheat_highlight(SystemField::None), None);
+        assert_eq!(system_cheat_highlight(SystemField::CheatName), Some(true));
+        assert_eq!(system_cheat_highlight(SystemField::CheatCode), Some(false));
+        assert_eq!(system_cheat_highlight(SystemField::LinkAddress), None);
     }
 }
