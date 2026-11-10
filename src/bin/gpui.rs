@@ -15,6 +15,7 @@ use gameboy_ultima::{
 };
 #[path = "controls.rs"]
 mod controls;
+mod system;
 use controls::*;
 #[cfg(target_os = "macos")]
 #[path = "metal_screen.rs"]
