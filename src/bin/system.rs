@@ -171,6 +171,25 @@ pub(crate) fn system_page(
                     |window, cx| window.dispatch_action(Box::new(ToggleRumbleShake), cx),
                 )),
         )
+        .child(div().text_sm().text_color(rgb(MUTED)).child("调试"))
+        .child(
+            div()
+                .id("system-debug")
+                .px(px(14.))
+                .py(px(8.))
+                .rounded(px(6.))
+                .bg(rgb(0x202A2C))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.system_field = SystemField::None;
+                    this.link_ui.lock().expect("link ui poisoned").open = false;
+                    this.cheat_ui.lock().expect("cheat ui poisoned").open = false;
+                    this.controls.lock().expect("control settings poisoned").open = false;
+                    this.debug_ui.open = true;
+                    cx.notify();
+                }))
+                .child("打开调试"),
+        )
         .child(div().text_sm().text_color(rgb(MUTED)).child("金手指"))
         .child(
             div()
@@ -184,6 +203,7 @@ pub(crate) fn system_page(
                     this.system_field = SystemField::None;
                     this.link_ui.lock().expect("link ui poisoned").open = false;
                     this.controls.lock().expect("control settings poisoned").open = false;
+                    this.debug_ui.open = false;
                     this.cheat_ui.lock().expect("cheat ui poisoned").open = true;
                     cx.notify();
                 }))
@@ -202,6 +222,7 @@ pub(crate) fn system_page(
                     this.system_field = SystemField::None;
                     this.cheat_ui.lock().expect("cheat ui poisoned").open = false;
                     this.controls.lock().expect("control settings poisoned").open = false;
+                    this.debug_ui.open = false;
                     this.link_ui.lock().expect("link ui poisoned").open = true;
                     cx.notify();
                 }))

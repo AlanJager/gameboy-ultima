@@ -1035,6 +1035,10 @@ impl Bus {
         self.sound.set_output_stride(speed);
     }
 
+    pub fn channel_levels(&self) -> [u8; 4] {
+        self.apu.channel_levels()
+    }
+
     /// `pressed` 里 1 表示按下。低 10 位从低到高是 A、B、Select、Start、右、左、上、下、R、L。
     pub fn set_keys(&mut self, pressed: u16) {
         self.keys.set_pressed(pressed);

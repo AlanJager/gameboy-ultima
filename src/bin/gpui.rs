@@ -8,9 +8,10 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use gameboy_ultima::debug::{format_memory, level_text, list_around, should_stop, toggle_break};
 use gameboy_ultima::link::{normalize_link_name, LinkHub, LinkSeat, LINK_ROOM};
 use gameboy_ultima::{
-    audio_pace, ereader_label, format_cheat, parse_cheat, read_cheat, rgb555_to_888, step_quiet,
+    audio_pace, ereader_label, format_cheat, parse_cheat, read_cheat, rgb555_to_888, step, step_quiet,
     AudioPlay, Bus, CheatFamily, CheatProgram, CheatReading, Registers, CYCLES_PER_FRAME,
     DEFAULT_SOLAR, HEIGHT, WIDTH,
 };
@@ -253,6 +254,8 @@ enum Command {
     RemoveCheat(usize),
     Error(String),
     SystemKey,
+    ToggleBreak(u32),
+    SetDebugAddress(Option<u32>),
     Shutdown,
 }
 
@@ -353,6 +356,10 @@ struct Snapshot {
     solar_cart: bool,
     solar: u8,
     system_open: bool,
+    debug_lines: Vec<(u32, String, bool, bool)>,
+    debug_memory: Vec<String>,
+    debug_levels: String,
+    debug_stop: u64,
 }
 
 enum LinkField {
@@ -380,6 +387,12 @@ struct CheatUi {
     gameshark: bool,
     action_replay: bool,
     field: CheatField,
+}
+
+struct DebugUi {
+    open: bool,
+    address: String,
+    editing: bool,
 }
 
 #[derive(Clone)]
@@ -461,6 +474,8 @@ struct AppView {
     controls: Arc<Mutex<ControlSettings>>,
     link_ui: Arc<Mutex<LinkUi>>,
     cheat_ui: Arc<Mutex<CheatUi>>,
+    debug_ui: DebugUi,
+    seen_debug_stop: u64,
     system_field: SystemField,
 }
 
@@ -539,6 +554,12 @@ impl AppView {
             controls,
             link_ui,
             cheat_ui,
+            debug_ui: DebugUi {
+                open: false,
+                address: String::new(),
+                editing: false,
+            },
+            seen_debug_stop: 0,
             system_field: SystemField::None,
         }
     }
@@ -992,12 +1013,77 @@ impl AppView {
         }
     }
 
+    fn edit_debug(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = normalize_key(&event.keystroke.key);
+        if key == "escape" {
+            self.debug_ui.open = false;
+            self.debug_ui.editing = false;
+            cx.notify();
+            return;
+        }
+        if key == "v" && event.keystroke.modifiers.platform && !event.is_held {
+            if self.debug_ui.editing {
+                if let Some(text) = clipboard_text() {
+                    self.debug_ui.address = text
+                        .chars()
+                        .filter(|ch| ch.is_ascii_hexdigit())
+                        .take(8)
+                        .collect::<String>()
+                        .to_ascii_uppercase();
+                    self.push_debug_addr();
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        if !self.debug_ui.editing {
+            return;
+        }
+        if key == "enter" {
+            self.debug_ui.editing = false;
+            cx.notify();
+            return;
+        }
+        if key == "backspace" {
+            self.debug_ui.address.pop();
+            self.push_debug_addr();
+            cx.notify();
+            return;
+        }
+        let Some(ch) = key.chars().next() else {
+            return;
+        };
+        if key.chars().nth(1).is_some() || !ch.is_ascii_hexdigit() || event.is_held {
+            return;
+        }
+        if self.debug_ui.address.len() < 8 {
+            self.debug_ui.address.push(ch.to_ascii_uppercase());
+            self.push_debug_addr();
+            cx.notify();
+        }
+    }
+
+    fn push_debug_addr(&self) {
+        let digits: String = self
+            .debug_ui
+            .address
+            .chars()
+            .filter(|ch| ch.is_ascii_hexdigit())
+            .collect();
+        let addr = u32::from_str_radix(&digits, 16).ok();
+        let _ = self.commands.send(Command::SetDebugAddress(addr));
+    }
+
     fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let system_open = self
             .snapshot
             .lock()
             .expect("emulator snapshot poisoned")
             .system_open;
+        if system_open && self.debug_ui.open {
+            self.edit_debug(event, cx);
+            return;
+        }
         if self.cheat_open() {
             self.edit_cheat_field(event, cx);
             return;
@@ -1518,6 +1604,10 @@ impl Render for AppView {
             lcd_ghost,
             color_correct,
             rumble_shake,
+            debug_lines,
+            debug_memory,
+            debug_levels,
+            debug_stop,
         ) = {
             let snapshot = self.snapshot.lock().expect("emulator snapshot poisoned");
             (
@@ -1546,8 +1636,24 @@ impl Render for AppView {
                 snapshot.lcd_ghost,
                 snapshot.color_correct,
                 snapshot.rumble_shake,
+                snapshot.debug_lines.clone(),
+                snapshot.debug_memory.clone(),
+                snapshot.debug_levels.clone(),
+                snapshot.debug_stop,
             )
         };
+        if debug_stop != self.seen_debug_stop {
+            self.seen_debug_stop = debug_stop;
+            if debug_stop != 0 {
+                self.debug_ui.open = true;
+                self.debug_ui.editing = false;
+                self.link_ui.lock().expect("link ui poisoned").open = false;
+                self.cheat_ui.lock().expect("cheat ui poisoned").open = false;
+            }
+        } else if !system_open {
+            self.debug_ui.open = false;
+            self.debug_ui.editing = false;
+        }
         if prefs_token != self.applied_prefs {
             self.applied_prefs = prefs_token;
             if !rom_id.is_empty() {
@@ -1792,6 +1898,7 @@ impl Render for AppView {
             .when(
                 self.cheat_open()
                     || self.link_open()
+                    || self.debug_ui.editing
                     || (system_open && self.system_field != SystemField::None),
                 |app| app.key_context("SystemTyping"),
             )
@@ -1823,6 +1930,24 @@ impl Render for AppView {
                     cheat_error.as_deref(),
                 ))
             })
+            .when(
+                system_open
+                    && !self.compare
+                    && !controls_open
+                    && !link_open
+                    && !self.cheat_open()
+                    && self.debug_ui.open,
+                |app| {
+                    app.child(debug_overlay(
+                        cx,
+                        &debug_lines,
+                        &debug_memory,
+                        &debug_levels,
+                        &self.debug_ui.address,
+                        self.debug_ui.editing,
+                    ))
+                },
+            )
             .when(!self.compare && !controls_open && link_open, |app| {
                 app.child(link_overlay(
                     cx,
@@ -2652,6 +2777,130 @@ fn cap_lines(mut lines: Vec<String>, max: usize, rest: &str) -> Vec<String> {
         lines.push(format!("还有 {extra} {rest}"));
     }
     lines
+}
+
+fn debug_overlay(
+    cx: &mut Context<AppView>,
+    lines: &[(u32, String, bool, bool)],
+    memory: &[String],
+    levels: &str,
+    address: &str,
+    editing: bool,
+) -> impl IntoElement {
+    let address_text = if address.is_empty() {
+        "点这里填地址，空着就跟 PC".to_string()
+    } else {
+        address.to_string()
+    };
+    div()
+        .absolute()
+        .top(px(0.))
+        .right(px(0.))
+        .bottom(px(0.))
+        .left(px(0.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(0x050809))
+        .child(
+            div()
+                .id("debug-panel")
+                .w(px(560.))
+                .max_h(px(640.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .p(px(18.))
+                .rounded(px(16.))
+                .bg(rgb(PANEL_HI))
+                .border_1()
+                .border_color(rgb(0x314044))
+                .text_color(rgb(TEXT))
+                .child(div().text_lg().child("调试"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child("暂停时才能改。点一行设断点。命中后停在这一条，还没执行。Esc 关闭。"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(ACCENT))
+                        .child(if levels.is_empty() {
+                            "方波 1  0    方波 2  0    波形  0    噪声  0".to_string()
+                        } else {
+                            levels.to_string()
+                        }),
+                )
+                .children(lines.iter().enumerate().map(|(index, (addr, text, here, stop))| {
+                    let addr = *addr;
+                    let mark = if *here { ">" } else { " " };
+                    let dot = if *stop { "●" } else { " " };
+                    div()
+                        .id(("debug-line", index))
+                        .w_full()
+                        .px(px(8.))
+                        .py(px(2.))
+                        .rounded(px(4.))
+                        .bg(rgb(if *here { 0x243034 } else { BG }))
+                        .text_color(rgb(if *stop { ACCENT } else { TEXT }))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let _ = this.commands.send(Command::ToggleBreak(addr));
+                            cx.notify();
+                        }))
+                        .child(format!("{mark} {dot}  {addr:08X}  {text}"))
+                }))
+                .child(div().text_sm().text_color(rgb(TEXT)).child("内存"))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .id("debug-address")
+                                .flex_1()
+                                .px(px(12.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(BG))
+                                .border_1()
+                                .border_color(rgb(if editing { ACCENT } else { 0x314044 }))
+                                .text_color(rgb(if address.is_empty() { MUTED } else { TEXT }))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.debug_ui.editing = true;
+                                    cx.notify();
+                                }))
+                                .child(address_text),
+                        )
+                        .child(
+                            div()
+                                .id("debug-follow")
+                                .px(px(14.))
+                                .py(px(8.))
+                                .rounded(px(6.))
+                                .bg(rgb(BG))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.debug_ui.address.clear();
+                                    this.debug_ui.editing = false;
+                                    let _ = this.commands.send(Command::SetDebugAddress(None));
+                                    cx.notify();
+                                }))
+                                .child("跟到 PC"),
+                        ),
+                )
+                .children(memory.iter().map(|line| {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(line.clone())
+                })),
+        )
 }
 
 fn cheat_overlay(
@@ -3608,6 +3857,33 @@ fn relay_target(address: &str) -> String {
     }
 }
 
+fn publish_debug(
+    snapshot: &Mutex<Snapshot>,
+    cart: &Option<ActiveCart>,
+    breaks: &[u32],
+    debug_addr: Option<u32>,
+    debug_stop: u64,
+) {
+    let Some(active) = cart.as_ref() else {
+        return;
+    };
+    let pc = active.regs.pc();
+    let thumb = active.regs.thumb();
+    let lines = list_around(&active.bus, pc, thumb, breaks);
+    let base = debug_addr.unwrap_or(pc) & !7;
+    let bytes = (0..32)
+        .map(|index| active.bus.read_u8(base.wrapping_add(index)))
+        .collect::<Vec<_>>();
+    let mut state = snapshot.lock().expect("emulator snapshot poisoned");
+    state.debug_lines = lines
+        .into_iter()
+        .map(|line| (line.address, line.text, line.here, line.breakpoint))
+        .collect();
+    state.debug_memory = format_memory(base, &bytes);
+    state.debug_levels = level_text(active.bus.channel_levels());
+    state.debug_stop = debug_stop;
+}
+
 fn publish_system(snapshot: &Mutex<Snapshot>, open: bool, paused: bool) {
     let mut state = snapshot.lock().expect("emulator snapshot poisoned");
     state.system_open = open;
@@ -3631,6 +3907,8 @@ fn take_link_command(
     ereader: &mut Option<Vec<u8>>,
     system_open: &mut bool,
     paused: &mut bool,
+    breaks: &mut Vec<u32>,
+    debug_addr: &mut Option<u32>,
 ) -> Option<Command> {
     let replaces_cart = matches!(
         command,
@@ -3797,6 +4075,14 @@ fn take_link_command(
             }
             let error = save_cheats(&rom_id, cheats).err();
             publish_cheats(snapshot, cheats, error);
+            None
+        }
+        Command::ToggleBreak(pc) => {
+            toggle_break(breaks, pc);
+            None
+        }
+        Command::SetDebugAddress(addr) => {
+            *debug_addr = addr;
             None
         }
         Command::SystemKey => {
@@ -4334,6 +4620,10 @@ fn emulator_worker(
     let mut cheat_rom = String::new();
     let mut lcd_held: Option<Vec<u8>> = None;
     let mut shake_phase = 0u32;
+    let mut breaks: Vec<u32> = Vec::new();
+    let mut debug_addr: Option<u32> = None;
+    let mut skip_break: Option<u32> = None;
+    let mut debug_stop = 0u64;
 
     'worker: loop {
         let pad = poll_gamepad(&mut pads);
@@ -4361,11 +4651,17 @@ fn emulator_worker(
                 snapshot.lock().expect("emulator snapshot poisoned").solar_cart = false;
             }
             cheat_rom = rom_id;
+            breaks.clear();
+            debug_addr = None;
+            skip_break = None;
             cheats = load_cheats(&cheat_rom);
             publish_cheats(&snapshot, &cheats, None);
         }
         sync_ereader(&mut cart, &mut ereader_card, &snapshot);
         if cart.is_none() || paused {
+            if paused {
+                publish_debug(&snapshot, &cart, &breaks, debug_addr, debug_stop);
+            }
             drive_link(&mut link, &mut cart, &snapshot);
             match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(command) => {
@@ -4382,6 +4678,8 @@ fn emulator_worker(
                             &mut ereader_card,
                             &mut system_open,
                             &mut paused,
+                            &mut breaks,
+                            &mut debug_addr,
                         )
                     {
                         match apply_command(
@@ -4444,6 +4742,8 @@ fn emulator_worker(
                             &mut ereader_card,
                             &mut system_open,
                             &mut paused,
+                            &mut breaks,
+                            &mut debug_addr,
                         )
                     {
                         match apply_command(
@@ -4520,6 +4820,8 @@ fn emulator_worker(
                             &mut ereader_card,
                             &mut system_open,
                             &mut paused,
+                            &mut breaks,
+                            &mut debug_addr,
                         )
                     else {
                         if paused {
@@ -4559,6 +4861,16 @@ fn emulator_worker(
             if paused {
                 continue 'worker;
             }
+            let pc = cart.as_ref().expect("running cart exists").regs.pc();
+            if should_stop(&breaks, pc, skip_break) {
+                skip_break = Some(pc & !1);
+                paused = true;
+                system_open = true;
+                debug_stop = debug_stop.wrapping_add(1);
+                publish_system(&snapshot, true, true);
+                publish_debug(&snapshot, &cart, &breaks, debug_addr, debug_stop);
+                continue 'worker;
+            }
             let active = cart.as_mut().expect("running cart exists");
             active.bus.set_keys(held_keys(keys.load(Ordering::Relaxed), pad));
             active
@@ -4568,7 +4880,15 @@ fn emulator_worker(
                 .bus
                 .set_tilt_bits(tilt_keys.load(Ordering::Relaxed));
             active.bus.set_solar(solar.load(Ordering::Relaxed));
-            if let Err(error) = step_quiet(&mut active.regs, &mut active.bus) {
+            let stepped = if breaks.is_empty() {
+                step_quiet(&mut active.regs, &mut active.bus)
+            } else {
+                step(&mut active.regs, &mut active.bus).map(|_| ())
+            };
+            if !breaks.is_empty() && active.regs.pc() & !1 != skip_break.unwrap_or(u32::MAX) {
+                skip_break = None;
+            }
+            if let Err(error) = stepped {
                 paused = true;
                 let mut state = snapshot.lock().expect("emulator snapshot poisoned");
                 state.running = false;
@@ -5033,7 +5353,9 @@ fn apply_command(
             CommandResult::Continue
         }
         Command::LoadEReader(_) | Command::ClearEReader => CommandResult::Continue,
-        Command::SystemKey => CommandResult::Continue,
+        Command::SystemKey
+        | Command::ToggleBreak(_)
+        | Command::SetDebugAddress(_) => CommandResult::Continue,
         Command::Shutdown => CommandResult::Shutdown,
     }
 }

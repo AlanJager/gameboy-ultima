@@ -9,6 +9,7 @@ mod bus;
 mod cheats;
 pub mod condition;
 mod cpu;
+pub mod debug;
 pub mod decode;
 mod disasm;
 mod dma;

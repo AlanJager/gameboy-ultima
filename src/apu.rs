@@ -180,6 +180,34 @@ impl Fifo {
 }
 
 impl Apu {
+    /// 方波 1、方波 2、波形、噪声。方波和噪声是当前包络 0–15，关掉就是 0。波形是音量档 0–4。
+    pub(crate) fn channel_levels(&self) -> [u8; 4] {
+        let square = |index: usize| {
+            let channel = &self.squares[index];
+            if channel.enabled && channel.dac {
+                channel.volume
+            } else {
+                0
+            }
+        };
+        let wave = if self.wave.enabled {
+            let reg = self.regs[0x13];
+            if reg & 0x80 != 0 {
+                4
+            } else {
+                (reg >> 5) & 3
+            }
+        } else {
+            0
+        };
+        let noise = if self.noise.enabled && self.noise.dac {
+            self.noise.volume
+        } else {
+            0
+        };
+        [square(0), square(1), wave, noise]
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             enabled: false,
