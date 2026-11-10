@@ -4,9 +4,11 @@
 
 Apple Silicon 上，Thumb 里连续的低位寄存器运算已经能译成宿主指令。这台 Mac 上 1 倍解释器已经够 16.78 MHz，所以扩展不是为了让 1 倍跑起来，而是让 2–8 倍和更慢的机器少在每条指令上返回 Rust。
 
-这一份只定范围和验收。不改 `src/dynarec.rs`。
+这一份定下一步还要覆盖哪些指令。x86_64 已经按同一份分类接上，再往下仍是先把拍数折进宿主代码。
 
 ## 现在
+
+Apple Silicon 和 x86_64 都用同一份 `classify`。x86_64 的寄存器、NZCV 和拍数跟解释器对照。其它机器仍逐条解释。
 
 `classify` 收下这些 Thumb 运算，并且只动 `r0`–`r7` 和 NZCV：
 
@@ -15,7 +17,7 @@ Apple Silicon 上，Thumb 里连续的低位寄存器运算已经能译成宿主
 - Alu，除了寄存器指定的 LSL、LSR、ASR、ROR（操作码 2、3、4、7）
 - Mul 记 2 拍，其余记 1 拍
 
-一段最少 2 条，最多 8 条，算进 `step_quiet` 的一批。宿主代码跑完之后，Rust 仍按每条原来的取指和空闲去 `account`、`note_internal`、`advance`。访存、跳转、高位寄存器、入栈出栈、软件中断、BX 和整段 ARM 仍逐条解释。不是 Apple Silicon 时 `try_block` 直接返回，仍走解释器。
+一段最少 2 条，最多 8 条，算进 `step_quiet` 的一批。宿主代码跑完之后，Rust 仍按每条原来的取指和空闲去 `account`、`note_internal`、`advance`。访存、跳转、高位寄存器、入栈出栈、软件中断、BX 和整段 ARM 仍逐条解释。不是 Apple Silicon、也不是 x86_64 时，`try_block` 直接返回，仍走解释器。
 
 断点非空时工作线程改走单步 `step`，不进这段宿主代码，所以断点不会落在一段中间。
 

@@ -800,7 +800,7 @@ impl Bus {
     }
 
     /// 这一拍的 `advance` 会把按键中断置进 `IF`，而且 CPU 马上会进中断。
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
     pub(crate) fn key_irq_would_fire(&self) -> bool {
         let mask = self.keys.irq_mask();
         if mask == 0 || self.io[IME] & 1 == 0 {
@@ -810,7 +810,7 @@ impl Bus {
         ie & mask != 0
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(all(target_arch = "aarch64", target_os = "macos"), target_arch = "x86_64"))]
     pub(crate) fn dma_owing(&self) -> bool {
         self.dma.owing() != 0
     }

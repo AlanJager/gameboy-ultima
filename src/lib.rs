@@ -14,6 +14,8 @@ pub mod decode;
 mod disasm;
 mod dma;
 mod dynarec;
+#[cfg(any(test, target_arch = "x86_64"))]
+mod dynarec_x64;
 mod ereader;
 mod gfxcache;
 mod gyro;

@@ -82,12 +82,18 @@ impl Registers {
     }
 
     /// `r0`–`r7` 的起点。这八个在任何模式都落在同一组里。
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        target_arch = "x86_64"
+    ))]
     pub(crate) fn low_regs_ptr(&mut self) -> *mut u32 {
         self.r.as_mut_ptr()
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        target_arch = "x86_64"
+    ))]
     pub(crate) fn cpsr_ptr(&mut self) -> *mut u32 {
         &mut self.cpsr
     }

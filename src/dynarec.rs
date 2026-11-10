@@ -1,4 +1,4 @@
-//! Thumb 直线上的低位寄存器运算，在 Apple Silicon 上译成宿主指令。
+//! Thumb 直线上的低位寄存器运算，在 Apple Silicon 和 x86_64 上译成宿主指令。
 //!
 //! 访存、跳转、高位寄存器、寄存器移位和 ARM 仍逐条解释。
 //! 译出来的代码只改 `r0`–`r7` 和 NZCV。拍数还是按原来的取指和空闲，一条条 `account` / `advance`，
@@ -22,7 +22,10 @@ pub(crate) struct Dynarec {
     enabled: bool,
     compiled: u64,
     ran: u64,
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        target_arch = "x86_64"
+    ))]
     engine: Engine,
 }
 
@@ -32,7 +35,10 @@ impl Default for Dynarec {
             enabled: true,
             compiled: 0,
             ran: 0,
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            #[cfg(any(
+                all(target_arch = "aarch64", target_os = "macos"),
+                target_arch = "x86_64"
+            ))]
             engine: Engine::empty(),
         }
     }
@@ -44,7 +50,10 @@ impl Clone for Dynarec {
             enabled: self.enabled,
             compiled: 0,
             ran: 0,
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            #[cfg(any(
+                all(target_arch = "aarch64", target_os = "macos"),
+                target_arch = "x86_64"
+            ))]
             engine: Engine::empty(),
         }
     }
@@ -75,25 +84,37 @@ impl Dynarec {
     }
 
     pub(crate) fn clear(&mut self) {
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[cfg(any(
+            all(target_arch = "aarch64", target_os = "macos"),
+            target_arch = "x86_64"
+        ))]
         self.engine.flush();
     }
 }
 
 /// 能译就跑掉 `limit` 条里的一段，返回实际条数。这段算进 `step_quiet` 的 8 条预算。
 pub(crate) fn try_block(regs: &mut Registers, bus: &mut Bus, limit: u32) -> Option<u32> {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        target_arch = "x86_64"
+    ))]
     {
         return try_block_host(regs, bus, limit);
     }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        target_arch = "x86_64"
+    )))]
     {
         let _ = (regs, bus, limit);
         None
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    target_arch = "x86_64"
+))]
 fn try_block_host(regs: &mut Registers, bus: &mut Bus, limit: u32) -> Option<u32> {
     if !bus.dynarec.enabled || limit < 2 || !regs.thumb() || regs.pc() & 1 != 0 {
         return None;
@@ -114,7 +135,10 @@ fn try_block_host(regs: &mut Registers, bus: &mut Bus, limit: u32) -> Option<u32
     }
     let pc = regs.pc();
     let mut halfs = [0u16; BLOCK];
-    let mut plans = [Plan { base: 1, idle: false }; BLOCK];
+    let mut plans = [Plan {
+        base: 1,
+        idle: false,
+    }; BLOCK];
     let mut n = 0;
     while n < max_n {
         let half = bus.read_u16(pc.wrapping_add((n as u32) * 2));
@@ -148,13 +172,22 @@ fn try_block_host(regs: &mut Registers, bus: &mut Bus, limit: u32) -> Option<u32
 }
 
 #[cfg_attr(
-    not(all(target_arch = "aarch64", target_os = "macos")),
+    not(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        target_arch = "x86_64"
+    )),
     allow(dead_code)
 )]
 fn classify(op: &Op) -> Option<Plan> {
     match *op {
-        Op::ShiftImm { kind, .. } if kind <= 2 => Some(Plan { base: 1, idle: false }),
-        Op::AddSub { .. } | Op::Imm { .. } => Some(Plan { base: 1, idle: false }),
+        Op::ShiftImm { kind, .. } if kind <= 2 => Some(Plan {
+            base: 1,
+            idle: false,
+        }),
+        Op::AddSub { .. } | Op::Imm { .. } => Some(Plan {
+            base: 1,
+            idle: false,
+        }),
         Op::Alu { op, .. } if !matches!(op, 2 | 3 | 4 | 7) => Some(Plan {
             base: if op == 13 { 2 } else { 1 },
             idle: op == 13,
@@ -205,10 +238,21 @@ impl Asm {
 
     fn emit_op(&mut self, op: &Op) -> bool {
         match *op {
-            Op::ShiftImm { kind, amount, rm, rd } if kind <= 2 => {
+            Op::ShiftImm {
+                kind,
+                amount,
+                rm,
+                rd,
+            } if kind <= 2 => {
                 self.emit_shift(kind, amount, rm, rd);
             }
-            Op::AddSub { sub, imm, rhs, rn, rd } => self.emit_add_sub(sub, imm, rhs, rn, rd),
+            Op::AddSub {
+                sub,
+                imm,
+                rhs,
+                rn,
+                rd,
+            } => self.emit_add_sub(sub, imm, rhs, rn, rd),
             Op::Imm { op, rd, imm } => self.emit_imm(op, rd, imm),
             Op::Alu { op, rm, rd } if !matches!(op, 2 | 3 | 4 | 7) => self.emit_alu(op, rm, rd),
             _ => return false,
@@ -533,24 +577,21 @@ impl Default for Asm {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    target_arch = "x86_64"
+))]
 const MAP_LEN: usize = 1 << 20;
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    target_arch = "x86_64"
+))]
 const SLOTS: usize = 1024;
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PROT_READ: i32 = 1;
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PROT_WRITE: i32 = 2;
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const PROT_EXEC: i32 = 4;
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const MAP_PRIVATE: i32 = 0x0002;
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const MAP_JIT: i32 = 0x0800;
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-const MAP_ANON: i32 = 0x1000;
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    target_os = "macos"
+))]
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
@@ -558,27 +599,183 @@ unsafe extern "C" {
     fn sys_icache_invalidate(start: *mut u8, len: usize);
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+unsafe extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+unsafe extern "system" {
+    fn VirtualAlloc(addr: *mut u8, size: usize, alloc_type: u32, protect: u32) -> *mut u8;
+    fn VirtualFree(addr: *mut u8, size: usize, free_type: u32) -> i32;
+    fn FlushInstructionCache(process: *mut core::ffi::c_void, base: *const u8, size: usize) -> i32;
+    fn GetCurrentProcess() -> *mut core::ffi::c_void;
+}
+
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    target_os = "macos"
+))]
+fn reserve() -> *mut u8 {
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const PROT_EXEC: i32 = 4;
+    const MAP_PRIVATE: i32 = 0x0002;
+    const MAP_JIT: i32 = 0x0800;
+    const MAP_ANON: i32 = 0x1000;
+    unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            MAP_LEN,
+            PROT_READ | PROT_WRITE | PROT_EXEC,
+            MAP_PRIVATE | MAP_ANON | MAP_JIT,
+            -1,
+            0,
+        )
+    }
+}
+
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    target_os = "macos"
+))]
+fn publish(dst: *mut u8, bytes: &[u8]) {
+    unsafe {
+        pthread_jit_write_protect_np(0);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        sys_icache_invalidate(dst, bytes.len());
+        pthread_jit_write_protect_np(1);
+    }
+}
+
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    target_os = "macos"
+))]
+fn release(ptr: *mut u8, len: usize) {
+    unsafe {
+        munmap(ptr, len);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn reserve() -> *mut u8 {
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const PROT_EXEC: i32 = 4;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_ANON: i32 = 0x20;
+    unsafe {
+        mmap(
+            std::ptr::null_mut(),
+            MAP_LEN,
+            PROT_READ | PROT_WRITE | PROT_EXEC,
+            MAP_PRIVATE | MAP_ANON,
+            -1,
+            0,
+        )
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn publish(dst: *mut u8, bytes: &[u8]) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        let _ = std::arch::x86_64::__cpuid(0);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn release(ptr: *mut u8, len: usize) {
+    unsafe {
+        munmap(ptr, len);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn reserve() -> *mut u8 {
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    unsafe {
+        VirtualAlloc(
+            std::ptr::null_mut(),
+            MAP_LEN,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE,
+        )
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn publish(dst: *mut u8, bytes: &[u8]) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        FlushInstructionCache(GetCurrentProcess(), dst, bytes.len());
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn release(ptr: *mut u8, _len: usize) {
+    const MEM_RELEASE: u32 = 0x8000;
+    unsafe {
+        VirtualFree(ptr, 0, MEM_RELEASE);
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
+fn reserve() -> *mut u8 {
+    std::ptr::null_mut()
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
+fn publish(_dst: *mut u8, _bytes: &[u8]) {}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    not(any(target_os = "macos", target_os = "linux", target_os = "windows"))
+))]
+fn release(_ptr: *mut u8, _len: usize) {}
+
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    target_arch = "x86_64"
+))]
 struct Map {
     ptr: *mut u8,
     len: usize,
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    target_arch = "x86_64"
+))]
 unsafe impl Send for Map {}
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    target_arch = "x86_64"
+))]
 impl Drop for Map {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe {
-                munmap(self.ptr, self.len);
-            }
+            release(self.ptr, self.len);
         }
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    target_arch = "x86_64"
+))]
 impl Map {
     fn empty() -> Self {
         Self {
@@ -588,7 +785,10 @@ impl Map {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    target_arch = "x86_64"
+))]
 #[derive(Clone, Copy, Default)]
 struct Slot {
     gen: u32,
@@ -598,7 +798,10 @@ struct Slot {
     offset: u32,
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    target_arch = "x86_64"
+))]
 struct Engine {
     map: Map,
     used: usize,
@@ -608,7 +811,10 @@ struct Engine {
     slots: Vec<Slot>,
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    target_arch = "x86_64"
+))]
 impl Engine {
     fn empty() -> Self {
         Self {
@@ -654,27 +860,19 @@ impl Engine {
     }
 
     fn compile(&mut self, index: usize, pc: u32, halfs: &[u16]) -> Option<*const u8> {
-        let mut asm = Asm::default();
-        asm.prologue();
-        for half in halfs {
-            if !asm.emit_op(&thumb::decode(*half)) {
-                return None;
-            }
-        }
-        asm.epilogue();
-        if asm.words.len() > 512 || !self.ensure_map() {
+        let bytes = encode_block(halfs)?;
+        if !self.ensure_map() {
             return None;
         }
-        let bytes = asm.words.len() * 4;
-        if self.used + bytes > MAP_LEN {
+        if self.used + bytes.len() > MAP_LEN {
             self.flush();
         }
-        if self.used + bytes > MAP_LEN {
+        if self.used + bytes.len() > MAP_LEN {
             return None;
         }
         let offset = self.used;
-        self.patch(offset, &asm.words);
-        self.used += bytes;
+        self.patch(offset, &bytes);
+        self.used += bytes.len();
         let mut stored = [0u16; BLOCK];
         stored[..halfs.len()].copy_from_slice(halfs);
         self.slots[index] = Slot {
@@ -695,16 +893,7 @@ impl Engine {
         if !self.map.ptr.is_null() {
             return true;
         }
-        let ptr = unsafe {
-            mmap(
-                std::ptr::null_mut(),
-                MAP_LEN,
-                PROT_READ | PROT_WRITE | PROT_EXEC,
-                MAP_PRIVATE | MAP_ANON | MAP_JIT,
-                -1,
-                0,
-            )
-        };
+        let ptr = reserve();
         if ptr.is_null() || ptr == usize::MAX as *mut u8 {
             self.failed = true;
             return false;
@@ -714,20 +903,44 @@ impl Engine {
         true
     }
 
-    fn patch(&self, offset: usize, words: &[u32]) {
-        let bytes = words.len() * 4;
+    fn patch(&self, offset: usize, bytes: &[u8]) {
         unsafe {
-            let dst = self.map.ptr.add(offset);
-            pthread_jit_write_protect_np(0);
-            std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, dst, bytes);
-            sys_icache_invalidate(dst, bytes);
-            pthread_jit_write_protect_np(1);
+            publish(self.map.ptr.add(offset), bytes);
         }
     }
 }
 
-/// 宿主代码只碰 `r0`–`r7` 和 CPSR。调用约定用 `x0`、`x1` 传入这两处，其余只用调用者保存的寄存器。
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn encode_block(halfs: &[u16]) -> Option<Vec<u8>> {
+    let mut asm = Asm::default();
+    asm.prologue();
+    for half in halfs {
+        if !asm.emit_op(&thumb::decode(*half)) {
+            return None;
+        }
+    }
+    asm.epilogue();
+    if asm.words.len() > 512 {
+        return None;
+    }
+    Some(
+        asm.words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect(),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+fn encode_block(halfs: &[u16]) -> Option<Vec<u8>> {
+    crate::dynarec_x64::encode(halfs)
+}
+
+/// 宿主代码只碰 `r0`–`r7` 和 CPSR。参数按这台机器的 C 调用约定传入。
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "macos"),
+    target_arch = "x86_64"
+))]
 unsafe fn invoke(code: *const u8, regs: &mut Registers) {
     let f: unsafe extern "C" fn(*mut u32, *mut u32) = std::mem::transmute(code);
     f(regs.low_regs_ptr(), regs.cpsr_ptr());
@@ -806,7 +1019,8 @@ mod tests {
 
     fn assert_same(off: &Registers, on: &Registers, off_cycles: u64, on_cycles: u64) {
         assert_eq!(
-            off_cycles, on_cycles,
+            off_cycles,
+            on_cycles,
             "cycles\noff {}\non  {}",
             off.format_line(),
             on.format_line()
@@ -823,7 +1037,10 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        target_arch = "x86_64"
+    ))]
     fn assert_ran(on: &Bus, off: &Bus) {
         assert!(on.dynarec_ran() > 0, "宿主代码没有跑起来");
         assert_eq!(off.dynarec_ran(), 0);
@@ -834,19 +1051,35 @@ mod tests {
         use crate::thumb::{decode, Op};
         assert!(matches!(
             decode(mov_imm(0, 1)),
-            Op::Imm { op: 0, rd: 0, imm: 1 }
+            Op::Imm {
+                op: 0,
+                rd: 0,
+                imm: 1
+            }
         ));
         assert!(matches!(
             decode(cmp_imm(2, 7)),
-            Op::Imm { op: 1, rd: 2, imm: 7 }
+            Op::Imm {
+                op: 1,
+                rd: 2,
+                imm: 7
+            }
         ));
         assert!(matches!(
             decode(add_imm(3, 4)),
-            Op::Imm { op: 2, rd: 3, imm: 4 }
+            Op::Imm {
+                op: 2,
+                rd: 3,
+                imm: 4
+            }
         ));
         assert!(matches!(
             decode(sub_imm(1, 9)),
-            Op::Imm { op: 3, rd: 1, imm: 9 }
+            Op::Imm {
+                op: 3,
+                rd: 1,
+                imm: 9
+            }
         ));
         assert!(matches!(
             decode(add_reg(2, 1, 1)),
@@ -915,8 +1148,22 @@ mod tests {
                 rd: 6
             }
         ));
-        assert!(matches!(decode(alu(5, 0, 3)), Op::Alu { op: 5, rm: 0, rd: 3 }));
-        assert!(matches!(decode(alu(13, 0, 4)), Op::Alu { op: 13, rm: 0, rd: 4 }));
+        assert!(matches!(
+            decode(alu(5, 0, 3)),
+            Op::Alu {
+                op: 5,
+                rm: 0,
+                rd: 3
+            }
+        ));
+        assert!(matches!(
+            decode(alu(13, 0, 4)),
+            Op::Alu {
+                op: 13,
+                rm: 0,
+                rd: 4
+            }
+        ));
         assert!(matches!(
             decode(ldr_word(1, 0, 8)),
             Op::MemImm {
@@ -952,7 +1199,10 @@ mod tests {
         assert_eq!(off.cpsr(), 0x6000_00F0, "{}", off.format_line());
         assert_eq!(off.pc(), 0x0300_000E);
         assert_same(&off, &on, off_bus.cycles(), on_bus.cycles());
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[cfg(any(
+            all(target_arch = "aarch64", target_os = "macos"),
+            target_arch = "x86_64"
+        ))]
         {
             assert_ran(&on_bus, &off_bus);
             assert_eq!(on_bus.dynarec_compiled(), 1);
@@ -1000,7 +1250,10 @@ mod tests {
         let (on, on_bus) = run(&code, true, 8);
         assert!(off_bus.cycles() > 32, "{}", off.format_line());
         assert_same(&off, &on, off_bus.cycles(), on_bus.cycles());
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[cfg(any(
+            all(target_arch = "aarch64", target_os = "macos"),
+            target_arch = "x86_64"
+        ))]
         {
             assert_ran(&on_bus, &off_bus);
             assert_eq!(on_bus.dynarec_compiled(), 4);
@@ -1047,7 +1300,10 @@ mod tests {
         let (ew_on, ew_on_bus) = run_at(0x0200_0000, true, None);
         assert!(ew_off_bus.cycles() > 8, "ewram {}", ew_off.format_line());
         assert_same(&ew_off, &ew_on, ew_off_bus.cycles(), ew_on_bus.cycles());
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[cfg(any(
+            all(target_arch = "aarch64", target_os = "macos"),
+            target_arch = "x86_64"
+        ))]
         {
             assert_ran(&rom_on_bus, &rom_off_bus);
             assert_ran(&ew_on_bus, &ew_off_bus);
@@ -1080,7 +1336,10 @@ mod tests {
         assert_eq!(off.get(1), 0xA1B2_C3D4);
         assert_eq!(off.get(2), 7);
         assert_same(&off, &on, off_bus.cycles(), on_bus.cycles());
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[cfg(any(
+            all(target_arch = "aarch64", target_os = "macos"),
+            target_arch = "x86_64"
+        ))]
         assert_ran(&on_bus, &off_bus);
     }
 
@@ -1105,7 +1364,10 @@ mod tests {
         crate::step_quiet(&mut on, &mut on_bus).unwrap();
         assert_eq!(off.get(2), 3);
         assert_same(&off, &on, off_bus.cycles(), on_bus.cycles());
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[cfg(any(
+            all(target_arch = "aarch64", target_os = "macos"),
+            target_arch = "x86_64"
+        ))]
         {
             assert_eq!(on_bus.dynarec_compiled(), 1);
             assert_eq!(on_bus.dynarec_ran(), 2);
@@ -1116,7 +1378,10 @@ mod tests {
         crate::step_quiet(&mut on, &mut on_bus).unwrap();
         assert_eq!(off.get(2), 7);
         assert_same(&off, &on, off_bus.cycles(), on_bus.cycles());
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[cfg(any(
+            all(target_arch = "aarch64", target_os = "macos"),
+            target_arch = "x86_64"
+        ))]
         {
             assert_eq!(on_bus.dynarec_compiled(), 2);
             assert_eq!(on_bus.dynarec_ran(), 4);
@@ -1151,7 +1416,10 @@ mod tests {
         assert!(off_bus.cycles() > 256, "{}", off.format_line());
         assert_same(&off, &on, off_bus.cycles(), on_bus.cycles());
         assert_eq!(off_bus.read_u16(0x0400_0202), on_bus.read_u16(0x0400_0202));
-        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[cfg(any(
+            all(target_arch = "aarch64", target_os = "macos"),
+            target_arch = "x86_64"
+        ))]
         assert_ran(&on_bus, &off_bus);
     }
 
