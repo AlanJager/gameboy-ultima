@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 
 use gameboy_ultima::link::{normalize_link_name, LinkHub, LinkSeat, LINK_ROOM};
 use gameboy_ultima::{
-    audio_pace, ereader_label, parse_cheat, rgb555_to_888, step_quiet, AudioPlay, Bus, CheatFamily,
-    CheatProgram, Registers, CYCLES_PER_FRAME, DEFAULT_SOLAR, HEIGHT, WIDTH,
+    audio_pace, ereader_label, format_cheat, parse_cheat, read_cheat, rgb555_to_888, step_quiet,
+    AudioPlay, Bus, CheatFamily, CheatProgram, CheatReading, Registers, CYCLES_PER_FRAME,
+    DEFAULT_SOLAR, HEIGHT, WIDTH,
 };
 #[path = "controls.rs"]
 mod controls;
@@ -765,9 +766,7 @@ impl AppView {
                 CheatField::Name => {
                     cheat.name.pop();
                 }
-                CheatField::Code => {
-                    cheat.code.pop();
-                }
+                CheatField::Code => pop_cheat_digit(&mut cheat),
             }
             cx.notify();
             return;
@@ -783,8 +782,8 @@ impl AppView {
                 }
             }
             CheatField::Code => {
-                if cheat.code.len() < 400 && (ch.is_ascii_hexdigit() || ch == ' ') {
-                    cheat.code.push(ch);
+                if ch.is_ascii_hexdigit() {
+                    push_cheat_digit(&mut cheat, ch);
                 }
             }
         }
@@ -797,22 +796,7 @@ impl AppView {
             CheatField::Name => {
                 cheat.name = text.chars().filter(|ch| !ch.is_control()).take(32).collect();
             }
-            CheatField::Code => {
-                let mut next = String::new();
-                for ch in text.chars() {
-                    if ch.is_ascii_hexdigit() {
-                        next.push(ch.to_ascii_uppercase());
-                    } else if ch.is_whitespace() || ch == ';' || ch == ',' {
-                        if !next.ends_with(' ') && !next.is_empty() {
-                            next.push(' ');
-                        }
-                    }
-                    if next.len() >= 400 {
-                        break;
-                    }
-                }
-                cheat.code = next.trim().to_string();
-            }
+            CheatField::Code => replace_cheat_code(&mut cheat, text),
         }
     }
 
@@ -823,7 +807,10 @@ impl AppView {
         let gameshark = cheat.gameshark;
         let action_replay = cheat.action_replay;
         drop(cheat);
-        if code.is_empty() {
+        if !matches!(
+            read_cheat(cheat_family(gameshark, action_replay), &code),
+            CheatReading::Lines(_)
+        ) {
             return;
         }
         let _ = self.commands.send(Command::AddCheat {
@@ -1011,6 +998,14 @@ impl AppView {
             .lock()
             .expect("emulator snapshot poisoned")
             .system_open;
+        if self.cheat_open() {
+            self.edit_cheat_field(event, cx);
+            return;
+        }
+        if self.link_open() {
+            self.edit_link_field(event, cx);
+            return;
+        }
         if system_open {
             let key = normalize_key(&event.keystroke.key);
             let binding = self
@@ -1034,14 +1029,6 @@ impl AppView {
                 SystemKey::Edit => self.edit_system_field(event, cx),
                 SystemKey::Resume | SystemKey::Ignore => {}
             }
-            return;
-        }
-        if self.cheat_open() {
-            self.edit_cheat_field(event, cx);
-            return;
-        }
-        if self.link_open() {
-            self.edit_link_field(event, cx);
             return;
         }
         if shortcut_chord(&event.keystroke.modifiers) {
@@ -1582,15 +1569,6 @@ impl Render for AppView {
         } else {
             link_name.clone()
         };
-        let (cheat_name, cheat_code, cheat_gameshark, cheat_action_replay) = {
-            let cheat = self.cheat_ui.lock().expect("cheat ui poisoned");
-            (
-                cheat.name.clone(),
-                cheat.code.clone(),
-                cheat.gameshark,
-                cheat.action_replay,
-            )
-        };
         let locked_speed = self.locked_speed.load(Ordering::Relaxed);
         let resume_error = resume_prompt.then(|| error.clone()).flatten();
 
@@ -1677,22 +1655,6 @@ impl Render for AppView {
                 lcd_ghost,
                 color_correct,
                 rumble_shake,
-                &link_address,
-                &shown_name,
-                self.system_field,
-                &link_line,
-                &ereader_line,
-                link_error.as_deref(),
-                &link_lan,
-                &link_hosts,
-                link_in_room,
-                &link_seats,
-                &cheat_name,
-                &cheat_code,
-                cheat_gameshark,
-                cheat_action_replay,
-                &cheats,
-                cheat_error.as_deref(),
             )
             .into_any_element()
         } else if !self.compare && self.library_mode.load(Ordering::Relaxed) {
@@ -1827,6 +1789,12 @@ impl Render for AppView {
 
         div()
             .id("app")
+            .when(
+                self.cheat_open()
+                    || self.link_open()
+                    || (system_open && self.system_field != SystemField::None),
+                |app| app.key_context("SystemTyping"),
+            )
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 this.handle_key_down(event, cx);
@@ -1842,7 +1810,7 @@ impl Render for AppView {
             .when(!system_open && !self.compare && controls_open, |app| {
                 app.child(controls_overlay(cx, &controls_map, controls_capturing))
             })
-            .when(!system_open && !self.compare && !controls_open && !link_open && self.cheat_open(), |app| {
+            .when(!self.compare && !controls_open && !link_open && self.cheat_open(), |app| {
                 let draft = self.cheat_ui.lock().expect("cheat ui poisoned");
                 app.child(cheat_overlay(
                     cx,
@@ -1855,7 +1823,7 @@ impl Render for AppView {
                     cheat_error.as_deref(),
                 ))
             })
-            .when(!system_open && !self.compare && !controls_open && link_open, |app| {
+            .when(!self.compare && !controls_open && link_open, |app| {
                 app.child(link_overlay(
                     cx,
                     &link_address,
@@ -2646,6 +2614,46 @@ fn cheat_family(gameshark: bool, action_replay: bool) -> CheatFamily {
     }
 }
 
+fn replace_cheat_code(cheat: &mut CheatUi, text: &str) {
+    cheat.code = format_cheat(cheat_family(cheat.gameshark, cheat.action_replay), text);
+}
+
+fn push_cheat_digit(cheat: &mut CheatUi, ch: char) {
+    if cheat
+        .code
+        .chars()
+        .filter(|digit| digit.is_ascii_hexdigit())
+        .take(481)
+        .count()
+        >= 480
+    {
+        return;
+    }
+    let mut raw = cheat.code.clone();
+    raw.push(ch);
+    replace_cheat_code(cheat, &raw);
+}
+
+fn pop_cheat_digit(cheat: &mut CheatUi) {
+    let mut digits: Vec<char> = cheat
+        .code
+        .chars()
+        .filter(|digit| digit.is_ascii_hexdigit())
+        .collect();
+    digits.pop();
+    let raw: String = digits.into_iter().collect();
+    replace_cheat_code(cheat, &raw);
+}
+
+fn cap_lines(mut lines: Vec<String>, max: usize, rest: &str) -> Vec<String> {
+    if lines.len() > max {
+        let extra = lines.len() - max;
+        lines.truncate(max);
+        lines.push(format!("还有 {extra} {rest}"));
+    }
+    lines
+}
+
 fn cheat_overlay(
     cx: &mut Context<AppView>,
     name: &str,
@@ -2693,15 +2701,27 @@ fn cheat_panel(
     } else {
         name.to_string()
     };
-    let code_text = if code.is_empty() {
-        "点这里，输入或粘贴。例如 82000000 03E7".to_string()
+    let code_lines: Vec<String> = if code.is_empty() {
+        vec!["点这里输入或粘贴。例如 82000000 03E7".into()]
     } else {
-        code.to_string()
+        code.split('\n').map(|line| line.to_string()).collect()
+    };
+    let draft = read_cheat(cheat_family(gameshark, action_replay), code);
+    let draft_lines = match &draft {
+        CheatReading::Empty => Vec::new(),
+        CheatReading::Short { missing } => vec![format!("还差 {missing} 位，凑成一行")],
+        CheatReading::Invalid(error) => vec![error.clone()],
+        CheatReading::Lines(lines) => cap_lines(lines.clone(), 6, "条"),
+    };
+    let draft_color = match draft {
+        CheatReading::Invalid(_) => 0xE08B76,
+        CheatReading::Lines(_) => ACCENT,
+        _ => MUTED,
     };
     let family = cheat_kind_label(gameshark, action_replay);
     div()
         .id("cheat-panel")
-                .w(px(460.))
+                .w(px(520.))
                 .max_h(px(640.))
                 .overflow_y_scroll()
                 .flex()
@@ -2717,7 +2737,7 @@ fn cheat_panel(
                     div()
                         .text_sm()
                         .text_color(rgb(MUTED))
-                        .child("按这张卡带记住。开着的码每帧写一次。Esc 关闭。"),
+                        .child("按这张卡带记住。输入会排成一行一条，下面写着它改哪里。Esc 关闭。"),
                 )
                 .children(error.map(|message| {
                     div()
@@ -2739,7 +2759,7 @@ fn cheat_panel(
                         .text_color(rgb(if name.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.system_field = SystemField::CheatName;
+                            this.system_field = SystemField::None;
                             this.cheat_ui.lock().expect("cheat ui poisoned").field = CheatField::Name;
                             cx.notify();
                         }))
@@ -2760,15 +2780,24 @@ fn cheat_panel(
                         } else {
                             0x314044
                         }))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
                         .text_color(rgb(if code.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.system_field = SystemField::CheatCode;
+                            this.system_field = SystemField::None;
                             this.cheat_ui.lock().expect("cheat ui poisoned").field = CheatField::Code;
                             cx.notify();
                         }))
-                        .child(code_text),
+                        .children(code_lines.into_iter().map(|line| div().child(line))),
                 )
+                .children(draft_lines.into_iter().map(|line| {
+                    div()
+                        .text_sm()
+                        .text_color(rgb(draft_color))
+                        .child(line)
+                }))
                 .child(
                     div()
                         .flex()
@@ -2792,6 +2821,8 @@ fn cheat_panel(
                                         cheat.gameshark = false;
                                         cheat.action_replay = false;
                                     }
+                                    let raw = cheat.code.clone();
+                                    replace_cheat_code(&mut cheat, &raw);
                                     cx.notify();
                                 }))
                                 .child(family),
@@ -2813,33 +2844,86 @@ fn cheat_panel(
                         ),
                 )
                 .children(cheats.iter().enumerate().map(|(index, cheat)| {
-                    let label = format!(
-                        "{}  {}  {}  {}",
-                        if cheat.enabled { "开" } else { "关" },
+                    let kind = cheat_family(cheat.gameshark, cheat.action_replay);
+                    let reading = read_cheat(kind, &cheat.code);
+                    let fallback = if cheat.name.is_empty() {
+                        "未命名".to_string()
+                    } else {
+                        cheat.name.clone()
+                    };
+                    let (title, notes) = match reading {
+                        CheatReading::Lines(lines) if cheat.name.is_empty() => {
+                            let mut lines = lines;
+                            let title = lines.first().cloned().unwrap_or(fallback);
+                            if !lines.is_empty() {
+                                lines.remove(0);
+                            }
+                            (title, cap_lines(lines, 4, "条"))
+                        }
+                        CheatReading::Lines(lines) => (fallback, cap_lines(lines, 4, "条")),
+                        CheatReading::Invalid(error) => (fallback, vec![error]),
+                        CheatReading::Short { missing } => {
+                            (fallback, vec![format!("还差 {missing} 位，凑成一行")])
+                        }
+                        CheatReading::Empty => (fallback, vec!["这条码是空的".into()]),
+                    };
+                    let formatted = format_cheat(kind, &cheat.code);
+                    let code_lines = cap_lines(
+                        formatted
+                            .split('\n')
+                            .filter(|line| !line.is_empty())
+                            .map(|line| line.to_string())
+                            .collect(),
+                        3,
+                        "行",
+                    );
+                    let on = cheat.enabled;
+                    let tag = format!(
+                        "{}  {}",
                         cheat_kind_tag(cheat.gameshark, cheat.action_replay),
-                        if cheat.name.is_empty() { "未命名" } else { &cheat.name },
-                        cheat.code
+                        if on { "开" } else { "关" }
                     );
                     div()
                         .w_full()
                         .flex()
-                        .items_center()
+                        .items_start()
                         .gap(px(8.))
                         .child(
                             div()
                                 .id(("cheat-toggle", index))
                                 .flex_grow()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.))
                                 .px(px(12.))
                                 .py(px(8.))
                                 .rounded(px(6.))
                                 .bg(rgb(BG))
-                                .text_color(rgb(if cheat.enabled { ACCENT } else { TEXT }))
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let _ = this.commands.send(Command::ToggleCheat(index));
                                     cx.notify();
                                 }))
-                                .child(label),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .text_color(rgb(if on { ACCENT } else { TEXT }))
+                                        .child(div().text_sm().child(title))
+                                        .child(div().text_xs().text_color(rgb(MUTED)).child(tag)),
+                                )
+                                .children(notes.into_iter().map(|line| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(if on { ACCENT } else { MUTED }))
+                                        .child(line)
+                                }))
+                                .children(code_lines.into_iter().map(|line| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(MUTED))
+                                        .child(line)
+                                })),
                         )
                         .child(
                             div()
@@ -2970,7 +3054,7 @@ fn link_panel(
         line.to_string()
     };
     let address_text = if address.is_empty() {
-        "输入 IP，或直接点下面的主机".to_string()
+        "地址，或 地址#房间号".to_string()
     } else {
         address.to_string()
     };
@@ -2982,13 +3066,7 @@ fn link_panel(
     let room: Vec<LinkSeat> = if in_room && !seats.is_empty() {
         seats.iter().take(shown_link_seats(seats)).cloned().collect()
     } else {
-        (1..=4)
-            .map(|number| LinkSeat {
-                number,
-                name: String::new(),
-                mine: false,
-            })
-            .collect()
+        Vec::new()
     };
     let online = seats.iter().filter(|seat| !seat.name.is_empty()).count();
     let room_label = if in_room {
@@ -3000,7 +3078,7 @@ fn link_panel(
         div()
             .text_sm()
             .text_color(rgb(MUTED))
-            .child("同一 Wi-Fi 下，对方选「做主机」后会出现在这里。")
+            .child("还没看到。对方在同一 Wi-Fi 点「做主机」。")
             .into_any_element()
     } else {
         div()
@@ -3072,55 +3150,152 @@ fn link_panel(
                         .text_color(rgb(if name.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.system_field = SystemField::LinkName;
+                            this.system_field = SystemField::None;
                             this.link_ui.lock().expect("link ui poisoned").field = LinkField::Name;
                             cx.notify();
                         }))
                         .child(name_text),
                 )
-                .child(div().text_sm().text_color(rgb(TEXT)).child(room_label))
-                .children(room.iter().map(|seat| link_seat_row(seat)))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(16.))
+                        .child(
+                            div()
+                                .w(px(280.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.))
+                                .child(div().text_sm().text_color(rgb(TEXT)).child("加入"))
+                                .child(found)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .child(
+                                            div()
+                                                .id("link-address")
+                                                .flex_1()
+                                                .px(px(12.))
+                                                .py(px(8.))
+                                                .rounded(px(6.))
+                                                .bg(rgb(BG))
+                                                .border_1()
+                                                .border_color(rgb(if editing_name == Some(false) {
+                                                    ACCENT
+                                                } else {
+                                                    0x314044
+                                                }))
+                                                .text_color(if address.is_empty() {
+                                                    rgb(MUTED)
+                                                } else {
+                                                    rgb(TEXT)
+                                                })
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.system_field = SystemField::None;
+                                                    this.link_ui
+                                                        .lock()
+                                                        .expect("link ui poisoned")
+                                                        .field = LinkField::Address;
+                                                    cx.notify();
+                                                }))
+                                                .child(address_text),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("link-join")
+                                                .px(px(14.))
+                                                .py(px(8.))
+                                                .rounded(px(6.))
+                                                .bg(rgb(ACCENT))
+                                                .text_color(rgb(BG))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    let address = this
+                                                        .link_ui
+                                                        .lock()
+                                                        .expect("link ui poisoned")
+                                                        .address
+                                                        .trim()
+                                                        .to_string();
+                                                    if !address.is_empty() {
+                                                        let _ = this
+                                                            .commands
+                                                            .send(Command::JoinLink(address));
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                                .child("加入"),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(280.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.))
+                                .child(div().text_sm().text_color(rgb(TEXT)).child("开房"))
+                                .child(
+                                    div()
+                                        .id("link-host")
+                                        .px(px(14.))
+                                        .py(px(8.))
+                                        .rounded(px(6.))
+                                        .bg(rgb(ACCENT))
+                                        .text_color(rgb(BG))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let _ = this.commands.send(Command::HostLink);
+                                            cx.notify();
+                                        }))
+                                        .child("做主机"),
+                                )
+                                .when(in_room, |column| {
+                                    column
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(TEXT))
+                                                .child(room_label),
+                                        )
+                                        .children(room.iter().map(|seat| link_seat_row(seat)))
+                                        .child(
+                                            div()
+                                                .id("link-stop")
+                                                .px(px(14.))
+                                                .py(px(8.))
+                                                .rounded(px(6.))
+                                                .bg(rgb(BG))
+                                                .text_color(rgb(TEXT))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    let _ = this.commands.send(Command::StopLink);
+                                                    cx.notify();
+                                                }))
+                                                .child("断开"),
+                                        )
+                                })
+                                .when(!in_room, |column| {
+                                    column.child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(MUTED))
+                                            .child("同一 Wi-Fi 里，别人会在左边看到你。"),
+                                    )
+                                }),
+                        ),
+                )
+                .child(div().text_sm().text_color(rgb(TEXT)).child("跨网"))
                 .child(
                     div()
                         .flex()
                         .flex_wrap()
                         .gap(px(10.))
-                        .child(
-                            div()
-                                .id("link-host")
-                                .px(px(14.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(ACCENT))
-                                .text_color(rgb(BG))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let _ = this.commands.send(Command::HostLink);
-                                    cx.notify();
-                                }))
-                                .child("做主机"),
-                        )
-                        .child(
-                            div()
-                                .id("link-relay-host")
-                                .px(px(14.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(ACCENT))
-                                .text_color(rgb(BG))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let address = this
-                                        .link_ui
-                                        .lock()
-                                        .expect("link ui poisoned")
-                                        .address
-                                        .clone();
-                                    let _ = this.commands.send(Command::HostRelay(address));
-                                    cx.notify();
-                                }))
-                                .child("经中继开房"),
-                        )
                         .child(
                             div()
                                 .id("link-relay")
@@ -3138,7 +3313,7 @@ fn link_panel(
                         )
                         .child(
                             div()
-                                .id("link-stop")
+                                .id("link-relay-host")
                                 .px(px(14.))
                                 .py(px(8.))
                                 .rounded(px(6.))
@@ -3146,69 +3321,16 @@ fn link_panel(
                                 .text_color(rgb(TEXT))
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    let _ = this.commands.send(Command::StopLink);
-                                    cx.notify();
-                                }))
-                                .child("断开"),
-                        ),
-                )
-                .child(div().text_sm().text_color(rgb(TEXT)).child("附近的主机"))
-                .child(found)
-                .child(div().text_sm().text_color(rgb(TEXT)).child("手动加入"))
-                .child(
-                    div()
-                        .id("link-address")
-                        .w_full()
-                        .px(px(12.))
-                        .py(px(8.))
-                        .rounded(px(6.))
-                        .bg(rgb(BG))
-                        .border_1()
-                        .border_color(rgb(if editing_name == Some(false) {
-                            ACCENT
-                        } else {
-                            0x314044
-                        }))
-                        .text_color(if address.is_empty() {
-                            rgb(MUTED)
-                        } else {
-                            rgb(TEXT)
-                        })
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.system_field = SystemField::LinkAddress;
-                            this.link_ui.lock().expect("link ui poisoned").field = LinkField::Address;
-                            cx.notify();
-                        }))
-                        .child(address_text),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(10.))
-                        .child(
-                            div()
-                                .id("link-join")
-                                .px(px(14.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(ACCENT))
-                                .text_color(rgb(BG))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
                                     let address = this
                                         .link_ui
                                         .lock()
                                         .expect("link ui poisoned")
                                         .address
-                                        .trim()
-                                        .to_string();
-                                    if !address.is_empty() {
-                                        let _ = this.commands.send(Command::JoinLink(address));
-                                    }
+                                        .clone();
+                                    let _ = this.commands.send(Command::HostRelay(address));
                                     cx.notify();
                                 }))
-                                .child("加入"),
+                                .child("经中继开房"),
                         )
                         .child(
                             div()
@@ -3230,7 +3352,7 @@ fn link_panel(
                         .text_xs()
                         .text_color(rgb(MUTED))
                         .child(format!(
-                            "本机 {lan_ip}:5576，中继端口 5578。同一 Wi-Fi 可以点下面的主机。跨网时把状态栏里的地址#房间号填进手动加入。Command-V 粘贴。同一张卡带，主机是 1 号机。"
+                            "本机 {lan_ip}:5576，中继 5578。跨网时一边开本机中继，另一边把地址#房间号填进加入。Command-V 粘贴。"
                         )),
                 )
 }

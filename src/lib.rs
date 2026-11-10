@@ -45,7 +45,7 @@ mod wait;
 
 pub use bus::Bus;
 pub use ereader::ereader_label;
-pub use cheats::{parse_cheat, CheatFamily, CheatProgram};
+pub use cheats::{format_cheat, parse_cheat, read_cheat, CheatFamily, CheatProgram, CheatReading};
 pub use cpu::{run_until_self_branch, step, step_quiet, Stepped};
 pub use disasm::{disassemble, Disassembly};
 pub use lesson::{

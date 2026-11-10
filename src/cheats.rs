@@ -159,6 +159,268 @@ impl CheatProgram {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheatReading {
+    Empty,
+    Short { missing: usize },
+    Lines(Vec<String>),
+    Invalid(String),
+}
+
+const CHEAT_DIGIT_CAP: usize = 480;
+
+pub fn format_cheat(family: CheatFamily, text: &str) -> String {
+    let mut digits = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_hexdigit() {
+            digits.push(ch.to_ascii_uppercase());
+            if digits.len() == CHEAT_DIGIT_CAP {
+                break;
+            }
+        }
+    }
+    let value_len = match family {
+        CheatFamily::CodeBreaker => 4,
+        CheatFamily::GameShark | CheatFamily::ActionReplay => 8,
+    };
+    let pair = 8 + value_len;
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    while offset < digits.len() {
+        let end = (offset + pair).min(digits.len());
+        let chunk = &digits[offset..end];
+        if chunk.len() <= 8 {
+            lines.push(chunk.to_string());
+        } else {
+            lines.push(format!("{} {}", &chunk[..8], &chunk[8..]));
+        }
+        offset = end;
+    }
+    lines.join("\n")
+}
+
+pub fn read_cheat(family: CheatFamily, text: &str) -> CheatReading {
+    let formatted = format_cheat(family, text);
+    let digits = formatted.chars().filter(|ch| ch.is_ascii_hexdigit()).count();
+    if digits == 0 {
+        return CheatReading::Empty;
+    }
+    let pair = match family {
+        CheatFamily::CodeBreaker => 12,
+        CheatFamily::GameShark | CheatFamily::ActionReplay => 16,
+    };
+    let missing = pair - (digits % pair);
+    if missing != pair {
+        return CheatReading::Short { missing };
+    }
+    match explain_cheat(family, &formatted) {
+        Ok(lines) => CheatReading::Lines(lines),
+        Err(error) => CheatReading::Invalid(error),
+    }
+}
+
+fn explain_cheat(family: CheatFamily, text: &str) -> Result<Vec<String>, String> {
+    let program = parse_cheat(family, text)?;
+    let mut lines = Vec::new();
+    for op in &program.ops {
+        lines.push(explain_op(op));
+    }
+    for (addr, value) in &program.rom {
+        lines.push(format!("把卡带 {addr:08X} 的半字改成 {value:04X}"));
+    }
+    if lines.is_empty() {
+        return Err("这些行没有要写入的码".into());
+    }
+    Ok(lines)
+}
+
+fn explain_op(op: &Op) -> String {
+    match op {
+        Op::Write8 { addr, value } => write_phrase(*addr, u32::from(*value), 1),
+        Op::Write16 { addr, value } => write_phrase(*addr, u32::from(*value), 2),
+        Op::Write32 { addr, value } => write_phrase(*addr, *value, 4),
+        Op::Or16 { addr, value } => {
+            format!("把 {addr:08X} 的半字按位或上 {value:04X}")
+        }
+        Op::And16 { addr, value } => {
+            format!("把 {addr:08X} 的半字按位与上 {value:04X}")
+        }
+        Op::Add16 { addr, value } => format!("把 {addr:08X} 的半字加上 {value:04X}"),
+        Op::Slide16 {
+            addr,
+            value,
+            count,
+            value_step,
+            addr_step,
+        } => format!(
+            "从 {addr:08X} 起写 {count} 次半字，开头 {value:04X}，每次地址加 {addr_step}、数值加 {value_step}"
+        ),
+        Op::Block16 { addr, values } => {
+            if values.len() <= 4 {
+                let listed = values
+                    .iter()
+                    .map(|value| format!("{value:04X}"))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                format!("从 {addr:08X} 起写入半字 {listed}")
+            } else {
+                format!("从 {addr:08X} 起写入 {} 个半字", values.len())
+            }
+        }
+        Op::If { cond, addr, value } => {
+            format!("若 {}，才做下一条", half_cond(*addr, *cond, *value))
+        }
+        Op::IfButtons { mask, mode } => button_phrase(*mask, mode),
+        Op::Unless { cond, addr, value } => {
+            format!("若 {}，就跳过下一条", half_cond(*addr, *cond, *value))
+        }
+        Op::Repeat {
+            addr,
+            value,
+            width,
+            count,
+            addr_step,
+            value_step,
+        } => {
+            if *count <= 1 && *value_step == 0 {
+                write_phrase(*addr, *value, *width)
+            } else if *value_step == 0 && *addr_step == u32::from(*width) {
+                format!(
+                    "从 {addr:08X} 起，把{} {} 连写 {count} 次",
+                    width_name(*width),
+                    hex_value(*value, *width)
+                )
+            } else {
+                format!(
+                    "从 {addr:08X} 起写 {count} 次{}，开头 {}，每次地址加 {addr_step}、数值加 {value_step}",
+                    width_name(*width),
+                    hex_value(*value, *width)
+                )
+            }
+        }
+        Op::Indirect {
+            addr,
+            value,
+            width,
+            offset,
+        } => {
+            if *offset == 0 {
+                format!(
+                    "读出 {addr:08X} 里的指针，把那里的{}写成 {}",
+                    width_name(*width),
+                    hex_value(*value, *width)
+                )
+            } else {
+                format!(
+                    "读出 {addr:08X} 里的指针，加上 {offset}，把那里的{}写成 {}",
+                    width_name(*width),
+                    hex_value(*value, *width)
+                )
+            }
+        }
+        Op::Add { addr, value, width } => format!(
+            "把 {addr:08X} 的{}加上 {}",
+            width_name(*width),
+            hex_value(*value, *width)
+        ),
+        Op::When {
+            kind,
+            addr,
+            value,
+            width,
+            then_len,
+            else_len,
+            ..
+        } => {
+            let phrase = when_phrase(*kind, *addr, *value, *width);
+            if *else_len == 0 && *then_len <= 1 {
+                format!("若 {phrase}，才做下一条")
+            } else if *else_len == 0 {
+                format!("若 {phrase}，做后面 {then_len} 条")
+            } else if *then_len == 0 {
+                format!("若 {phrase}，跳过后面 {else_len} 条")
+            } else {
+                format!("若 {phrase}，做后面 {then_len} 条，否则做后面 {else_len} 条")
+            }
+        }
+    }
+}
+
+fn write_phrase(addr: u32, value: u32, width: u8) -> String {
+    format!(
+        "把 {addr:08X} 的{}写成 {}",
+        width_name(width),
+        hex_value(value, width)
+    )
+}
+
+fn width_name(width: u8) -> &'static str {
+    match width {
+        1 => "字节",
+        2 => "半字",
+        _ => "字",
+    }
+}
+
+fn hex_value(value: u32, width: u8) -> String {
+    match width {
+        1 => format!("{value:02X}"),
+        2 => format!("{value:04X}"),
+        _ => format!("{value:08X}"),
+    }
+}
+
+fn half_cond(addr: u32, cond: Cond, value: u16) -> String {
+    let place = format!("{addr:08X} 的半字");
+    match cond {
+        Cond::Eq => format!("{place}等于 {value:04X}"),
+        Cond::Ne => format!("{place}不等于 {value:04X}"),
+        Cond::Gt => format!("{place}大于 {value:04X}"),
+        Cond::Lt => format!("{place}小于 {value:04X}"),
+        Cond::And => format!("{place}按位与上 {value:04X} 之后不为 0"),
+    }
+}
+
+fn when_phrase(kind: WhenKind, addr: u32, value: u32, width: u8) -> String {
+    if kind == WhenKind::Never {
+        return "这个条件永远不成立".into();
+    }
+    let place = format!("{addr:08X} 的{}", width_name(width));
+    let shown = hex_value(value, width);
+    match kind {
+        WhenKind::Eq => format!("{place}等于 {shown}"),
+        WhenKind::Ne => format!("{place}不等于 {shown}"),
+        WhenKind::Lt => format!("{place}有符号小于 {shown}"),
+        WhenKind::Gt => format!("{place}有符号大于 {shown}"),
+        WhenKind::Ult => format!("{place}小于 {shown}"),
+        WhenKind::Ugt => format!("{place}大于 {shown}"),
+        WhenKind::And => format!("{place}按位与上 {shown} 之后不为 0"),
+        WhenKind::Never => "这个条件永远不成立".into(),
+    }
+}
+
+fn button_phrase(mask: u16, mode: &ButtonMode) -> String {
+    const NAMES: [&str; 10] = ["A", "B", "SELECT", "START", "右", "左", "上", "下", "R", "L"];
+    let names = NAMES
+        .iter()
+        .enumerate()
+        .filter(|(bit, _)| mask & (1 << bit) != 0)
+        .map(|(_, name)| *name)
+        .collect::<Vec<_>>()
+        .join("、");
+    if names.is_empty() {
+        return match mode {
+            ButtonMode::Exact => "什么键都没按时才做下一条".into(),
+            _ => "不看按键，直接做下一条".into(),
+        };
+    }
+    match mode {
+        ButtonMode::All => format!("按着 {names} 时才做下一条"),
+        ButtonMode::None => format!("没按 {names} 时才做下一条"),
+        ButtonMode::Exact => format!("只按着 {names} 时才做下一条"),
+    }
+}
+
 pub fn parse_cheat(family: CheatFamily, text: &str) -> Result<CheatProgram, String> {
     let pairs = parse_pairs(text)?;
     if pairs.is_empty() {
@@ -1388,6 +1650,50 @@ mod tests {
             program.apply(&mut bus);
         }
         assert_eq!(bus.read_u8(0x0200_0010), 0);
+    }
+
+    #[test]
+    fn formatting_groups_each_line_and_a_short_line_says_what_is_missing() {
+        assert_eq!(
+            format_cheat(CheatFamily::CodeBreaker, "8200000003e7 32000000 00ab"),
+            "82000000 03E7\n32000000 00AB"
+        );
+        assert_eq!(
+            format_cheat(CheatFamily::CodeBreaker, "8200000003"),
+            "82000000 03"
+        );
+        assert_eq!(
+            format_cheat(CheatFamily::GameShark, "12 000000 beefabcd"),
+            "12000000 BEEFABCD"
+        );
+        assert_eq!(
+            read_cheat(CheatFamily::CodeBreaker, "8200000003"),
+            CheatReading::Short { missing: 2 }
+        );
+        assert_eq!(read_cheat(CheatFamily::CodeBreaker, "  "), CheatReading::Empty);
+    }
+
+    #[test]
+    fn a_code_reads_as_the_memory_it_changes() {
+        assert_eq!(
+            read_cheat(CheatFamily::CodeBreaker, "32000000 00AB\n82000002 1234"),
+            CheatReading::Lines(vec![
+                "把 02000000 的字节写成 AB".into(),
+                "把 02000002 的半字写成 1234".into(),
+            ])
+        );
+        assert_eq!(
+            read_cheat(CheatFamily::CodeBreaker, "72000000 0001\nD0000020 0001"),
+            CheatReading::Lines(vec![
+                "若 02000000 的半字等于 0001，才做下一条".into(),
+                "按着 A 时才做下一条".into(),
+            ])
+        );
+        let (hi, lo) = encrypt_gameshark(GS_SEEDS, 0x1200_0000, 0x0000_BEEF);
+        assert_eq!(
+            read_cheat(CheatFamily::GameShark, &format!("{hi:08X}{lo:08X}")),
+            CheatReading::Lines(vec!["把 02000000 的半字写成 BEEF".into()])
+        );
     }
 
     fn ar(pairs: &[(u32, u32)]) -> CheatProgram {

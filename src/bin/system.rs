@@ -1,8 +1,7 @@
 use gpui::{div, prelude::*, px, rgb, Context, Window};
 use super::{
-    cheat_panel, link_panel, picture_option_label, AppView, CheatView, Command, LinkSeat,
-    SetLockedSpeed, ToggleColorCorrect, ToggleLcdGhost, ToggleRumbleShake, ACCENT, BG, MUTED,
-    SPEEDS, TEXT,
+    picture_option_label, AppView, Command, SetLockedSpeed, ToggleColorCorrect, ToggleLcdGhost,
+    ToggleRumbleShake, ACCENT, BG, MUTED, SPEEDS, TEXT,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +18,7 @@ pub(crate) enum SystemInput {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum SystemField {
     None,
     LinkName,
@@ -64,6 +64,7 @@ pub(crate) fn system_stops_link(_input: SystemInput) -> bool {
     false
 }
 
+#[cfg(test)]
 pub(crate) fn system_link_highlight(field: SystemField) -> Option<bool> {
     match field {
         SystemField::LinkName => Some(true),
@@ -72,6 +73,7 @@ pub(crate) fn system_link_highlight(field: SystemField) -> Option<bool> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn system_cheat_highlight(field: SystemField) -> Option<bool> {
     match field {
         SystemField::CheatName => Some(true),
@@ -99,28 +101,9 @@ pub(crate) fn system_page(
     lcd_ghost: bool,
     color_correct: bool,
     rumble_shake: bool,
-    address: &str,
-    name: &str,
-    field: SystemField,
-    line: &str,
-    card_line: &str,
-    link_error: Option<&str>,
-    lan_ip: &str,
-    hosts: &[(String, String)],
-    in_room: bool,
-    seats: &[LinkSeat],
-    cheat_name: &str,
-    cheat_code: &str,
-    gameshark: bool,
-    action_replay: bool,
-    cheats: &[CheatView],
-    cheat_error: Option<&str>,
 ) -> impl IntoElement {
     div()
         .id("system-page")
-        .when(field != SystemField::None, |page| {
-            page.key_context("SystemTyping")
-        })
         .size_full()
         .overflow_y_scroll()
         .flex()
@@ -188,29 +171,42 @@ pub(crate) fn system_page(
                     |window, cx| window.dispatch_action(Box::new(ToggleRumbleShake), cx),
                 )),
         )
-        .child(link_panel(
-            cx,
-            address,
-            name,
-            system_link_highlight(field),
-            line,
-            card_line,
-            link_error,
-            lan_ip,
-            hosts,
-            in_room,
-            seats,
-        ))
-        .child(cheat_panel(
-            cx,
-            cheat_name,
-            cheat_code,
-            gameshark,
-            action_replay,
-            system_cheat_highlight(field),
-            cheats,
-            cheat_error,
-        ))
+        .child(div().text_sm().text_color(rgb(MUTED)).child("金手指"))
+        .child(
+            div()
+                .id("system-cheats")
+                .px(px(14.))
+                .py(px(8.))
+                .rounded(px(6.))
+                .bg(rgb(0x202A2C))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.system_field = SystemField::None;
+                    this.link_ui.lock().expect("link ui poisoned").open = false;
+                    this.controls.lock().expect("control settings poisoned").open = false;
+                    this.cheat_ui.lock().expect("cheat ui poisoned").open = true;
+                    cx.notify();
+                }))
+                .child("打开金手指"),
+        )
+        .child(div().text_sm().text_color(rgb(MUTED)).child("联机"))
+        .child(
+            div()
+                .id("system-link")
+                .px(px(14.))
+                .py(px(8.))
+                .rounded(px(6.))
+                .bg(rgb(0x202A2C))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.system_field = SystemField::None;
+                    this.cheat_ui.lock().expect("cheat ui poisoned").open = false;
+                    this.controls.lock().expect("control settings poisoned").open = false;
+                    this.link_ui.lock().expect("link ui poisoned").open = true;
+                    cx.notify();
+                }))
+                .child("打开联机"),
+        )
 }
 
 fn speed_button(cx: &mut Context<AppView>, speed: u8, selected: u8) -> impl IntoElement {
