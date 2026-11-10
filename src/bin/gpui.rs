@@ -4221,9 +4221,9 @@ fn adopt_cart_runtime(
     state.prefs_token = state.prefs_token.wrapping_add(1);
 }
 
-/// 大约十秒。每半秒一档，按住时每四帧退一档。
+/// 大约两分钟。每半秒一档，按住时每四帧退一档。
 const REWIND_EVERY: u32 = 30;
-const REWIND_SLOTS: usize = 20;
+const REWIND_SLOTS: usize = 240;
 const REWIND_HOLD: u32 = 3;
 
 struct RewindSlot {
@@ -7011,6 +7011,7 @@ mod tests {
         let mut bus = Bus::new();
         bus.load_rom(&[0x12, 0x34]);
         let regs = Registers::arm_start(0x0800_0000);
+        assert_eq!(REWIND_SLOTS as u32 * REWIND_EVERY, 120 * 60);
         let mut rewind = Rewind::default();
         for frame in 1..REWIND_EVERY {
             rewind.record(&regs, &mut bus, frame.into());
