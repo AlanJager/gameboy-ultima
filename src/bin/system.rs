@@ -1,3 +1,10 @@
+use gpui::{div, prelude::*, px, rgb, Context, Window};
+use super::{
+    cheat_panel, link_panel, picture_option_label, AppView, CheatView, Command, LinkSeat,
+    SetLockedSpeed, ToggleColorCorrect, ToggleLcdGhost, ToggleRumbleShake, ACCENT, BG, MUTED,
+    SPEEDS, TEXT,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SystemRun {
     pub open: bool,
@@ -12,7 +19,6 @@ pub(crate) enum SystemInput {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum SystemField {
     None,
     LinkName,
@@ -64,6 +70,161 @@ pub(crate) fn pause_key_while_open(open: bool) -> Option<SystemInput> {
     } else {
         None
     }
+}
+
+pub(crate) fn system_page(
+    cx: &mut Context<AppView>,
+    title: &str,
+    locked_speed: u8,
+    lcd_ghost: bool,
+    color_correct: bool,
+    rumble_shake: bool,
+    address: &str,
+    name: &str,
+    editing_name: bool,
+    line: &str,
+    card_line: &str,
+    link_error: Option<&str>,
+    lan_ip: &str,
+    hosts: &[(String, String)],
+    in_room: bool,
+    seats: &[LinkSeat],
+    cheat_name: &str,
+    cheat_code: &str,
+    gameshark: bool,
+    action_replay: bool,
+    editing_cheat_name: bool,
+    cheats: &[CheatView],
+    cheat_error: Option<&str>,
+) -> impl IntoElement {
+    div()
+        .id("system-page")
+        .size_full()
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(16.))
+        .p(px(24.))
+        .bg(rgb(BG))
+        .text_color(rgb(TEXT))
+        .child(div().text_lg().child("系统"))
+        .when(!title.is_empty(), |page| {
+            page.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child(title.to_string()),
+            )
+        })
+        .child(
+            div()
+                .id("system-resume")
+                .px(px(18.))
+                .py(px(8.))
+                .rounded(px(6.))
+                .bg(rgb(ACCENT))
+                .text_color(rgb(BG))
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.system_field = SystemField::None;
+                    let _ = this.commands.send(Command::SystemKey);
+                    cx.notify();
+                }))
+                .child("恢复"),
+        )
+        .child(div().text_sm().text_color(rgb(MUTED)).child("速度"))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(8.))
+                .children(SPEEDS.map(|speed| speed_button(cx, speed, locked_speed))),
+        )
+        .child(div().text_sm().text_color(rgb(MUTED)).child("画面"))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(8.))
+                .child(picture_button(
+                    cx,
+                    "system-ghost",
+                    &picture_option_label("液晶余辉", lcd_ghost),
+                    |window, cx| window.dispatch_action(Box::new(ToggleLcdGhost), cx),
+                ))
+                .child(picture_button(
+                    cx,
+                    "system-color",
+                    &picture_option_label("色彩校正", color_correct),
+                    |window, cx| window.dispatch_action(Box::new(ToggleColorCorrect), cx),
+                ))
+                .child(picture_button(
+                    cx,
+                    "system-rumble",
+                    &picture_option_label("画面震动", rumble_shake),
+                    |window, cx| window.dispatch_action(Box::new(ToggleRumbleShake), cx),
+                )),
+        )
+        .child(link_panel(
+            cx,
+            address,
+            name,
+            editing_name,
+            line,
+            card_line,
+            link_error,
+            lan_ip,
+            hosts,
+            in_room,
+            seats,
+        ))
+        .child(cheat_panel(
+            cx,
+            cheat_name,
+            cheat_code,
+            gameshark,
+            action_replay,
+            editing_cheat_name,
+            cheats,
+            cheat_error,
+        ))
+}
+
+fn speed_button(cx: &mut Context<AppView>, speed: u8, selected: u8) -> impl IntoElement {
+    div()
+        .id(("system-speed", speed as usize))
+        .px(px(14.))
+        .py(px(8.))
+        .rounded(px(6.))
+        .bg(rgb(0x202A2C))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.system_field = SystemField::None;
+            window.dispatch_action(Box::new(SetLockedSpeed(speed)), cx);
+        }))
+        .child(picture_option_label(&speed.to_string(), speed == selected))
+}
+
+fn picture_button(
+    cx: &mut Context<AppView>,
+    id: &'static str,
+    label: &str,
+    dispatch: fn(&mut Window, &mut Context<AppView>),
+) -> impl IntoElement {
+    let label = label.to_string();
+    div()
+        .id(id)
+        .px(px(14.))
+        .py(px(8.))
+        .rounded(px(6.))
+        .bg(rgb(0x202A2C))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.system_field = SystemField::None;
+            dispatch(window, cx);
+        }))
+        .child(label)
 }
 
 #[cfg(test)]

@@ -739,6 +739,11 @@ impl AppView {
             self.close_cheats(cx);
             return;
         }
+        self.edit_cheat_text(event, cx);
+    }
+
+    fn edit_cheat_text(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = normalize_key(&event.keystroke.key);
         if key == "v" && event.keystroke.modifiers.platform && !event.is_held {
             if let Some(text) = clipboard_text() {
                 self.push_cheat_text(&text);
@@ -835,6 +840,11 @@ impl AppView {
             self.close_link(cx);
             return;
         }
+        self.edit_link_text(event, cx);
+    }
+
+    fn edit_link_text(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = normalize_key(&event.keystroke.key);
         let editing_name = matches!(
             self.link_ui.lock().expect("link ui poisoned").field,
             LinkField::Name
@@ -967,9 +977,65 @@ impl AppView {
         let _ = self.commands.send(Command::SetLinkName(name.to_string()));
     }
 
-    fn edit_system_field(&mut self, _event: &KeyDownEvent, _cx: &mut Context<Self>) {}
+    fn edit_system_field(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = normalize_key(&event.keystroke.key);
+        if key == "escape" {
+            self.system_field = SystemField::None;
+            cx.notify();
+            return;
+        }
+        match self.system_field {
+            SystemField::LinkName => {
+                self.link_ui.lock().expect("link ui poisoned").field = LinkField::Name;
+                self.edit_link_text(event, cx);
+            }
+            SystemField::LinkAddress => {
+                self.link_ui.lock().expect("link ui poisoned").field = LinkField::Address;
+                self.edit_link_text(event, cx);
+            }
+            SystemField::CheatName => {
+                self.cheat_ui.lock().expect("cheat ui poisoned").field = CheatField::Name;
+                self.edit_cheat_text(event, cx);
+            }
+            SystemField::CheatCode => {
+                self.cheat_ui.lock().expect("cheat ui poisoned").field = CheatField::Code;
+                self.edit_cheat_text(event, cx);
+            }
+            SystemField::None => {}
+        }
+    }
 
     fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let system_open = self
+            .snapshot
+            .lock()
+            .expect("emulator snapshot poisoned")
+            .system_open;
+        if system_open {
+            let key = normalize_key(&event.keystroke.key);
+            let binding = self
+                .controls_settings()
+                .map
+                .hotkey(Hotkey::System)
+                .to_string();
+            let field = self.system_field;
+            match system_key(field, &key, &binding) {
+                SystemKey::Resume if !event.is_held => {
+                    self.system_field = SystemField::None;
+                    self.link_ui.lock().expect("link ui poisoned").open = false;
+                    self.cheat_ui.lock().expect("cheat ui poisoned").open = false;
+                    self.controls.lock().expect("control settings poisoned").open = false;
+                    self.keys.store(0, Ordering::Relaxed);
+                    self.turbo_held.store(false, Ordering::Relaxed);
+                    self.rewind_held.store(false, Ordering::Relaxed);
+                    let _ = self.commands.send(Command::SystemKey);
+                    cx.notify();
+                }
+                SystemKey::Edit => self.edit_system_field(event, cx),
+                SystemKey::Resume | SystemKey::Ignore => {}
+            }
+            return;
+        }
         if self.cheat_open() {
             self.edit_cheat_field(event, cx);
             return;
@@ -1012,34 +1078,6 @@ impl AppView {
         }
         let map = settings.map.clone();
         drop(settings);
-        let system_open = self
-            .snapshot
-            .lock()
-            .expect("emulator snapshot poisoned")
-            .system_open;
-        if system_open {
-            let binding = map.hotkey(Hotkey::System).to_string();
-            let field = self.system_field;
-            match system_key(field, &key, &binding) {
-                SystemKey::Resume if !event.is_held => {
-                    self.system_field = SystemField::None;
-                    self.link_ui.lock().expect("link ui poisoned").open = false;
-                    self.cheat_ui.lock().expect("cheat ui poisoned").open = false;
-                    self.controls.lock().expect("control settings poisoned").open = false;
-                    self.keys.store(0, Ordering::Relaxed);
-                    self.turbo_held.store(false, Ordering::Relaxed);
-                    self.rewind_held.store(false, Ordering::Relaxed);
-                    let _ = self.commands.send(Command::SystemKey);
-                    cx.notify();
-                    return;
-                }
-                SystemKey::Edit => {
-                    self.edit_system_field(event, cx);
-                    return;
-                }
-                SystemKey::Resume | SystemKey::Ignore => return,
-            }
-        }
         if is_reset_key(&key, &map) {
             if !event.is_held {
                 let _ = self.commands.send(Command::Reset);
@@ -1056,6 +1094,7 @@ impl AppView {
                         .rom_path
                         .is_some();
                     if has_cart {
+                        self.system_field = SystemField::None;
                         self.link_ui.lock().expect("link ui poisoned").open = false;
                         self.cheat_ui.lock().expect("cheat ui poisoned").open = false;
                         self.controls.lock().expect("control settings poisoned").open = false;
@@ -1488,6 +1527,10 @@ impl Render for AppView {
             rom_id,
             prefs_token,
             solar_cart,
+            system_open,
+            lcd_ghost,
+            color_correct,
+            rumble_shake,
         ) = {
             let snapshot = self.snapshot.lock().expect("emulator snapshot poisoned");
             (
@@ -1512,6 +1555,10 @@ impl Render for AppView {
                 snapshot.rom_id.clone(),
                 snapshot.prefs_token,
                 snapshot.solar_cart,
+                snapshot.system_open,
+                snapshot.lcd_ghost,
+                snapshot.color_correct,
+                snapshot.rumble_shake,
             )
         };
         if prefs_token != self.applied_prefs {
@@ -1535,6 +1582,17 @@ impl Render for AppView {
         } else {
             link_name.clone()
         };
+        let (cheat_name, cheat_code, cheat_gameshark, cheat_action_replay, cheat_editing_name) = {
+            let cheat = self.cheat_ui.lock().expect("cheat ui poisoned");
+            (
+                cheat.name.clone(),
+                cheat.code.clone(),
+                cheat.gameshark,
+                cheat.action_replay,
+                matches!(cheat.field, CheatField::Name),
+            )
+        };
+        let locked_speed = self.locked_speed.load(Ordering::Relaxed);
         let resume_error = resume_prompt.then(|| error.clone()).flatten();
 
         let viewport = window.viewport_size();
@@ -1612,7 +1670,34 @@ impl Render for AppView {
         );
 
         let screen = self.game_picture(screen_w, screen_h, screen_scale);
-        let content = if !self.compare && self.library_mode.load(Ordering::Relaxed) {
+        let content = if system_open {
+            system_page(
+                cx,
+                &title,
+                locked_speed,
+                lcd_ghost,
+                color_correct,
+                rumble_shake,
+                &link_address,
+                &shown_name,
+                link_field,
+                &link_line,
+                &ereader_line,
+                link_error.as_deref(),
+                &link_lan,
+                &link_hosts,
+                link_in_room,
+                &link_seats,
+                &cheat_name,
+                &cheat_code,
+                cheat_gameshark,
+                cheat_action_replay,
+                cheat_editing_name,
+                &cheats,
+                cheat_error.as_deref(),
+            )
+            .into_any_element()
+        } else if !self.compare && self.library_mode.load(Ordering::Relaxed) {
             self.render_library(cx, &library, error).into_any_element()
         } else {
             let game = div()
@@ -1756,10 +1841,10 @@ impl Render for AppView {
             .flex_col()
             .when(self.paints_opaque_root(), |app| app.bg(rgb(0x000000)))
             .child(content)
-            .when(!self.compare && controls_open, |app| {
+            .when(!system_open && !self.compare && controls_open, |app| {
                 app.child(controls_overlay(cx, &controls_map, controls_capturing))
             })
-            .when(!self.compare && !controls_open && !link_open && self.cheat_open(), |app| {
+            .when(!system_open && !self.compare && !controls_open && !link_open && self.cheat_open(), |app| {
                 let draft = self.cheat_ui.lock().expect("cheat ui poisoned");
                 app.child(cheat_overlay(
                     cx,
@@ -1772,7 +1857,7 @@ impl Render for AppView {
                     cheat_error.as_deref(),
                 ))
             })
-            .when(!self.compare && !controls_open && link_open, |app| {
+            .when(!system_open && !self.compare && !controls_open && link_open, |app| {
                 app.child(link_overlay(
                     cx,
                     &link_address,
@@ -2573,6 +2658,38 @@ fn cheat_overlay(
     cheats: &[CheatView],
     error: Option<&str>,
 ) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(0.))
+        .right(px(0.))
+        .bottom(px(0.))
+        .left(px(0.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(0x050809))
+        .child(cheat_panel(
+            cx,
+            name,
+            code,
+            gameshark,
+            action_replay,
+            editing_name,
+            cheats,
+            error,
+        ))
+}
+
+fn cheat_panel(
+    cx: &mut Context<AppView>,
+    name: &str,
+    code: &str,
+    gameshark: bool,
+    action_replay: bool,
+    editing_name: bool,
+    cheats: &[CheatView],
+    error: Option<&str>,
+) -> impl IntoElement {
     let name_text = if name.is_empty() {
         "未命名".to_string()
     } else {
@@ -2585,18 +2702,7 @@ fn cheat_overlay(
     };
     let family = cheat_kind_label(gameshark, action_replay);
     div()
-        .absolute()
-        .top(px(0.))
-        .right(px(0.))
-        .bottom(px(0.))
-        .left(px(0.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgb(0x050809))
-        .child(
-            div()
-                .id("cheat-panel")
+        .id("cheat-panel")
                 .w(px(460.))
                 .max_h(px(640.))
                 .overflow_y_scroll()
@@ -2635,6 +2741,7 @@ fn cheat_overlay(
                         .text_color(rgb(if name.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
+                            this.system_field = SystemField::CheatName;
                             this.cheat_ui.lock().expect("cheat ui poisoned").field = CheatField::Name;
                             cx.notify();
                         }))
@@ -2654,6 +2761,7 @@ fn cheat_overlay(
                         .text_color(rgb(if code.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
+                            this.system_field = SystemField::CheatCode;
                             this.cheat_ui.lock().expect("cheat ui poisoned").field = CheatField::Code;
                             cx.notify();
                         }))
@@ -2746,8 +2854,7 @@ fn cheat_overlay(
                                 }))
                                 .child("删除"),
                         )
-                })),
-        )
+                }))
 }
 
 fn shown_link_seats(seats: &[LinkSeat]) -> usize {
@@ -2805,6 +2912,44 @@ fn link_board(seats: &[LinkSeat]) -> impl IntoElement {
 }
 
 fn link_overlay(
+    cx: &mut Context<AppView>,
+    address: &str,
+    name: &str,
+    editing_name: bool,
+    line: &str,
+    card_line: &str,
+    error: Option<&str>,
+    lan_ip: &str,
+    hosts: &[(String, String)],
+    in_room: bool,
+    seats: &[LinkSeat],
+) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(0.))
+        .right(px(0.))
+        .bottom(px(0.))
+        .left(px(0.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(0x050809))
+        .child(link_panel(
+            cx,
+            address,
+            name,
+            editing_name,
+            line,
+            card_line,
+            error,
+            lan_ip,
+            hosts,
+            in_room,
+            seats,
+        ))
+}
+
+fn link_panel(
     cx: &mut Context<AppView>,
     address: &str,
     name: &str,
@@ -2883,18 +3028,7 @@ fn link_overlay(
             .into_any_element()
     };
     div()
-        .absolute()
-        .top(px(0.))
-        .right(px(0.))
-        .bottom(px(0.))
-        .left(px(0.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgb(0x050809))
-        .child(
-            div()
-                .id("link-panel")
+        .id("link-panel")
                 .w(px(440.))
                 .max_h(px(640.))
                 .overflow_y_scroll()
@@ -2936,6 +3070,7 @@ fn link_overlay(
                         .text_color(rgb(if name.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
+                            this.system_field = SystemField::LinkName;
                             this.link_ui.lock().expect("link ui poisoned").field = LinkField::Name;
                             cx.notify();
                         }))
@@ -3035,6 +3170,7 @@ fn link_overlay(
                         })
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
+                            this.system_field = SystemField::LinkAddress;
                             this.link_ui.lock().expect("link ui poisoned").field = LinkField::Address;
                             cx.notify();
                         }))
@@ -3090,8 +3226,7 @@ fn link_overlay(
                         .child(format!(
                             "本机 {lan_ip}:5576，中继端口 5578。同一 Wi-Fi 可以点下面的主机。跨网时把状态栏里的地址#房间号填进手动加入。Command-V 粘贴。同一张卡带，主机是 1 号机。"
                         )),
-                ),
-        )
+                )
 }
 
 fn link_seat_row(seat: &LinkSeat) -> impl IntoElement {
