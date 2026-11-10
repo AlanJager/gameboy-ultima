@@ -85,7 +85,9 @@ cargo run --release --bin gameboy-ultima-gpui
 cargo run --release --bin gameboy-ultima-gpui -- 卡带.gba
 ```
 
-不带路径时打开图库。macOS 上应用数据在 `~/Library/Application Support/gameboy-ultima`（`library.json`、封面、即时存档、键位、`cart_prefs/`、`shell.json`）。
+不带路径时打开图库。应用数据里有 `library.json`、封面、即时存档、键位、`cart_prefs/`、`shell.json`。macOS 在 `~/Library/Application Support/gameboy-ultima`，Windows 在 `%APPDATA%\gameboy-ultima`，Linux 在 `$XDG_CONFIG_HOME/gameboy-ultima`，没设这个变量时在 `~/.config/gameboy-ultima`。
+
+Windows 和 Linux 用上面的 `cargo run`。画面默认是 CPU 整数最近邻，没有 Metal。x86_64 上会走动态重编译，别的指令集仍逐条解释。还没有 Windows 或 Linux 的安装包。
 
 macOS 可以打成独立应用，构建需要 Xcode Command Line Tools：
 

@@ -5871,6 +5871,7 @@ fn picture_menu_item(mode: PictureMode, open: bool) -> MenuItem {
     match mode {
         #[cfg(target_os = "macos")]
         PictureMode::Metal => MenuItem::action(name, ToggleMetalScreen),
+        #[cfg(target_os = "macos")]
         PictureMode::Sharpen => MenuItem::action(name, ToggleSharpenScreen),
         PictureMode::CpuNearest => MenuItem::action(name, ToggleCpuScreen),
         PictureMode::Linear => MenuItem::action(name, ToggleLinearScreen),
@@ -6246,6 +6247,7 @@ impl PictureWindows {
         match mode {
             #[cfg(target_os = "macos")]
             PictureMode::Metal => self.metal,
+            #[cfg(target_os = "macos")]
             PictureMode::Sharpen => self.sharpen,
             PictureMode::CpuNearest => self.cpu,
             PictureMode::Linear => self.linear,
@@ -6256,6 +6258,7 @@ impl PictureWindows {
         match mode {
             #[cfg(target_os = "macos")]
             PictureMode::Metal => &mut self.metal,
+            #[cfg(target_os = "macos")]
             PictureMode::Sharpen => &mut self.sharpen,
             PictureMode::CpuNearest => &mut self.cpu,
             PictureMode::Linear => &mut self.linear,
@@ -7463,6 +7466,7 @@ mod tests {
         ];
         #[cfg(target_os = "macos")]
         names.push(PictureMode::Metal.title());
+        #[cfg(target_os = "macos")]
         names.push(PictureMode::Sharpen.title());
         let mut unique = names.clone();
         unique.sort_unstable();
