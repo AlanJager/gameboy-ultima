@@ -4425,7 +4425,7 @@ fn emulator_worker(
         cart.as_mut()
             .expect("running cart exists")
             .bus
-            .set_fast_forward(speed > 1);
+            .set_fast_forward(speed);
 
         let rewinding = rewind_held.load(Ordering::Relaxed);
         if rewinding {

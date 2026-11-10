@@ -61,8 +61,17 @@ pub(crate) struct Sampler {
     accum: u32,
     #[serde(default)]
     muted: bool,
+    /// 高于 1 倍时每隔这么多样本留一个，喇叭仍按原来的采样率播。
+    #[serde(default = "one_u8")]
+    stride: u8,
+    #[serde(default)]
+    phase: u8,
     #[serde(skip, default = "state_audio_link")]
     link: AudioLink,
+}
+
+fn one_u8() -> u8 {
+    1
 }
 
 fn state_audio_link() -> AudioLink {
@@ -379,12 +388,28 @@ impl Sampler {
         Self {
             accum: 0,
             muted: false,
+            stride: 1,
+            phase: 0,
             link: AudioLink::new(AUDIO_CAP),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn set_muted(&mut self, muted: bool) {
         self.muted = muted;
+    }
+
+    /// `speed` 是 1 时每个样本都留。更大时刚切换清一次积压，之后按倍数抽稀。
+    pub(crate) fn set_output_stride(&mut self, speed: u8) {
+        let stride = speed.max(1);
+        if stride == self.stride.max(1) {
+            return;
+        }
+        self.stride = stride;
+        self.phase = 0;
+        if stride > 1 {
+            self.discard();
+        }
     }
 
     pub(crate) fn discard(&self) {
@@ -404,6 +429,13 @@ impl Sampler {
             self.accum = 0;
             return;
         }
+        let stride = self.stride.max(1);
+        self.phase = self.phase.saturating_add(1);
+        if self.phase < stride {
+            self.accum = 0;
+            return;
+        }
+        self.phase = 0;
         self.link.produce(
             Sample {
                 left: pwm(level.0, bias),
@@ -534,6 +566,19 @@ mod tests {
         let fast = 262_144;
         let fast_target = (capacity / 2).min((fast / 20) as usize);
         assert!((audio_pace(fast_target, capacity, fast) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fast_forward_keeps_one_sample_from_each_speed_group() {
+        let mut sampler = Sampler::new();
+        sampler.set_output_stride(4);
+        for level in 0..8 {
+            sampler.latch((level, level), 0x200);
+        }
+        assert_eq!(sampler.samples().0.len(), 2);
+        sampler.set_output_stride(1);
+        sampler.latch((9, 9), 0x200);
+        assert_eq!(sampler.samples().0.len(), 3);
     }
 
     #[test]
