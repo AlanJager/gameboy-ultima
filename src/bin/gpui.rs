@@ -17,6 +17,7 @@ use gameboy_ultima::{
 mod controls;
 mod system;
 use controls::*;
+use system::*;
 #[cfg(target_os = "macos")]
 #[path = "metal_screen.rs"]
 mod metal_screen;
@@ -250,6 +251,7 @@ enum Command {
     ToggleCheat(usize),
     RemoveCheat(usize),
     Error(String),
+    SystemKey,
     Shutdown,
 }
 
@@ -349,6 +351,7 @@ struct Snapshot {
     cheat_error: Option<String>,
     solar_cart: bool,
     solar: u8,
+    system_open: bool,
 }
 
 enum LinkField {
@@ -457,6 +460,7 @@ struct AppView {
     controls: Arc<Mutex<ControlSettings>>,
     link_ui: Arc<Mutex<LinkUi>>,
     cheat_ui: Arc<Mutex<CheatUi>>,
+    system_field: SystemField,
 }
 
 impl AppView {
@@ -534,6 +538,7 @@ impl AppView {
             controls,
             link_ui,
             cheat_ui,
+            system_field: SystemField::None,
         }
     }
 
@@ -962,7 +967,9 @@ impl AppView {
         let _ = self.commands.send(Command::SetLinkName(name.to_string()));
     }
 
-    fn handle_key_down(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn edit_system_field(&mut self, _event: &KeyDownEvent, _cx: &mut Context<Self>) {}
+
+    fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         if self.cheat_open() {
             self.edit_cheat_field(event, cx);
             return;
@@ -1005,6 +1012,34 @@ impl AppView {
         }
         let map = settings.map.clone();
         drop(settings);
+        let system_open = self
+            .snapshot
+            .lock()
+            .expect("emulator snapshot poisoned")
+            .system_open;
+        if system_open {
+            let binding = map.hotkey(Hotkey::System).to_string();
+            let field = self.system_field;
+            match system_key(field, &key, &binding) {
+                SystemKey::Resume if !event.is_held => {
+                    self.system_field = SystemField::None;
+                    self.link_ui.lock().expect("link ui poisoned").open = false;
+                    self.cheat_ui.lock().expect("cheat ui poisoned").open = false;
+                    self.controls.lock().expect("control settings poisoned").open = false;
+                    self.keys.store(0, Ordering::Relaxed);
+                    self.turbo_held.store(false, Ordering::Relaxed);
+                    self.rewind_held.store(false, Ordering::Relaxed);
+                    let _ = self.commands.send(Command::SystemKey);
+                    cx.notify();
+                    return;
+                }
+                SystemKey::Edit => {
+                    self.edit_system_field(event, cx);
+                    return;
+                }
+                SystemKey::Resume | SystemKey::Ignore => return,
+            }
+        }
         if is_reset_key(&key, &map) {
             if !event.is_held {
                 let _ = self.commands.send(Command::Reset);
@@ -1012,6 +1047,26 @@ impl AppView {
             return;
         }
         if let Some(hotkey) = map.hotkey_for_key(&key) {
+            if hotkey == Hotkey::System {
+                if !event.is_held {
+                    let has_cart = self
+                        .snapshot
+                        .lock()
+                        .expect("emulator snapshot poisoned")
+                        .rom_path
+                        .is_some();
+                    if has_cart {
+                        self.link_ui.lock().expect("link ui poisoned").open = false;
+                        self.cheat_ui.lock().expect("cheat ui poisoned").open = false;
+                        self.controls.lock().expect("control settings poisoned").open = false;
+                        self.keys.store(0, Ordering::Relaxed);
+                        self.turbo_held.store(false, Ordering::Relaxed);
+                        self.rewind_held.store(false, Ordering::Relaxed);
+                        let _ = self.commands.send(Command::SystemKey);
+                    }
+                }
+                return;
+            }
             if hotkey == Hotkey::FastForward {
                 self.turbo_held.store(true, Ordering::Relaxed);
                 return;
@@ -3290,6 +3345,20 @@ fn relay_target(address: &str) -> String {
     }
 }
 
+fn publish_system(snapshot: &Mutex<Snapshot>, open: bool, paused: bool) {
+    let mut state = snapshot.lock().expect("emulator snapshot poisoned");
+    state.system_open = open;
+    state.running = !paused && state.rom_path.is_some();
+    if state.error.is_none() {
+        state.status = if paused { "PAUSED" } else { "RUNNING" }.into();
+    }
+}
+
+fn take_system(open: bool, paused: bool, has_cart: bool, input: SystemInput) -> SystemRun {
+    debug_assert!(!system_stops_link(input));
+    apply_system(SystemRun { open, paused }, has_cart, input)
+}
+
 fn take_link_command(
     command: Command,
     link: &mut LinkHub,
@@ -3297,6 +3366,8 @@ fn take_link_command(
     snapshot: &Mutex<Snapshot>,
     cheats: &mut Vec<LiveCheat>,
     ereader: &mut Option<Vec<u8>>,
+    system_open: &mut bool,
+    paused: &mut bool,
 ) -> Option<Command> {
     let replaces_cart = matches!(
         command,
@@ -3308,6 +3379,9 @@ fn take_link_command(
             | Command::ResumeState
     );
     if replaces_cart {
+        let hidden = take_system(*system_open, *paused, true, SystemInput::Hide);
+        *system_open = hidden.open;
+        publish_system(snapshot, hidden.open, *paused);
         link.stop();
         if let Some(active) = cart.as_mut() {
             active.bus.set_link_player(None);
@@ -3461,6 +3535,34 @@ fn take_link_command(
             let error = save_cheats(&rom_id, cheats).err();
             publish_cheats(snapshot, cheats, error);
             None
+        }
+        Command::SystemKey => {
+            let has_cart = cart.is_some();
+            let next = take_system(
+                *system_open,
+                *paused,
+                has_cart,
+                if *system_open {
+                    SystemInput::Resume
+                } else {
+                    SystemInput::Open
+                },
+            );
+            *system_open = next.open;
+            *paused = next.paused;
+            publish_system(snapshot, next.open, *paused);
+            None
+        }
+        Command::TogglePause => {
+            if let Some(input) = pause_key_while_open(*system_open) {
+                let next = take_system(*system_open, *paused, cart.is_some(), input);
+                *system_open = next.open;
+                *paused = next.paused;
+                publish_system(snapshot, next.open, *paused);
+                None
+            } else {
+                Some(Command::TogglePause)
+            }
         }
         other => Some(other),
     }
@@ -3954,6 +4056,7 @@ fn emulator_worker(
     let mut cart: Option<ActiveCart> = None;
     let mut audio: Option<AudioPlay> = None;
     let mut paused = false;
+    let mut system_open = false;
     let mut bios_hle = read_shell_prefs().bios_hle;
     let mut frame_number = 0u64;
     let mut screenshot_frames_left: Option<u32> = None;
@@ -4014,6 +4117,8 @@ fn emulator_worker(
                             &snapshot,
                             &mut cheats,
                             &mut ereader_card,
+                            &mut system_open,
+                            &mut paused,
                         )
                     {
                         match apply_command(
@@ -4074,6 +4179,8 @@ fn emulator_worker(
                             &snapshot,
                             &mut cheats,
                             &mut ereader_card,
+                            &mut system_open,
+                            &mut paused,
                         )
                     {
                         match apply_command(
@@ -4148,8 +4255,13 @@ fn emulator_worker(
                             &snapshot,
                             &mut cheats,
                             &mut ereader_card,
+                            &mut system_open,
+                            &mut paused,
                         )
                     else {
+                        if paused {
+                            continue 'worker;
+                        }
                         continue;
                     };
                     match apply_command(
@@ -4658,6 +4770,7 @@ fn apply_command(
             CommandResult::Continue
         }
         Command::LoadEReader(_) | Command::ClearEReader => CommandResult::Continue,
+        Command::SystemKey => CommandResult::Continue,
         Command::Shutdown => CommandResult::Shutdown,
     }
 }
