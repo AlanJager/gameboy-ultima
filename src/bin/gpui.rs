@@ -373,6 +373,18 @@ struct LinkUi {
     name: String,
     name_touched: bool,
     field: LinkField,
+    editing: bool,
+    pressed: Option<LinkPress>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinkPress {
+    Back,
+    Join,
+    Host,
+    Stop,
+    Relay,
+    RelayHost,
 }
 
 enum CheatField {
@@ -387,12 +399,29 @@ struct CheatUi {
     gameshark: bool,
     action_replay: bool,
     field: CheatField,
+    editing: bool,
+    pressed: Option<CheatPress>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheatPress {
+    Back,
+    Add,
+    Family,
+    Remove(usize),
 }
 
 struct DebugUi {
     open: bool,
     address: String,
     editing: bool,
+    pressed: Option<DebugPress>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DebugPress {
+    Back,
+    Follow,
 }
 
 #[derive(Clone)]
@@ -477,6 +506,32 @@ struct AppView {
     debug_ui: DebugUi,
     seen_debug_stop: u64,
     system_field: SystemField,
+    system_chrome: Arc<Mutex<SystemChrome>>,
+    debug_pop: PopClock,
+    link_pop: PopClock,
+    cheat_pop: PopClock,
+}
+
+struct SystemChrome {
+    live: bool,
+    closing: bool,
+    committed: bool,
+    started: Instant,
+    hover: Option<PixelHit>,
+    pressed: Option<PixelHit>,
+}
+
+impl SystemChrome {
+    fn idle() -> Self {
+        Self {
+            live: false,
+            closing: false,
+            committed: false,
+            started: Instant::now(),
+            hover: None,
+            pressed: None,
+        }
+    }
 }
 
 impl AppView {
@@ -503,6 +558,7 @@ impl AppView {
         windows_alive: Arc<AtomicUsize>,
         picture_windows: Arc<Mutex<PictureWindows>>,
         chrome_dirty: Arc<AtomicBool>,
+        system_chrome: Arc<Mutex<SystemChrome>>,
         picture_token: u64,
         picture: PictureMode,
         compare: bool,
@@ -558,9 +614,14 @@ impl AppView {
                 open: false,
                 address: String::new(),
                 editing: false,
+                pressed: None,
             },
             seen_debug_stop: 0,
             system_field: SystemField::None,
+            system_chrome,
+            debug_pop: PopClock::new(),
+            link_pop: PopClock::new(),
+            cheat_pop: PopClock::new(),
         }
     }
 
@@ -737,8 +798,8 @@ impl AppView {
         self.link_ui.lock().expect("link ui poisoned").open
     }
 
-    fn close_link(&self, cx: &mut Context<Self>) {
-        self.link_ui.lock().expect("link ui poisoned").open = false;
+    fn close_link(&mut self, cx: &mut Context<Self>) {
+        self.link_pop.request_close(Instant::now());
         self.keys.store(0, Ordering::Relaxed);
         self.release_turbo();
         cx.notify();
@@ -748,20 +809,33 @@ impl AppView {
         self.cheat_ui.lock().expect("cheat ui poisoned").open
     }
 
-    fn close_cheats(&self, cx: &mut Context<Self>) {
-        self.cheat_ui.lock().expect("cheat ui poisoned").open = false;
+    fn close_cheats(&mut self, cx: &mut Context<Self>) {
+        self.cheat_pop.request_close(Instant::now());
         self.keys.store(0, Ordering::Relaxed);
         self.release_turbo();
         cx.notify();
     }
 
-    fn edit_cheat_field(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let key = normalize_key(&event.keystroke.key);
-        if key == "escape" {
-            self.close_cheats(cx);
+    fn edit_cheat_field(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if !self.cheat_ui.lock().expect("cheat ui poisoned").editing {
             return;
         }
         self.edit_cheat_text(event, cx);
+    }
+
+    fn cycle_cheat_family(&self, cx: &mut Context<Self>) {
+        let mut cheat = self.cheat_ui.lock().expect("cheat ui poisoned");
+        if !cheat.gameshark && !cheat.action_replay {
+            cheat.gameshark = true;
+        } else if cheat.gameshark && !cheat.action_replay {
+            cheat.action_replay = true;
+        } else {
+            cheat.gameshark = false;
+            cheat.action_replay = false;
+        }
+        let raw = cheat.code.clone();
+        replace_cheat_code(&mut cheat, &raw);
+        cx.notify();
     }
 
     fn edit_cheat_text(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -842,10 +916,8 @@ impl AppView {
         });
     }
 
-    fn edit_link_field(&self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let key = normalize_key(&event.keystroke.key);
-        if key == "escape" {
-            self.close_link(cx);
+    fn edit_link_field(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if !self.link_ui.lock().expect("link ui poisoned").editing {
             return;
         }
         self.edit_link_text(event, cx);
@@ -1015,12 +1087,6 @@ impl AppView {
 
     fn edit_debug(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = normalize_key(&event.keystroke.key);
-        if key == "escape" {
-            self.debug_ui.open = false;
-            self.debug_ui.editing = false;
-            cx.notify();
-            return;
-        }
         if key == "v" && event.keystroke.modifiers.platform && !event.is_held {
             if self.debug_ui.editing {
                 if let Some(text) = clipboard_text() {
@@ -1074,6 +1140,94 @@ impl AppView {
         let _ = self.commands.send(Command::SetDebugAddress(addr));
     }
 
+    fn leave_debug(&mut self, cx: &mut Context<Self>) {
+        self.debug_ui.editing = false;
+        self.debug_ui.pressed = None;
+        self.debug_pop.request_close(Instant::now());
+        cx.notify();
+    }
+
+    fn system_menu_open(&self) -> bool {
+        self.snapshot
+            .lock()
+            .expect("emulator snapshot poisoned")
+            .system_open
+    }
+
+    fn overlay_blocks_resume(&self) -> bool {
+        self.debug_ui.open || self.link_open() || self.cheat_open()
+    }
+
+    fn begin_system_close(&mut self, cx: &mut Context<Self>) {
+        let mut chrome = self.system_chrome.lock().expect("system chrome poisoned");
+        if chrome.closing {
+            return;
+        }
+        if !chrome.live {
+            chrome.live = true;
+            chrome.closing = true;
+            chrome.committed = false;
+            chrome.pressed = None;
+            chrome.started = Instant::now()
+                .checked_sub(Duration::from_millis(close_rewind_ms(1) as u64))
+                .unwrap_or_else(Instant::now);
+            drop(chrome);
+            self.keys.store(0, Ordering::Relaxed);
+            self.turbo_held.store(false, Ordering::Relaxed);
+            self.rewind_held.store(false, Ordering::Relaxed);
+            cx.notify();
+            return;
+        }
+        let shown = pixel_reveal(chrome.started.elapsed().as_millis(), false);
+        let rewind = Duration::from_millis(close_rewind_ms(shown) as u64);
+        chrome.closing = true;
+        chrome.committed = false;
+        chrome.pressed = None;
+        chrome.started = Instant::now().checked_sub(rewind).unwrap_or_else(Instant::now);
+        drop(chrome);
+        self.keys.store(0, Ordering::Relaxed);
+        self.turbo_held.store(false, Ordering::Relaxed);
+        self.rewind_held.store(false, Ordering::Relaxed);
+        cx.notify();
+    }
+
+    fn finish_system_close(&mut self) {
+        self.system_field = SystemField::None;
+        self.link_ui.lock().expect("link ui poisoned").open = false;
+        self.cheat_ui.lock().expect("cheat ui poisoned").open = false;
+        self.controls.lock().expect("control settings poisoned").open = false;
+        self.debug_ui.open = false;
+        self.debug_ui.editing = false;
+        let _ = self.commands.send(Command::SystemKey);
+    }
+
+    fn system_reveal_step(&mut self, system_open: bool) -> u8 {
+        let now = Instant::now();
+        let mut chrome = self.system_chrome.lock().expect("system chrome poisoned");
+        if !system_open {
+            *chrome = SystemChrome::idle();
+            return 0;
+        }
+        if !chrome.live {
+            chrome.live = true;
+            chrome.closing = false;
+            chrome.committed = false;
+            chrome.started = now;
+            chrome.hover = None;
+            chrome.pressed = None;
+        }
+        let step = pixel_reveal(now.saturating_duration_since(chrome.started).as_millis(), chrome.closing);
+        if chrome.closing && step == 0 {
+            if !chrome.committed {
+                chrome.committed = true;
+                drop(chrome);
+                self.finish_system_close();
+            }
+            return 0;
+        }
+        step
+    }
+
     fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let system_open = self
             .snapshot
@@ -1081,14 +1235,70 @@ impl AppView {
             .expect("emulator snapshot poisoned")
             .system_open;
         if system_open && self.debug_ui.open {
+            let key = normalize_key(&event.keystroke.key);
+            let binding = self
+                .controls_settings()
+                .map
+                .hotkey(Hotkey::System)
+                .to_string();
+            match debug_back(self.debug_ui.editing, &key, &binding) {
+                DebugBack::Field => {
+                    self.debug_ui.editing = false;
+                    cx.notify();
+                    return;
+                }
+                DebugBack::Menu if !event.is_held => {
+                    self.leave_debug(cx);
+                    return;
+                }
+                DebugBack::Menu | DebugBack::Stay => {}
+            }
             self.edit_debug(event, cx);
             return;
         }
         if self.cheat_open() {
+            let key = normalize_key(&event.keystroke.key);
+            let binding = self
+                .controls_settings()
+                .map
+                .hotkey(Hotkey::System)
+                .to_string();
+            let editing = self.cheat_ui.lock().expect("cheat ui poisoned").editing;
+            match debug_back(editing, &key, &binding) {
+                DebugBack::Field => {
+                    self.cheat_ui.lock().expect("cheat ui poisoned").editing = false;
+                    cx.notify();
+                    return;
+                }
+                DebugBack::Menu if !event.is_held => {
+                    self.close_cheats(cx);
+                    return;
+                }
+                DebugBack::Menu | DebugBack::Stay => {}
+            }
             self.edit_cheat_field(event, cx);
             return;
         }
         if self.link_open() {
+            let key = normalize_key(&event.keystroke.key);
+            let binding = self
+                .controls_settings()
+                .map
+                .hotkey(Hotkey::System)
+                .to_string();
+            let editing = self.link_ui.lock().expect("link ui poisoned").editing;
+            match debug_back(editing, &key, &binding) {
+                DebugBack::Field => {
+                    self.link_ui.lock().expect("link ui poisoned").editing = false;
+                    cx.notify();
+                    return;
+                }
+                DebugBack::Menu if !event.is_held => {
+                    self.close_link(cx);
+                    return;
+                }
+                DebugBack::Menu | DebugBack::Stay => {}
+            }
             self.edit_link_field(event, cx);
             return;
         }
@@ -1101,17 +1311,7 @@ impl AppView {
                 .to_string();
             let field = self.system_field;
             match system_key(field, &key, &binding) {
-                SystemKey::Resume if !event.is_held => {
-                    self.system_field = SystemField::None;
-                    self.link_ui.lock().expect("link ui poisoned").open = false;
-                    self.cheat_ui.lock().expect("cheat ui poisoned").open = false;
-                    self.controls.lock().expect("control settings poisoned").open = false;
-                    self.keys.store(0, Ordering::Relaxed);
-                    self.turbo_held.store(false, Ordering::Relaxed);
-                    self.rewind_held.store(false, Ordering::Relaxed);
-                    let _ = self.commands.send(Command::SystemKey);
-                    cx.notify();
-                }
+                SystemKey::Resume if !event.is_held => self.begin_system_close(cx),
                 SystemKey::Edit => self.edit_system_field(event, cx),
                 SystemKey::Resume | SystemKey::Ignore => {}
             }
@@ -1660,7 +1860,7 @@ impl Render for AppView {
                 self.apply_open_cart(&rom_id, window, cx);
             }
         }
-        let (link_open, link_address, link_draft, link_touched, link_field) = {
+        let (_link_open, link_address, link_draft, link_touched, link_field, link_editing, link_pressed) = {
             let link = self.link_ui.lock().expect("link ui poisoned");
             (
                 link.open,
@@ -1668,6 +1868,8 @@ impl Render for AppView {
                 link.name.clone(),
                 link.name_touched,
                 matches!(link.field, LinkField::Name),
+                link.editing,
+                link.pressed,
             )
         };
         let shown_name = if link_touched {
@@ -1752,18 +1954,32 @@ impl Render for AppView {
             self.turbo_held.load(Ordering::Relaxed),
         );
 
+        let system_step = self.system_reveal_step(system_open);
+        let (system_hover, system_pressed) = {
+            let chrome = self.system_chrome.lock().expect("system chrome poisoned");
+            (chrome.hover, chrome.pressed)
+        };
+        let shade_now = Instant::now();
+        let debug_tick = self.debug_pop.advance(self.debug_ui.open, shade_now);
+        if debug_tick.dismiss {
+            self.debug_ui.open = false;
+            self.debug_ui.editing = false;
+        }
+        let link_tick = self.link_pop.advance(self.link_open(), shade_now);
+        if link_tick.dismiss {
+            self.link_ui.lock().expect("link ui poisoned").open = false;
+        }
+        let cheat_tick = self.cheat_pop.advance(self.cheat_open(), shade_now);
+        if cheat_tick.dismiss {
+            self.cheat_ui.lock().expect("cheat ui poisoned").open = false;
+        }
+
         let screen = self.game_picture(screen_w, screen_h, screen_scale);
-        let content = if system_open {
-            system_page(
-                cx,
-                &title,
-                locked_speed,
-                lcd_ghost,
-                color_correct,
-                rumble_shake,
-            )
-            .into_any_element()
-        } else if !self.compare && self.library_mode.load(Ordering::Relaxed) {
+        let content = if !system_open
+            && system_step == 0
+            && !self.compare
+            && self.library_mode.load(Ordering::Relaxed)
+        {
             self.render_library(cx, &library, error).into_any_element()
         } else {
             let game = div()
@@ -1889,7 +2105,20 @@ impl Render for AppView {
                     |game, progress| game.child(boot_animation_overlay(progress)),
                 )
             };
-            game.when(self.labeled, |game| game.child(picture_label(self.picture)))
+            game.when(system_step > 0, |game| {
+                game.child(system_page(
+                    cx,
+                    &title,
+                    locked_speed,
+                    lcd_ghost,
+                    color_correct,
+                    rumble_shake,
+                    system_step,
+                    system_hover,
+                    system_pressed,
+                ))
+            })
+            .when(self.labeled, |game| game.child(picture_label(self.picture)))
                 .into_any_element()
         };
 
@@ -1917,50 +2146,64 @@ impl Render for AppView {
             .when(!system_open && !self.compare && controls_open, |app| {
                 app.child(controls_overlay(cx, &controls_map, controls_capturing))
             })
-            .when(!self.compare && !controls_open && !link_open && self.cheat_open(), |app| {
-                let draft = self.cheat_ui.lock().expect("cheat ui poisoned");
-                app.child(cheat_overlay(
-                    cx,
-                    &draft.name,
-                    &draft.code,
-                    draft.gameshark,
-                    draft.action_replay,
-                    matches!(draft.field, CheatField::Name),
-                    &cheats,
-                    cheat_error.as_deref(),
-                ))
-            })
             .when(
-                system_open
-                    && !self.compare
-                    && !controls_open
-                    && !link_open
-                    && !self.cheat_open()
-                    && self.debug_ui.open,
+                !self.compare && !controls_open && cheat_tick.step > 0 && link_tick.step == 0,
                 |app| {
-                    app.child(debug_overlay(
-                        cx,
-                        &debug_lines,
-                        &debug_memory,
-                        &debug_levels,
-                        &self.debug_ui.address,
-                        self.debug_ui.editing,
+                    let draft = self.cheat_ui.lock().expect("cheat ui poisoned");
+                    let editing = draft.editing;
+                    let pressed = draft.pressed;
+                    app.child(fade_shade(
+                        cheat_tick.step,
+                        cheat_overlay(
+                            cx,
+                            &draft.name,
+                            &draft.code,
+                            draft.gameshark,
+                            draft.action_replay,
+                            editing && matches!(draft.field, CheatField::Name),
+                            editing,
+                            pressed,
+                            &cheats,
+                            cheat_error.as_deref(),
+                        ),
                     ))
                 },
             )
-            .when(!self.compare && !controls_open && link_open, |app| {
-                app.child(link_overlay(
-                    cx,
-                    &link_address,
-                    &shown_name,
-                    link_field,
-                    &link_line,
-                    &ereader_line,
-                    link_error.as_deref(),
-                    &link_lan,
-                    &link_hosts,
-                    link_in_room,
-                    &link_seats,
+            .when(
+                debug_tick.step > 0 && link_tick.step == 0 && cheat_tick.step == 0,
+                |app| {
+                    app.child(fade_shade(
+                        debug_tick.step,
+                        debug_overlay(
+                            cx,
+                            &debug_lines,
+                            &debug_memory,
+                            &debug_levels,
+                            &self.debug_ui.address,
+                            self.debug_ui.editing,
+                            self.debug_ui.pressed,
+                        ),
+                    ))
+                },
+            )
+            .when(!self.compare && !controls_open && link_tick.step > 0, |app| {
+                app.child(fade_shade(
+                    link_tick.step,
+                    link_overlay(
+                        cx,
+                        &link_address,
+                        &shown_name,
+                        link_editing && link_field,
+                        link_editing,
+                        link_pressed,
+                        &link_line,
+                        &ereader_line,
+                        link_error.as_deref(),
+                        &link_lan,
+                        &link_hosts,
+                        link_in_room,
+                        &link_seats,
+                    ),
                 ))
             })
     }
@@ -2786,6 +3029,7 @@ fn debug_overlay(
     levels: &str,
     address: &str,
     editing: bool,
+    pressed: Option<DebugPress>,
 ) -> impl IntoElement {
     let address_text = if address.is_empty() {
         "点这里填地址，空着就跟 PC".to_string()
@@ -2801,33 +3045,29 @@ fn debug_overlay(
         .flex()
         .items_center()
         .justify_center()
-        .bg(rgb(0x050809))
-        .child(
+        .child(pixel_shell(
+            pixel_face(false, false),
             div()
                 .id("debug-panel")
-                .w(px(560.))
+                .w(px(520.))
                 .max_h(px(640.))
                 .overflow_y_scroll()
                 .flex()
                 .flex_col()
                 .gap(px(8.))
-                .p(px(18.))
-                .rounded(px(16.))
-                .bg(rgb(PANEL_HI))
-                .border_1()
-                .border_color(rgb(0x314044))
-                .text_color(rgb(TEXT))
+                .p(px(12.))
+                .text_color(rgb(PIXEL_INK))
+                .child(debug_pixel_button(cx, "debug-back", "返回", DebugPress::Back, pressed))
                 .child(div().text_lg().child("调试"))
                 .child(
                     div()
-                        .text_sm()
-                        .text_color(rgb(MUTED))
-                        .child("暂停时才能改。点一行设断点。命中后停在这一条，还没执行。Esc 关闭。"),
+                        .text_xs()
+                        .text_color(rgb(PIXEL_QUIET))
+                        .child("点一行设断点。返回回到系统。填地址时 Esc 先离开输入。"),
                 )
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(ACCENT))
                         .child(if levels.is_empty() {
                             "方波 1  0    方波 2  0    波形  0    噪声  0".to_string()
                         } else {
@@ -2835,25 +3075,9 @@ fn debug_overlay(
                         }),
                 )
                 .children(lines.iter().enumerate().map(|(index, (addr, text, here, stop))| {
-                    let addr = *addr;
-                    let mark = if *here { ">" } else { " " };
-                    let dot = if *stop { "●" } else { " " };
-                    div()
-                        .id(("debug-line", index))
-                        .w_full()
-                        .px(px(8.))
-                        .py(px(2.))
-                        .rounded(px(4.))
-                        .bg(rgb(if *here { 0x243034 } else { BG }))
-                        .text_color(rgb(if *stop { ACCENT } else { TEXT }))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let _ = this.commands.send(Command::ToggleBreak(addr));
-                            cx.notify();
-                        }))
-                        .child(format!("{mark} {dot}  {addr:08X}  {text}"))
+                    debug_line(cx, index, *addr, text, *here, *stop)
                 }))
-                .child(div().text_sm().text_color(rgb(TEXT)).child("内存"))
+                .child(div().text_xs().text_color(rgb(PIXEL_QUIET)).child("内存"))
                 .child(
                     div()
                         .flex()
@@ -2863,44 +3087,130 @@ fn debug_overlay(
                             div()
                                 .id("debug-address")
                                 .flex_1()
-                                .px(px(12.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(BG))
-                                .border_1()
-                                .border_color(rgb(if editing { ACCENT } else { 0x314044 }))
-                                .text_color(rgb(if address.is_empty() { MUTED } else { TEXT }))
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.debug_ui.editing = true;
                                     cx.notify();
                                 }))
-                                .child(address_text),
+                                .child(pixel_shell(
+                                    pixel_face(editing, false),
+                                    div()
+                                        .px(px(8.))
+                                        .py(px(6.))
+                                        .text_color(rgb(if editing {
+                                            PIXEL_PAPER
+                                        } else if address.is_empty() {
+                                            PIXEL_QUIET
+                                        } else {
+                                            PIXEL_INK
+                                        }))
+                                        .child(address_text),
+                                )),
                         )
-                        .child(
-                            div()
-                                .id("debug-follow")
-                                .px(px(14.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(BG))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.debug_ui.address.clear();
-                                    this.debug_ui.editing = false;
-                                    let _ = this.commands.send(Command::SetDebugAddress(None));
-                                    cx.notify();
-                                }))
-                                .child("跟到 PC"),
-                        ),
+                        .child(debug_pixel_button(
+                            cx,
+                            "debug-follow",
+                            "跟到 PC",
+                            DebugPress::Follow,
+                            pressed,
+                        )),
                 )
                 .children(memory.iter().map(|line| {
                     div()
                         .text_xs()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(PIXEL_QUIET))
                         .child(line.clone())
                 })),
+        ))
+}
+
+fn debug_line(
+    cx: &mut Context<AppView>,
+    index: usize,
+    addr: u32,
+    text: &str,
+    here: bool,
+    stop: bool,
+) -> impl IntoElement {
+    let fg = if here { PIXEL_PAPER } else { PIXEL_INK };
+    let text = text.to_string();
+    div()
+        .id(("debug-line", index))
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .px(px(4.))
+        .py(px(2.))
+        .bg(rgb(if here { PIXEL_INK } else { PIXEL_PAPER }))
+        .text_color(rgb(fg))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| {
+            let _ = this.commands.send(Command::ToggleBreak(addr));
+            cx.notify();
+        }))
+        .child(div().w(px(8.)).when(here, |slot| slot.child(pixel_arrow(fg))))
+        .child(
+            div()
+                .w(px(6.))
+                .h(px(6.))
+                .bg(rgb(if stop { fg } else if here { PIXEL_INK } else { PIXEL_PAPER })),
         )
+        .child(format!("{addr:08X}  {text}"))
+}
+
+fn debug_pixel_button(
+    cx: &mut Context<AppView>,
+    id: &'static str,
+    label: &'static str,
+    hit: DebugPress,
+    pressed: Option<DebugPress>,
+) -> impl IntoElement {
+    let down = pressed == Some(hit);
+    div()
+        .id(id)
+        .cursor_pointer()
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.debug_ui.pressed = Some(hit);
+                cx.notify();
+            }),
+        )
+        .on_mouse_up(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                let was = this.debug_ui.pressed.take();
+                if was == Some(hit) {
+                    match hit {
+                        DebugPress::Back => this.leave_debug(cx),
+                        DebugPress::Follow => {
+                            this.debug_ui.address.clear();
+                            this.debug_ui.editing = false;
+                            let _ = this.commands.send(Command::SetDebugAddress(None));
+                            cx.notify();
+                        }
+                    }
+                }
+                cx.notify();
+            }),
+        )
+        .on_mouse_up_out(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                if this.debug_ui.pressed == Some(hit) {
+                    this.debug_ui.pressed = None;
+                    cx.notify();
+                }
+            }),
+        )
+        .child(pixel_shell(
+            pixel_face(false, down),
+            div()
+                .px(px(12.))
+                .py(px(6.))
+                .child(label),
+        ))
 }
 
 fn cheat_overlay(
@@ -2910,6 +3220,8 @@ fn cheat_overlay(
     gameshark: bool,
     action_replay: bool,
     editing_name: bool,
+    editing: bool,
+    pressed: Option<CheatPress>,
     cheats: &[CheatView],
     error: Option<&str>,
 ) -> impl IntoElement {
@@ -2922,16 +3234,19 @@ fn cheat_overlay(
         .flex()
         .items_center()
         .justify_center()
-        .bg(rgb(0x050809))
-        .child(cheat_panel(
-            cx,
-            name,
-            code,
-            gameshark,
-            action_replay,
-            Some(editing_name),
-            cheats,
-            error,
+        .child(pixel_shell(
+            pixel_face(false, false),
+            cheat_panel(
+                cx,
+                name,
+                code,
+                gameshark,
+                action_replay,
+                editing.then_some(editing_name),
+                pressed,
+                cheats,
+                error,
+            ),
         ))
 }
 
@@ -2942,6 +3257,7 @@ fn cheat_panel(
     gameshark: bool,
     action_replay: bool,
     editing_name: Option<bool>,
+    pressed: Option<CheatPress>,
     cheats: &[CheatView],
     error: Option<&str>,
 ) -> impl IntoElement {
@@ -2964,82 +3280,92 @@ fn cheat_panel(
     };
     let draft_color = match draft {
         CheatReading::Invalid(_) => 0xE08B76,
-        CheatReading::Lines(_) => ACCENT,
-        _ => MUTED,
+        CheatReading::Lines(_) => PIXEL_INK,
+        _ => PIXEL_QUIET,
     };
     let family = cheat_kind_label(gameshark, action_replay);
     div()
         .id("cheat-panel")
-                .w(px(520.))
-                .max_h(px(640.))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap(px(10.))
-                .p(px(18.))
-                .rounded(px(16.))
-                .bg(rgb(PANEL_HI))
-                .border_1()
-                .border_color(rgb(0x314044))
-                .child(div().text_lg().text_color(rgb(TEXT)).child("金手指"))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(MUTED))
-                        .child("按这张卡带记住。输入会排成一行一条，下面写着它改哪里。Esc 关闭。"),
-                )
+        .w(px(520.))
+        .max_h(px(640.))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .p(px(12.))
+        .text_color(rgb(PIXEL_INK))
+        .child(cheat_pixel_button(cx, "cheat-back", "返回", CheatPress::Back, pressed))
+        .child(div().text_lg().child("金手指"))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(PIXEL_QUIET))
+                .child("按这张卡带记住。返回回到系统。填名字或码时 Esc 先离开输入。"),
+        )
                 .children(error.map(|message| {
                     div()
                         .text_sm()
                         .text_color(rgb(0xE08B76))
                         .child(message.to_string())
                 }))
-                .child(div().text_sm().text_color(rgb(TEXT)).child("名字"))
+                .child(div().text_xs().text_color(rgb(PIXEL_QUIET)).child("名字"))
                 .child(
                     div()
                         .id("cheat-name")
                         .w_full()
-                        .px(px(12.))
-                        .py(px(8.))
-                        .rounded(px(6.))
-                        .bg(rgb(BG))
-                        .border_1()
-                        .border_color(rgb(if editing_name == Some(true) { ACCENT } else { 0x314044 }))
-                        .text_color(rgb(if name.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.system_field = SystemField::None;
-                            this.cheat_ui.lock().expect("cheat ui poisoned").field = CheatField::Name;
+                            let mut cheat = this.cheat_ui.lock().expect("cheat ui poisoned");
+                            cheat.field = CheatField::Name;
+                            cheat.editing = true;
                             cx.notify();
                         }))
-                        .child(name_text),
+                        .child(pixel_shell(
+                            pixel_face(editing_name == Some(true), false),
+                            div()
+                                .px(px(8.))
+                                .py(px(6.))
+                                .text_color(rgb(if editing_name == Some(true) {
+                                    PIXEL_PAPER
+                                } else if name.is_empty() {
+                                    PIXEL_QUIET
+                                } else {
+                                    PIXEL_INK
+                                }))
+                                .child(name_text),
+                        )),
                 )
-                .child(div().text_sm().text_color(rgb(TEXT)).child("码"))
+                .child(div().text_xs().text_color(rgb(PIXEL_QUIET)).child("码"))
                 .child(
                     div()
                         .id("cheat-code")
                         .w_full()
-                        .px(px(12.))
-                        .py(px(8.))
-                        .rounded(px(6.))
-                        .bg(rgb(BG))
-                        .border_1()
-                        .border_color(rgb(if editing_name == Some(false) {
-                            ACCENT
-                        } else {
-                            0x314044
-                        }))
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .text_color(rgb(if code.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.system_field = SystemField::None;
-                            this.cheat_ui.lock().expect("cheat ui poisoned").field = CheatField::Code;
+                            let mut cheat = this.cheat_ui.lock().expect("cheat ui poisoned");
+                            cheat.field = CheatField::Code;
+                            cheat.editing = true;
                             cx.notify();
                         }))
-                        .children(code_lines.into_iter().map(|line| div().child(line))),
+                        .child(pixel_shell(
+                            pixel_face(editing_name == Some(false), false),
+                            div()
+                                .px(px(8.))
+                                .py(px(6.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .text_color(rgb(if editing_name == Some(false) {
+                                    PIXEL_PAPER
+                                } else if code.is_empty() {
+                                    PIXEL_QUIET
+                                } else {
+                                    PIXEL_INK
+                                }))
+                                .children(code_lines.into_iter().map(|line| div().child(line))),
+                        )),
                 )
                 .children(draft_lines.into_iter().map(|line| {
                     div()
@@ -3050,47 +3376,21 @@ fn cheat_panel(
                 .child(
                     div()
                         .flex()
-                        .gap(px(10.))
-                        .child(
-                            div()
-                                .id("cheat-family")
-                                .px(px(14.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(BG))
-                                .text_color(rgb(TEXT))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let mut cheat = this.cheat_ui.lock().expect("cheat ui poisoned");
-                                    if !cheat.gameshark && !cheat.action_replay {
-                                        cheat.gameshark = true;
-                                    } else if cheat.gameshark && !cheat.action_replay {
-                                        cheat.action_replay = true;
-                                    } else {
-                                        cheat.gameshark = false;
-                                        cheat.action_replay = false;
-                                    }
-                                    let raw = cheat.code.clone();
-                                    replace_cheat_code(&mut cheat, &raw);
-                                    cx.notify();
-                                }))
-                                .child(family),
-                        )
-                        .child(
-                            div()
-                                .id("cheat-add")
-                                .px(px(14.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(ACCENT))
-                                .text_color(rgb(BG))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.submit_cheat();
-                                    cx.notify();
-                                }))
-                                .child("加上"),
-                        ),
+                        .gap(px(8.))
+                        .child(cheat_pixel_button(
+                            cx,
+                            "cheat-family",
+                            family,
+                            CheatPress::Family,
+                            pressed,
+                        ))
+                        .child(cheat_pixel_button(
+                            cx,
+                            "cheat-add",
+                            "加上",
+                            CheatPress::Add,
+                            pressed,
+                        )),
                 )
                 .children(cheats.iter().enumerate().map(|(index, cheat)| {
                     let kind = cheat_family(cheat.gameshark, cheat.action_replay);
@@ -3127,11 +3427,7 @@ fn cheat_panel(
                         "行",
                     );
                     let on = cheat.enabled;
-                    let tag = format!(
-                        "{}  {}",
-                        cheat_kind_tag(cheat.gameshark, cheat.action_replay),
-                        if on { "开" } else { "关" }
-                    );
+                    let tag = cheat_kind_tag(cheat.gameshark, cheat.action_replay).to_string();
                     div()
                         .w_full()
                         .flex()
@@ -3144,10 +3440,8 @@ fn cheat_panel(
                                 .flex()
                                 .flex_col()
                                 .gap(px(4.))
-                                .px(px(12.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(BG))
+                                .px(px(8.))
+                                .py(px(6.))
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let _ = this.commands.send(Command::ToggleCheat(index));
@@ -3156,40 +3450,101 @@ fn cheat_panel(
                                 .child(
                                     div()
                                         .flex()
+                                        .items_center()
                                         .justify_between()
-                                        .text_color(rgb(if on { ACCENT } else { TEXT }))
+                                        .text_color(rgb(PIXEL_INK))
                                         .child(div().text_sm().child(title))
-                                        .child(div().text_xs().text_color(rgb(MUTED)).child(tag)),
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(8.))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(PIXEL_QUIET))
+                                                        .child(tag),
+                                                )
+                                                .child(pixel_switch(on)),
+                                        ),
                                 )
                                 .children(notes.into_iter().map(|line| {
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(if on { ACCENT } else { MUTED }))
+                                        .text_color(rgb(PIXEL_QUIET))
                                         .child(line)
                                 }))
                                 .children(code_lines.into_iter().map(|line| {
                                     div()
                                         .text_xs()
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(PIXEL_QUIET))
                                         .child(line)
                                 })),
                         )
-                        .child(
-                            div()
-                                .id(("cheat-remove", index))
-                                .px(px(10.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(BG))
-                                .text_color(rgb(MUTED))
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let _ = this.commands.send(Command::RemoveCheat(index));
-                                    cx.notify();
-                                }))
-                                .child("删除"),
-                        )
+                        .child(cheat_pixel_button(
+                            cx,
+                            ("cheat-remove", index),
+                            "删除",
+                            CheatPress::Remove(index),
+                            pressed,
+                        ))
                 }))
+}
+
+fn cheat_pixel_button(
+    cx: &mut Context<AppView>,
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<String>,
+    hit: CheatPress,
+    pressed: Option<CheatPress>,
+) -> impl IntoElement {
+    let label = label.into();
+    let down = pressed == Some(hit);
+    div()
+        .id(id)
+        .cursor_pointer()
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.cheat_ui.lock().expect("cheat ui poisoned").pressed = Some(hit);
+                cx.notify();
+            }),
+        )
+        .on_mouse_up(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                let was = this.cheat_ui.lock().expect("cheat ui poisoned").pressed.take();
+                if was == Some(hit) {
+                    match hit {
+                        CheatPress::Back => this.close_cheats(cx),
+                        CheatPress::Add => {
+                            this.submit_cheat();
+                            cx.notify();
+                        }
+                        CheatPress::Family => this.cycle_cheat_family(cx),
+                        CheatPress::Remove(index) => {
+                            let _ = this.commands.send(Command::RemoveCheat(index));
+                            cx.notify();
+                        }
+                    }
+                }
+                cx.notify();
+            }),
+        )
+        .on_mouse_up_out(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                let mut cheat = this.cheat_ui.lock().expect("cheat ui poisoned");
+                if cheat.pressed == Some(hit) {
+                    cheat.pressed = None;
+                    cx.notify();
+                }
+            }),
+        )
+        .child(pixel_shell(
+            pixel_face(false, down),
+            div().px(px(12.)).py(px(6.)).child(label),
+        ))
 }
 
 fn shown_link_seats(seats: &[LinkSeat]) -> usize {
@@ -3251,6 +3606,8 @@ fn link_overlay(
     address: &str,
     name: &str,
     editing_name: bool,
+    editing: bool,
+    pressed: Option<LinkPress>,
     line: &str,
     card_line: &str,
     error: Option<&str>,
@@ -3268,19 +3625,22 @@ fn link_overlay(
         .flex()
         .items_center()
         .justify_center()
-        .bg(rgb(0x050809))
-        .child(link_panel(
-            cx,
-            address,
-            name,
-            Some(editing_name),
-            line,
-            card_line,
-            error,
-            lan_ip,
-            hosts,
-            in_room,
-            seats,
+        .child(pixel_shell(
+            pixel_face(false, false),
+            link_panel(
+                cx,
+                address,
+                name,
+                editing.then_some(editing_name),
+                pressed,
+                line,
+                card_line,
+                error,
+                lan_ip,
+                hosts,
+                in_room,
+                seats,
+            ),
         ))
 }
 
@@ -3289,6 +3649,7 @@ fn link_panel(
     address: &str,
     name: &str,
     editing_name: Option<bool>,
+    pressed: Option<LinkPress>,
     line: &str,
     card_line: &str,
     error: Option<&str>,
@@ -3325,8 +3686,8 @@ fn link_panel(
     };
     let found = if hosts.is_empty() {
         div()
-            .text_sm()
-            .text_color(rgb(MUTED))
+            .text_xs()
+            .text_color(rgb(PIXEL_QUIET))
             .child("还没看到。对方在同一 Wi-Fi 点「做主机」。")
             .into_any_element()
     } else {
@@ -3341,13 +3702,10 @@ fn link_panel(
                 div()
                     .id(("link-found", index))
                     .w_full()
-                    .px(px(12.))
-                    .py(px(8.))
-                    .rounded(px(6.))
-                    .bg(rgb(BG))
-                    .text_color(rgb(TEXT))
+                    .px(px(8.))
+                    .py(px(6.))
+                    .text_color(rgb(PIXEL_INK))
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(0x314044)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let _ = this.commands.send(Command::JoinLink(addr.clone()));
                         cx.notify();
@@ -3358,52 +3716,64 @@ fn link_panel(
     };
     div()
         .id("link-panel")
-                .w(px(440.))
-                .max_h(px(640.))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap(px(10.))
-                .p(px(18.))
-                .rounded(px(16.))
-                .bg(rgb(PANEL_HI))
-                .border_1()
-                .border_color(rgb(0x314044))
-                .child(div().text_lg().text_color(rgb(TEXT)).child("联机"))
-                .child(div().text_sm().text_color(rgb(ACCENT)).child(status))
-                .when(!card_line.is_empty(), |panel| {
-                    panel.child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(ACCENT))
-                            .child(card_line.to_string()),
-                    )
-                })
+        .w(px(600.))
+        .max_h(px(640.))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .p(px(12.))
+        .text_color(rgb(PIXEL_INK))
+        .child(link_pixel_button(cx, "link-back", "返回", LinkPress::Back, pressed))
+        .child(div().text_lg().child("联机"))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(PIXEL_QUIET))
+                .child("返回回到系统。填名字或地址时 Esc 先离开输入。"),
+        )
+        .child(div().text_sm().child(status))
+        .when(!card_line.is_empty(), |panel| {
+            panel.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(PIXEL_QUIET))
+                    .child(card_line.to_string()),
+            )
+        })
                 .children(error.filter(|message| *message != line).map(|message| {
                     div()
                         .text_sm()
                         .text_color(rgb(0xE08B76))
                         .child(message.to_string())
                 }))
-                .child(div().text_sm().text_color(rgb(TEXT)).child("你的名字"))
+                .child(div().text_xs().text_color(rgb(PIXEL_QUIET)).child("你的名字"))
                 .child(
                     div()
                         .id("link-name")
                         .w_full()
-                        .px(px(12.))
-                        .py(px(8.))
-                        .rounded(px(6.))
-                        .bg(rgb(BG))
-                        .border_1()
-                        .border_color(rgb(if editing_name == Some(true) { ACCENT } else { 0x314044 }))
-                        .text_color(rgb(if name.is_empty() { MUTED } else { TEXT }))
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.system_field = SystemField::None;
-                            this.link_ui.lock().expect("link ui poisoned").field = LinkField::Name;
+                            let mut link = this.link_ui.lock().expect("link ui poisoned");
+                            link.field = LinkField::Name;
+                            link.editing = true;
                             cx.notify();
                         }))
-                        .child(name_text),
+                        .child(pixel_shell(
+                            pixel_face(editing_name == Some(true), false),
+                            div()
+                                .px(px(8.))
+                                .py(px(6.))
+                                .text_color(rgb(if editing_name == Some(true) {
+                                    PIXEL_PAPER
+                                } else if name.is_empty() {
+                                    PIXEL_QUIET
+                                } else {
+                                    PIXEL_INK
+                                }))
+                                .child(name_text),
+                        )),
                 )
                 .child(
                     div()
@@ -3417,7 +3787,7 @@ fn link_panel(
                                 .flex()
                                 .flex_col()
                                 .gap(px(8.))
-                                .child(div().text_sm().text_color(rgb(TEXT)).child("加入"))
+                                .child(div().text_xs().text_color(rgb(PIXEL_QUIET)).child("加入"))
                                 .child(found)
                                 .child(
                                     div()
@@ -3428,58 +3798,37 @@ fn link_panel(
                                             div()
                                                 .id("link-address")
                                                 .flex_1()
-                                                .px(px(12.))
-                                                .py(px(8.))
-                                                .rounded(px(6.))
-                                                .bg(rgb(BG))
-                                                .border_1()
-                                                .border_color(rgb(if editing_name == Some(false) {
-                                                    ACCENT
-                                                } else {
-                                                    0x314044
-                                                }))
-                                                .text_color(if address.is_empty() {
-                                                    rgb(MUTED)
-                                                } else {
-                                                    rgb(TEXT)
-                                                })
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.system_field = SystemField::None;
-                                                    this.link_ui
-                                                        .lock()
-                                                        .expect("link ui poisoned")
-                                                        .field = LinkField::Address;
+                                                    let mut link =
+                                                        this.link_ui.lock().expect("link ui poisoned");
+                                                    link.field = LinkField::Address;
+                                                    link.editing = true;
                                                     cx.notify();
                                                 }))
-                                                .child(address_text),
+                                                .child(pixel_shell(
+                                                    pixel_face(editing_name == Some(false), false),
+                                                    div()
+                                                        .px(px(8.))
+                                                        .py(px(6.))
+                                                        .text_color(rgb(if editing_name == Some(false) {
+                                                            PIXEL_PAPER
+                                                        } else if address.is_empty() {
+                                                            PIXEL_QUIET
+                                                        } else {
+                                                            PIXEL_INK
+                                                        }))
+                                                        .child(address_text),
+                                                )),
                                         )
-                                        .child(
-                                            div()
-                                                .id("link-join")
-                                                .px(px(14.))
-                                                .py(px(8.))
-                                                .rounded(px(6.))
-                                                .bg(rgb(ACCENT))
-                                                .text_color(rgb(BG))
-                                                .cursor_pointer()
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    let address = this
-                                                        .link_ui
-                                                        .lock()
-                                                        .expect("link ui poisoned")
-                                                        .address
-                                                        .trim()
-                                                        .to_string();
-                                                    if !address.is_empty() {
-                                                        let _ = this
-                                                            .commands
-                                                            .send(Command::JoinLink(address));
-                                                    }
-                                                    cx.notify();
-                                                }))
-                                                .child("加入"),
-                                        ),
+                                        .child(link_pixel_button(
+                                            cx,
+                                            "link-join",
+                                            "加入",
+                                            LinkPress::Join,
+                                            pressed,
+                                        )),
                                 ),
                         )
                         .child(
@@ -3488,122 +3837,146 @@ fn link_panel(
                                 .flex()
                                 .flex_col()
                                 .gap(px(8.))
-                                .child(div().text_sm().text_color(rgb(TEXT)).child("开房"))
-                                .child(
-                                    div()
-                                        .id("link-host")
-                                        .px(px(14.))
-                                        .py(px(8.))
-                                        .rounded(px(6.))
-                                        .bg(rgb(ACCENT))
-                                        .text_color(rgb(BG))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            let _ = this.commands.send(Command::HostLink);
-                                            cx.notify();
-                                        }))
-                                        .child("做主机"),
-                                )
+                                .child(div().text_xs().text_color(rgb(PIXEL_QUIET)).child("开房"))
+                                .child(link_pixel_button(
+                                    cx,
+                                    "link-host",
+                                    "做主机",
+                                    LinkPress::Host,
+                                    pressed,
+                                ))
                                 .when(in_room, |column| {
                                     column
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(rgb(TEXT))
-                                                .child(room_label),
-                                        )
+                                        .child(div().text_sm().child(room_label))
                                         .children(room.iter().map(|seat| link_seat_row(seat)))
-                                        .child(
-                                            div()
-                                                .id("link-stop")
-                                                .px(px(14.))
-                                                .py(px(8.))
-                                                .rounded(px(6.))
-                                                .bg(rgb(BG))
-                                                .text_color(rgb(TEXT))
-                                                .cursor_pointer()
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    let _ = this.commands.send(Command::StopLink);
-                                                    cx.notify();
-                                                }))
-                                                .child("断开"),
-                                        )
+                                        .child(link_pixel_button(
+                                            cx,
+                                            "link-stop",
+                                            "断开",
+                                            LinkPress::Stop,
+                                            pressed,
+                                        ))
                                 })
                                 .when(!in_room, |column| {
                                     column.child(
                                         div()
-                                            .text_sm()
-                                            .text_color(rgb(MUTED))
+                                            .text_xs()
+                                            .text_color(rgb(PIXEL_QUIET))
                                             .child("同一 Wi-Fi 里，别人会在左边看到你。"),
                                     )
                                 }),
                         ),
                 )
-                .child(div().text_sm().text_color(rgb(TEXT)).child("跨网"))
+                .child(div().text_xs().text_color(rgb(PIXEL_QUIET)).child("跨网"))
                 .child(
                     div()
                         .flex()
                         .flex_wrap()
-                        .gap(px(10.))
-                        .child(
-                            div()
-                                .id("link-relay")
-                                .px(px(14.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(BG))
-                                .text_color(rgb(TEXT))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let _ = this.commands.send(Command::ServeRelay);
-                                    cx.notify();
-                                }))
-                                .child("本机中继"),
-                        )
-                        .child(
-                            div()
-                                .id("link-relay-host")
-                                .px(px(14.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(BG))
-                                .text_color(rgb(TEXT))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let address = this
-                                        .link_ui
-                                        .lock()
-                                        .expect("link ui poisoned")
-                                        .address
-                                        .clone();
-                                    let _ = this.commands.send(Command::HostRelay(address));
-                                    cx.notify();
-                                }))
-                                .child("经中继开房"),
-                        )
-                        .child(
-                            div()
-                                .id("link-done")
-                                .px(px(14.))
-                                .py(px(8.))
-                                .rounded(px(6.))
-                                .bg(rgb(BG))
-                                .text_color(rgb(TEXT))
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.close_link(cx);
-                                }))
-                                .child("完成"),
-                        ),
+                        .gap(px(8.))
+                        .child(link_pixel_button(
+                            cx,
+                            "link-relay",
+                            "本机中继",
+                            LinkPress::Relay,
+                            pressed,
+                        ))
+                        .child(link_pixel_button(
+                            cx,
+                            "link-relay-host",
+                            "经中继开房",
+                            LinkPress::RelayHost,
+                            pressed,
+                        )),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(PIXEL_QUIET))
                         .child(format!(
                             "本机 {lan_ip}:5576，中继 5578。跨网时一边开本机中继，另一边把地址#房间号填进加入。Command-V 粘贴。"
                         )),
                 )
+}
+
+fn link_pixel_button(
+    cx: &mut Context<AppView>,
+    id: &'static str,
+    label: &'static str,
+    hit: LinkPress,
+    pressed: Option<LinkPress>,
+) -> impl IntoElement {
+    let down = pressed == Some(hit);
+    div()
+        .id(id)
+        .cursor_pointer()
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.link_ui.lock().expect("link ui poisoned").pressed = Some(hit);
+                cx.notify();
+            }),
+        )
+        .on_mouse_up(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                let was = this.link_ui.lock().expect("link ui poisoned").pressed.take();
+                if was == Some(hit) {
+                    match hit {
+                        LinkPress::Back => this.close_link(cx),
+                        LinkPress::Join => {
+                            let address = this
+                                .link_ui
+                                .lock()
+                                .expect("link ui poisoned")
+                                .address
+                                .trim()
+                                .to_string();
+                            if !address.is_empty() {
+                                let _ = this.commands.send(Command::JoinLink(address));
+                            }
+                            cx.notify();
+                        }
+                        LinkPress::Host => {
+                            let _ = this.commands.send(Command::HostLink);
+                            cx.notify();
+                        }
+                        LinkPress::Stop => {
+                            let _ = this.commands.send(Command::StopLink);
+                            cx.notify();
+                        }
+                        LinkPress::Relay => {
+                            let _ = this.commands.send(Command::ServeRelay);
+                            cx.notify();
+                        }
+                        LinkPress::RelayHost => {
+                            let address = this
+                                .link_ui
+                                .lock()
+                                .expect("link ui poisoned")
+                                .address
+                                .clone();
+                            let _ = this.commands.send(Command::HostRelay(address));
+                            cx.notify();
+                        }
+                    }
+                }
+                cx.notify();
+            }),
+        )
+        .on_mouse_up_out(
+            gpui::MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                let mut link = this.link_ui.lock().expect("link ui poisoned");
+                if link.pressed == Some(hit) {
+                    link.pressed = None;
+                    cx.notify();
+                }
+            }),
+        )
+        .child(pixel_shell(
+            pixel_face(false, down),
+            div().px(px(12.)).py(px(6.)).child(label),
+        ))
 }
 
 fn link_seat_row(seat: &LinkSeat) -> impl IntoElement {
@@ -3613,17 +3986,15 @@ fn link_seat_row(seat: &LinkSeat) -> impl IntoElement {
         .flex()
         .justify_between()
         .items_center()
-        .px(px(12.))
-        .py(px(6.))
-        .rounded(px(6.))
-        .bg(rgb(BG))
+        .px(px(4.))
+        .py(px(2.))
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(8.))
                 .text_sm()
-                .text_color(rgb(if open { MUTED } else { TEXT }))
+                .text_color(rgb(if open { PIXEL_QUIET } else { PIXEL_INK }))
                 .child(format!("{}号机", seat.number))
                 .child(if open {
                     "空位".to_string()
@@ -3634,7 +4005,7 @@ fn link_seat_row(seat: &LinkSeat) -> impl IntoElement {
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(if seat.mine { ACCENT } else { MUTED }))
+                .text_color(rgb(if seat.mine { PIXEL_INK } else { PIXEL_QUIET }))
                 .child(if seat.mine {
                     "你".to_string()
                 } else if open {
@@ -6219,6 +6590,7 @@ struct WindowLaunch {
     windows_alive: Arc<AtomicUsize>,
     picture_windows: Arc<Mutex<PictureWindows>>,
     chrome_dirty: Arc<AtomicBool>,
+    system_chrome: Arc<Mutex<SystemChrome>>,
 }
 
 #[derive(Clone, Copy)]
@@ -6502,6 +6874,7 @@ fn open_game_window(
                     launch.windows_alive,
                     launch.picture_windows,
                     launch.chrome_dirty,
+                    launch.system_chrome,
                     picture_token,
                     picture,
                     compare,
@@ -6866,6 +7239,8 @@ fn main() {
         name: saved_link_name.clone(),
         name_touched: !saved_link_name.is_empty(),
         field: LinkField::Address,
+        editing: false,
+        pressed: None,
     }));
     let cheat_ui = Arc::new(Mutex::new(CheatUi {
         open: false,
@@ -6874,6 +7249,8 @@ fn main() {
         gameshark: false,
         action_replay: false,
         field: CheatField::Code,
+        editing: false,
+        pressed: None,
     }));
     let launch = WindowLaunch {
         snapshot: Arc::clone(&snapshot),
@@ -6904,6 +7281,7 @@ fn main() {
             linear: None,
         })),
         chrome_dirty: Arc::new(AtomicBool::new(false)),
+        system_chrome: Arc::new(Mutex::new(SystemChrome::idle())),
     };
     let menu_commands = commands.clone();
     let menu_library_mode = Arc::clone(&library_mode);
@@ -7040,8 +7418,28 @@ fn main() {
             cx.refresh_windows();
         });
         let pause_commands = menu_commands.clone();
-        cx.on_action(move |_: &TogglePause, _| {
-            let _ = pause_commands.send(Command::TogglePause);
+        cx.on_action(move |_: &TogglePause, cx| {
+            let handled = cx
+                .active_window()
+                .and_then(|window| window.downcast::<AppView>())
+                .and_then(|handle| {
+                    handle
+                        .update(cx, |view, _, cx| {
+                            if view.overlay_blocks_resume() {
+                                return true;
+                            }
+                            if view.system_menu_open() {
+                                view.begin_system_close(cx);
+                                return true;
+                            }
+                            false
+                        })
+                        .ok()
+                })
+                .unwrap_or(false);
+            if !handled {
+                let _ = pause_commands.send(Command::TogglePause);
+            }
         });
         let reset_commands = menu_commands.clone();
         cx.on_action(move |_: &ResetConsole, _| {
@@ -7077,7 +7475,12 @@ fn main() {
             settings.capturing = None;
             drop(settings);
             open_cheats.lock().expect("cheat ui poisoned").open = false;
-            open_link.lock().expect("link ui poisoned").open = true;
+            {
+                let mut link = open_link.lock().expect("link ui poisoned");
+                link.open = true;
+                link.editing = false;
+                link.pressed = None;
+            }
             open_keys.store(0, Ordering::Relaxed);
             open_turbo.store(false, Ordering::Relaxed);
             open_rewind.store(false, Ordering::Relaxed);
@@ -7103,7 +7506,12 @@ fn main() {
             settings.capturing = None;
             drop(settings);
             cheat_link.lock().expect("link ui poisoned").open = false;
-            cheat_panel.lock().expect("cheat ui poisoned").open = true;
+            {
+                let mut cheat = cheat_panel.lock().expect("cheat ui poisoned");
+                cheat.open = true;
+                cheat.editing = false;
+                cheat.pressed = None;
+            }
             cheat_keys.store(0, Ordering::Relaxed);
             cheat_turbo.store(false, Ordering::Relaxed);
             cheat_rewind.store(false, Ordering::Relaxed);
